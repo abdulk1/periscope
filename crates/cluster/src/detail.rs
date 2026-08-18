@@ -79,6 +79,11 @@ pub async fn fetch(
     })
 }
 
+/// Renders any object as YAML, for the dry-run preview.
+pub fn to_yaml_public(object: &DynamicObject) -> Result<String, kube::Error> {
+    to_yaml(object, false)
+}
+
 /// Renders an object as YAML, with the noise removed.
 ///
 /// `managedFields` is usually longer than the object itself and is never what

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::coalesce::CoalesceKey;
 use crate::logs::{LogLine, LogSource, LogSourceState, LogTarget};
+use crate::mutation::{Mutation, MutationOutcome};
 use crate::resource::{
     ColumnSpec, ContextInfo, KindId, KindInfo, ObjectDetail, ResourceKey, ResourceRow,
 };
@@ -117,6 +118,19 @@ pub enum ClusterCommand {
         /// Which cluster.
         cluster: ClusterId,
     },
+    /// Change something in a cluster.
+    ///
+    /// The UI sends this only after the store has authorised it and the user
+    /// has confirmed a sentence naming the cluster and the object. The cluster
+    /// layer checks the read-only policy again before touching the apiserver:
+    /// two independent gates, because one bug in the UI must not be enough to
+    /// mutate a cluster somebody marked read-only.
+    Mutate {
+        /// Which cluster.
+        cluster: ClusterId,
+        /// What to do.
+        mutation: Arc<Mutation>,
+    },
     /// Round-trip liveness probe. The cluster layer answers with
     /// [`ClusterEvent::Pong`] carrying the same nonce.
     Ping {
@@ -144,7 +158,8 @@ impl ClusterCommand {
             | Self::StopWatch { cluster, .. }
             | Self::FetchObject { cluster, .. }
             | Self::StartLogs { cluster, .. }
-            | Self::StopLogs { cluster } => Some(cluster),
+            | Self::StopLogs { cluster }
+            | Self::Mutate { cluster, .. } => Some(cluster),
             Self::ListContexts => None,
         }
     }
@@ -319,6 +334,15 @@ pub enum ClusterEvent {
         /// What it is doing now.
         state: LogSourceState,
     },
+    /// A mutation finished, one way or another.
+    MutationDone {
+        /// Cluster it was aimed at.
+        cluster: ClusterId,
+        /// What was asked for.
+        mutation: Arc<Mutation>,
+        /// What happened.
+        outcome: MutationOutcome,
+    },
     /// The log session itself could not start or could not continue.
     LogsFailed {
         /// Cluster the session belonged to.
@@ -429,6 +453,9 @@ impl ClusterEvent {
                 cluster, source, ..
             } => Some(EventKey::LogSource(cluster.clone(), source.clone())),
             Self::LogsFailed { cluster, .. } => Some(EventKey::LogsFailed(cluster.clone())),
+            // Every outcome is reported: two deletes are two things that
+            // happened, and collapsing them would hide one.
+            Self::MutationDone { .. } => None,
         }
     }
 
@@ -445,7 +472,8 @@ impl ClusterEvent {
             | Self::ObjectFailed { cluster, .. }
             | Self::LogBatch { cluster, .. }
             | Self::LogSourceChanged { cluster, .. }
-            | Self::LogsFailed { cluster, .. } => Some(cluster),
+            | Self::LogsFailed { cluster, .. }
+            | Self::MutationDone { cluster, .. } => Some(cluster),
             Self::Stale { cluster, .. } => cluster.as_ref(),
             Self::Contexts { .. } | Self::ConfigFailed { .. } => None,
         }
@@ -641,6 +669,24 @@ mod tests {
             LogSource::new("api-0", "api")
         )));
         assert!(!reset.supersedes(&EventKey::LogsFailed("prod".into())));
+    }
+
+    #[test]
+    fn mutation_outcomes_are_never_collapsed() {
+        // Two deletes are two things that happened. Coalescing them would mean
+        // the audit trail on screen disagreed with the one on disk.
+        let done = ClusterEvent::MutationDone {
+            cluster: "prod".into(),
+            mutation: Arc::new(crate::mutation::Mutation::Delete {
+                kind: KindId::new("", "v1", "Pod", "pods"),
+                key: ResourceKey::new("default", "api-0"),
+                grace_period: None,
+            }),
+            outcome: crate::mutation::MutationOutcome::Applied {
+                detail: "deleted".into(),
+            },
+        };
+        assert_eq!(done.coalesce_key(), None);
     }
 
     #[test]

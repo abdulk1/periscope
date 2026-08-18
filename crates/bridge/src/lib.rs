@@ -27,6 +27,7 @@ pub mod channel;
 pub mod coalesce;
 pub mod link;
 pub mod logs;
+pub mod mutation;
 pub mod protocol;
 pub mod resource;
 pub mod runtime;
@@ -40,6 +41,7 @@ pub use link::{
     DEFAULT_FLUSH_INTERVAL, DEFAULT_MAX_BATCH, FlushStats, PumpConfig, spawn_event_pump,
 };
 pub use logs::{LogLine, LogSelector, LogSource, LogSourceState, LogTarget};
+pub use mutation::{Mutation, MutationOutcome};
 pub use protocol::{ClusterCommand, ClusterEvent, ClusterId, ConnectionState, EventKey};
 pub use resource::{
     ColumnSpec, ContextInfo, EventLine, KindId, KindInfo, ObjectDetail, OwnerRef, ResourceKey,

@@ -10,12 +10,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use periscope_bridge::{
-    ClusterEvent, ClusterId, ColumnSpec, ContextInfo, KindId, KindInfo, LogTarget, ObjectDetail,
-    ResourceKey, ResourceRow,
+    ClusterEvent, ClusterId, ColumnSpec, ConnectionState, ContextInfo, KindId, KindInfo, LogTarget,
+    Mutation, MutationOutcome, ObjectDetail, ResourceKey, ResourceRow,
 };
 
 use crate::connections::{Connection, ConnectionRegistry};
 use crate::logs::{FilterSpec, LogBuffer};
+use crate::permissions::{Authorized, Permissions, Refusal};
 use crate::table::ResourceTable;
 
 /// A live log tail.
@@ -194,7 +195,27 @@ pub struct AppState {
     last_viewed: BTreeMap<ClusterId, Instant>,
     /// Rows one cluster may hold before its unviewed tables are released.
     budget: usize,
+    /// Which clusters may be changed.
+    permissions: Permissions,
+    /// What recent mutations did, newest first.
+    activity: Vec<Activity>,
 }
+
+/// One thing Periscope did to a cluster, as the UI shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Activity {
+    /// Which cluster.
+    pub cluster: ClusterId,
+    /// What was asked for.
+    pub mutation: Arc<Mutation>,
+    /// What happened.
+    pub outcome: MutationOutcome,
+    /// When it was recorded.
+    pub at: Instant,
+}
+
+/// How many recent actions the UI keeps.
+const ACTIVITY_LIMIT: usize = 50;
 
 impl Default for AppState {
     fn default() -> Self {
@@ -211,6 +232,8 @@ impl Default for AppState {
             focus: 0,
             last_viewed: BTreeMap::new(),
             budget: DEFAULT_ROW_BUDGET,
+            permissions: Permissions::permissive(),
+            activity: Vec::new(),
         }
     }
 }
@@ -336,6 +359,20 @@ impl AppState {
                     session.buffer.fail(reason.clone());
                     changed = true;
                 }
+            }
+
+            ClusterEvent::MutationDone {
+                cluster,
+                mutation,
+                outcome,
+            } => {
+                self.record_activity(Activity {
+                    cluster: cluster.clone(),
+                    mutation: Arc::clone(mutation),
+                    outcome: outcome.clone(),
+                    at: now,
+                });
+                changed = true;
             }
 
             ClusterEvent::Status { .. }
@@ -514,6 +551,92 @@ impl AppState {
                 ))
             })
             .collect()
+    }
+
+    // --- mutations ----------------------------------------------------------
+
+    /// Sets the policy, from settings.
+    pub fn set_permissions(&mut self, permissions: Permissions) {
+        self.permissions = permissions;
+    }
+
+    /// The policy in force.
+    pub fn permissions(&self) -> &Permissions {
+        &self.permissions
+    }
+
+    /// Whether a cluster may be changed at all, for the UI to grey buttons out.
+    ///
+    /// Greying out is a courtesy, not the enforcement: [`AppState::authorize`]
+    /// is what actually refuses.
+    pub fn may_mutate(&self, cluster: &ClusterId) -> bool {
+        self.permissions.may_mutate(cluster)
+    }
+
+    /// Authorises a mutation, or says why not.
+    ///
+    /// Nothing else in the app can construct an [`Authorized`], so a mutation
+    /// that was never checked cannot be sent.
+    pub fn authorize(
+        &self,
+        cluster: &ClusterId,
+        mutation: Arc<Mutation>,
+    ) -> Result<Authorized, Refusal> {
+        if !self.permissions.may_mutate(cluster) {
+            return Err(Refusal::ReadOnly {
+                cluster: cluster.clone(),
+            });
+        }
+
+        // Acting on a cluster the app never connected to would fail at the API
+        // with something unhelpful; refuse it here, where the reason is known.
+        let connected = self.connections.get(cluster).is_some_and(|connection| {
+            matches!(
+                connection.state,
+                ConnectionState::Connected | ConnectionState::Degraded { .. }
+            )
+        });
+        if !connected {
+            return Err(Refusal::NotConnected {
+                cluster: cluster.clone(),
+            });
+        }
+
+        Ok(Authorized::new(cluster.clone(), mutation))
+    }
+
+    /// Records a refusal so it shows up in the activity list like anything
+    /// else. A refusal the user cannot see is indistinguishable from a bug.
+    pub fn record_refusal(
+        &mut self,
+        cluster: ClusterId,
+        mutation: Arc<Mutation>,
+        refusal: &Refusal,
+        now: Instant,
+    ) {
+        self.record_activity(Activity {
+            cluster,
+            mutation,
+            outcome: MutationOutcome::Refused {
+                reason: refusal.reason(),
+            },
+            at: now,
+        });
+    }
+
+    fn record_activity(&mut self, activity: Activity) {
+        self.activity.insert(0, activity);
+        self.activity.truncate(ACTIVITY_LIMIT);
+    }
+
+    /// What Periscope has done recently, newest first.
+    pub fn activity(&self) -> &[Activity] {
+        &self.activity
+    }
+
+    /// The most recent action, for the status line.
+    pub fn last_activity(&self) -> Option<&Activity> {
+        self.activity.first()
     }
 
     // --- warm clusters ------------------------------------------------------
@@ -1533,6 +1656,167 @@ mod tests {
         assert_eq!(targets[0].1, pods());
         assert_eq!(targets[1].0, ClusterId::new("staging"));
         assert_eq!(targets[1].1, deployments());
+    }
+
+    fn connected(state: &mut AppState, cluster: &str) {
+        state.apply_batch(
+            &[ClusterEvent::Status {
+                cluster: cluster.into(),
+                state: ConnectionState::Connected,
+            }],
+            Instant::now(),
+        );
+    }
+
+    fn delete_api() -> Arc<Mutation> {
+        Arc::new(Mutation::Delete {
+            kind: pods(),
+            key: ResourceKey::new("default", "api-0"),
+            grace_period: None,
+        })
+    }
+
+    #[test]
+    fn a_read_only_cluster_rejects_mutations_at_the_store_layer() {
+        // The Phase 5 acceptance criterion, in one test: the refusal happens
+        // here, not in the UI, and not only in the cluster layer.
+        let mut state = state_with_contexts();
+        connected(&mut state, "prod");
+
+        let mut permissions = crate::Permissions::permissive();
+        permissions.deny(ClusterId::new("prod"));
+        state.set_permissions(permissions);
+
+        let refusal = state
+            .authorize(&ClusterId::new("prod"), delete_api())
+            .expect_err("a read-only cluster must refuse");
+
+        assert_eq!(
+            refusal,
+            crate::Refusal::ReadOnly {
+                cluster: ClusterId::new("prod")
+            }
+        );
+        assert!(!state.may_mutate(&ClusterId::new("prod")));
+        assert!(
+            refusal.reason().contains("read-only"),
+            "{}",
+            refusal.reason()
+        );
+    }
+
+    #[test]
+    fn a_writable_cluster_authorizes() {
+        let mut state = state_with_contexts();
+        connected(&mut state, "prod");
+
+        let authorized = state
+            .authorize(&ClusterId::new("prod"), delete_api())
+            .expect("a writable, connected cluster authorizes");
+
+        assert_eq!(authorized.cluster(), &ClusterId::new("prod"));
+        assert_eq!(authorized.mutation().verb(), "delete");
+    }
+
+    #[test]
+    fn a_cluster_that_is_not_connected_refuses_before_the_api_can() {
+        let state = state_with_contexts();
+
+        let refusal = state
+            .authorize(&ClusterId::new("prod"), delete_api())
+            .expect_err("nothing to act on");
+        assert_eq!(
+            refusal,
+            crate::Refusal::NotConnected {
+                cluster: ClusterId::new("prod")
+            }
+        );
+    }
+
+    #[test]
+    fn read_only_by_default_refuses_everything_not_named() {
+        let mut state = state_with_contexts();
+        connected(&mut state, "prod");
+        connected(&mut state, "staging");
+        state.set_permissions(crate::Permissions::read_only_except([ClusterId::new(
+            "staging",
+        )]));
+
+        assert!(
+            state
+                .authorize(&ClusterId::new("prod"), delete_api())
+                .is_err()
+        );
+        assert!(
+            state
+                .authorize(&ClusterId::new("staging"), delete_api())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_recorded_where_the_user_can_see_it() {
+        let mut state = state_with_contexts();
+        connected(&mut state, "prod");
+        let mut permissions = crate::Permissions::permissive();
+        permissions.deny(ClusterId::new("prod"));
+        state.set_permissions(permissions);
+
+        let mutation = delete_api();
+        let refusal = state
+            .authorize(&ClusterId::new("prod"), Arc::clone(&mutation))
+            .expect_err("refused");
+        state.record_refusal(ClusterId::new("prod"), mutation, &refusal, Instant::now());
+
+        let last = state.last_activity().expect("recorded");
+        assert!(last.outcome.is_problem());
+        assert!(last.outcome.message().contains("read-only"));
+    }
+
+    #[test]
+    fn outcomes_arriving_from_the_cluster_join_the_activity_list() {
+        let mut state = state_with_contexts();
+
+        state.apply_batch(
+            &[ClusterEvent::MutationDone {
+                cluster: "prod".into(),
+                mutation: delete_api(),
+                outcome: MutationOutcome::Applied {
+                    detail: "pod \"api-0\" deleted".into(),
+                },
+            }],
+            Instant::now(),
+        );
+
+        let last = state.last_activity().expect("recorded");
+        assert!(!last.outcome.is_problem());
+        assert_eq!(last.outcome.message(), "pod \"api-0\" deleted");
+        assert_eq!(state.activity().len(), 1);
+    }
+
+    #[test]
+    fn the_activity_list_keeps_the_newest_actions_first_and_is_bounded() {
+        let mut state = state_with_contexts();
+        for index in 0..60 {
+            state.apply_batch(
+                &[ClusterEvent::MutationDone {
+                    cluster: "prod".into(),
+                    mutation: Arc::new(Mutation::Scale {
+                        kind: deployments(),
+                        key: ResourceKey::new("default", "api"),
+                        replicas: index,
+                        current: None,
+                    }),
+                    outcome: MutationOutcome::Applied {
+                        detail: format!("scaled to {index}"),
+                    },
+                }],
+                Instant::now(),
+            );
+        }
+
+        assert_eq!(state.activity().len(), ACTIVITY_LIMIT);
+        assert_eq!(state.activity()[0].outcome.message(), "scaled to 59");
     }
 
     #[test]

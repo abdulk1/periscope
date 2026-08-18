@@ -36,6 +36,14 @@ pub fn export_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.data_local_dir().join("exports"))
 }
 
+/// Path to the action audit log.
+///
+/// Beside the logs rather than in the config directory: it is a record of what
+/// happened, not something the user edits.
+pub fn audit_file() -> Result<PathBuf> {
+    Ok(project_dirs()?.data_local_dir().join("audit.log"))
+}
+
 /// Path to the user's settings file.
 pub fn settings_file() -> Result<PathBuf> {
     Ok(project_dirs()?.config_dir().join("settings.toml"))
@@ -57,6 +65,13 @@ mod tests {
         let dir = export_dir().expect("home directory resolves in tests");
         assert!(dir.ends_with("exports"));
         assert!(dir.to_string_lossy().contains("Periscope"));
+    }
+
+    #[test]
+    fn the_audit_log_lives_with_the_apps_data() {
+        let path = audit_file().expect("home directory resolves in tests");
+        assert_eq!(path.file_name().unwrap(), "audit.log");
+        assert!(path.to_string_lossy().contains("Periscope"));
     }
 
     #[test]

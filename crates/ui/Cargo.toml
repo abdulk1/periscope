@@ -13,6 +13,7 @@ gpui.workspace = true
 gpui-component.workspace = true
 nucleo-matcher.workspace = true
 periscope-bridge.workspace = true
+periscope-cluster.workspace = true
 periscope-config.workspace = true
 periscope-store.workspace = true
 tracing.workspace = true

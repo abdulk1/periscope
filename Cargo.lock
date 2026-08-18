@@ -4773,6 +4773,8 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "periscope-bridge",
+ "periscope-config",
+ "serde-saphyr",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
@@ -4787,6 +4789,8 @@ dependencies = [
  "directories",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -4804,7 +4808,9 @@ dependencies = [
  "kube",
  "periscope-bridge",
  "periscope-cluster",
+ "periscope-config",
  "periscope-store",
+ "serde-saphyr",
  "serde_json",
  "tokio",
 ]
@@ -4814,6 +4820,7 @@ name = "periscope-store"
 version = "0.1.0"
 dependencies = [
  "periscope-bridge",
+ "periscope-config",
  "regex",
  "tracing",
 ]
@@ -4826,6 +4833,7 @@ dependencies = [
  "gpui-component",
  "nucleo-matcher",
  "periscope-bridge",
+ "periscope-cluster",
  "periscope-config",
  "periscope-store",
  "tracing",
@@ -5960,6 +5968,7 @@ dependencies = [
  "periscope-bridge",
  "periscope-cluster",
  "periscope-config",
+ "periscope-store",
  "periscope-ui",
  "tracing",
 ]

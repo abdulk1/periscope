@@ -5,7 +5,7 @@ affordances: live resource streams, multi-cluster, and log tailing across pods.
 
 **Binary:** `scope` · **Language:** Rust · **UI:** GPUI
 
-> **Status: Phase 4 (multi-cluster).** Connects to kubeconfig contexts on
+> **Status: Phase 5 (actions), partially.** Connects to kubeconfig contexts on
 > demand, discovers every kind each serves — CRDs included — streams any of them
 > into a virtualised table, tails logs from one pod or from every pod matching a
 > label selector, and shows two clusters side by side. Clusters you have visited
@@ -104,6 +104,30 @@ it dropped. Filtering — substring or regular expression, case-sensitive or not
 applies to what is already held, so it never restarts the stream. **Copy** puts
 the visible lines on the clipboard; **Export** writes them to a file and tells
 you where.
+
+## Changing things
+
+Open an object and the detail pane offers what its kind supports: **Scale**,
+**Restart**, **Cordon**, **Dry run**, **Apply** and **Delete**. Nothing happens
+until you confirm a sentence that names the cluster, the namespace, the object
+and the operation — *"Delete deployments.apps api in namespace payments on
+cluster prod?"* — and `Escape` cancels it.
+
+Mark the clusters that must never change in `settings.toml`:
+
+```toml
+[access]
+read-only = ["prod", "prod-eu"]
+
+# Or invert it: nothing is writable unless named.
+read-only-by-default = true
+writable = ["kind-local"]
+```
+
+Those names are refused twice: once by the store, before anything is sent, and
+again by the cluster layer, immediately before the request. Every attempt —
+applied, dry-run, refused or failed — is appended to `audit.log` beside the
+application logs.
 
 ## Security posture
 

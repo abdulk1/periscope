@@ -16,20 +16,24 @@ use gpui::{
     IntoElement, KeyBinding, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, actions, div, px,
 };
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use periscope_bridge::{
     ClusterCommand, ClusterEvent, ClusterId, CommandError, CommandSender, ConnectionState,
-    FlushStats, KindId, LogTarget, ResourceKey,
+    FlushStats, KindId, LogTarget, Mutation, ResourceKey,
 };
 use periscope_config::ThemeChoice;
 use periscope_store::{AppState, Detail, FilterSpec};
 
 use crate::palette::{Palette, Target};
+// The two predicates that decide which actions a kind offers live with the
+// mutations themselves, so the UI cannot disagree with what the cluster layer
+// will accept.
 use crate::perf::FrameMeter;
 use crate::{logview, table, theme};
+use periscope_cluster::mutate as periscope_cluster_actions;
 
 actions!(
     periscope,
@@ -156,6 +160,12 @@ pub struct Workspace {
 
     /// A tail asked for on the command line, opened once the cluster connects.
     pending_tail: Option<Arc<LogTarget>>,
+    /// A mutation waiting for the user to confirm it.
+    ///
+    /// Nothing is sent while this is `Some`: the confirmation *is* the gate.
+    pending_mutation: Option<Arc<Mutation>>,
+    /// Replica count for a scale, as typed.
+    replicas_input: Entity<InputState>,
     /// How many lines a session keeps before dropping the oldest.
     log_capacity: usize,
     /// Counts exports, so two in one session do not overwrite each other.
@@ -221,6 +231,7 @@ impl Workspace {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("filter rows"));
         let palette_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("jump to a kind or object"));
+        let replicas_input = cx.new(|cx| InputState::new(window, cx).placeholder("replicas"));
         let log_filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("filter lines"));
         let log_selector_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("label selector (all pods)"));
@@ -315,6 +326,8 @@ impl Workspace {
             palette_index: 0,
             palette_focus: root_focus,
             pending_tail: tail.map(Arc::new),
+            pending_mutation: None,
+            replicas_input,
             log_capacity: periscope_store::logs::DEFAULT_CAPACITY,
             exports: 0,
             frames: FrameMeter::new(perf),
@@ -376,6 +389,11 @@ impl Workspace {
         self.sweep_idle_clusters(Instant::now(), cx);
 
         cx.notify();
+    }
+
+    /// Sets which clusters may be changed, from settings.
+    pub fn set_permissions(&mut self, permissions: periscope_store::Permissions) {
+        self.state.set_permissions(permissions);
     }
 
     /// Running bridge counters.
@@ -576,6 +594,67 @@ impl Workspace {
             });
         }
         cx.notify();
+    }
+
+    // --- mutations ----------------------------------------------------------
+
+    /// Puts a mutation in front of the user. Nothing is sent until they agree.
+    fn propose(&mut self, mutation: Mutation, cx: &mut Context<Self>) {
+        self.pending_mutation = Some(Arc::new(mutation));
+        cx.notify();
+    }
+
+    /// Drops the proposal without doing anything.
+    fn cancel_mutation(&mut self, cx: &mut Context<Self>) {
+        self.pending_mutation = None;
+        cx.notify();
+    }
+
+    /// Sends the proposed mutation, if the store allows it.
+    fn confirm_mutation(&mut self, cx: &mut Context<Self>) {
+        let (Some(mutation), Some(cluster)) =
+            (self.pending_mutation.take(), self.state.active().cloned())
+        else {
+            return;
+        };
+
+        match self.state.authorize(&cluster, Arc::clone(&mutation)) {
+            Ok(authorized) => {
+                let (cluster, mutation) = authorized.into_parts();
+                tracing::info!(
+                    %cluster,
+                    verb = mutation.verb(),
+                    object = %mutation.key(),
+                    "sending mutation"
+                );
+                self.send(ClusterCommand::Mutate { cluster, mutation });
+            }
+            Err(refusal) => {
+                // A refusal the user cannot see is indistinguishable from a
+                // bug, so it joins the activity list like any other outcome.
+                tracing::warn!(%cluster, reason = refusal.reason(), "mutation refused");
+                self.state
+                    .record_refusal(cluster, mutation, &refusal, Instant::now());
+            }
+        }
+        cx.notify();
+    }
+
+    /// The replica count typed into the scale field, if it is a number.
+    fn typed_replicas(&self, cx: &App) -> Option<u32> {
+        self.replicas_input.read(cx).value().trim().parse().ok()
+    }
+
+    /// What the table says a workload's replica count currently is.
+    ///
+    /// Read from the row rather than fetched: the confirmation says "from 3 to
+    /// 5", and being one watch event stale there is better than a round trip
+    /// before every dialog.
+    fn current_replicas(&self, key: &ResourceKey) -> Option<u32> {
+        let row = self.state.rows().iter().find(|row| &row.key == key)?;
+        // Deployments and StatefulSets render READY as `ready/desired`.
+        let (_, desired) = row.cell(0).split_once('/')?;
+        desired.trim().parse().ok()
     }
 
     // --- logs ---------------------------------------------------------------
@@ -922,7 +1001,10 @@ impl Workspace {
     }
 
     fn dismiss(&mut self, _: &Dismiss, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette_open {
+        if self.pending_mutation.is_some() {
+            // Escape closes the most dangerous thing on screen first.
+            self.cancel_mutation(cx);
+        } else if self.palette_open {
             self.close_palette(cx);
         } else if self.state.logs().is_some() {
             self.close_logs(cx);
@@ -1016,6 +1098,23 @@ impl Workspace {
             .child(
                 h_flex()
                     .gap_2()
+                    .children(
+                        self.state
+                            .active()
+                            .filter(|cluster| !self.state.may_mutate(cluster))
+                            .map(|_| {
+                                // A cluster that refuses changes says so where
+                                // the user is looking, not only when they try.
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(cx.theme().secondary)
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("read-only")
+                            }),
+                    )
                     .child(
                         Button::new("palette")
                             .outline()
@@ -1296,6 +1395,21 @@ impl Workspace {
             .border_color(cx.theme().border)
             .text_xs()
             .text_color(cx.theme().muted_foreground)
+            .children(self.state.last_activity().map(|activity| {
+                div()
+                    .text_xs()
+                    .text_color(if activity.outcome.is_problem() {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(format!(
+                        "{} {} · {}",
+                        activity.mutation.verb(),
+                        activity.mutation.key(),
+                        activity.outcome.message()
+                    ))
+            }))
             .child(
                 h_flex()
                     .gap_2()
@@ -1642,6 +1756,154 @@ impl Workspace {
         };
 
         let is_pod = detail.kind().is_core() && &*detail.kind().kind == "Pod";
+        let is_node = detail.kind().is_core() && &*detail.kind().kind == "Node";
+        let kind = detail.kind().clone();
+        let key = detail.key().clone();
+        let writable = self
+            .state
+            .active()
+            .is_some_and(|cluster| self.state.may_mutate(cluster));
+
+        // Actions are offered only where they mean something, and only where
+        // the cluster allows changes at all.
+        let actions: Vec<_> = if !writable {
+            Vec::new()
+        } else {
+            let mut actions = Vec::new();
+
+            if periscope_cluster_actions::is_scalable(&kind) {
+                let (scale_kind, scale_key) = (kind.clone(), key.clone());
+                actions.push(
+                    Button::new("scale")
+                        .outline()
+                        .small()
+                        .label("Scale")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let Some(replicas) = this.typed_replicas(cx) else {
+                                this.last_error = Some(SharedString::from(
+                                    "Type a replica count next to Scale first.",
+                                ));
+                                cx.notify();
+                                return;
+                            };
+                            let current = this.current_replicas(&scale_key);
+                            this.propose(
+                                Mutation::Scale {
+                                    kind: scale_kind.clone(),
+                                    key: scale_key.clone(),
+                                    replicas,
+                                    current,
+                                },
+                                cx,
+                            );
+                        })),
+                );
+            }
+
+            if periscope_cluster_actions::is_restartable(&kind) {
+                let (restart_kind, restart_key) = (kind.clone(), key.clone());
+                actions.push(
+                    Button::new("restart")
+                        .outline()
+                        .small()
+                        .label("Restart")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.propose(
+                                Mutation::Restart {
+                                    kind: restart_kind.clone(),
+                                    key: restart_key.clone(),
+                                },
+                                cx,
+                            );
+                        })),
+                );
+            }
+
+            if is_node {
+                let node = key.name.clone();
+                let cordoned = self
+                    .state
+                    .rows()
+                    .iter()
+                    .find(|row| row.key == key)
+                    .is_some_and(|row| row.cell(0).contains("SchedulingDisabled"));
+                actions.push(
+                    Button::new("cordon")
+                        .outline()
+                        .small()
+                        .label(if cordoned { "Uncordon" } else { "Cordon" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.propose(
+                                Mutation::Cordon {
+                                    node: Arc::clone(&node),
+                                    cordon: !cordoned,
+                                },
+                                cx,
+                            );
+                        })),
+                );
+            }
+
+            let (dry_kind, dry_key) = (kind.clone(), key.clone());
+            actions.push(
+                Button::new("dry-run")
+                    .outline()
+                    .small()
+                    .label("Dry run")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let yaml = this.yaml_view.read(cx).value().to_string();
+                        this.propose(
+                            Mutation::Apply {
+                                kind: dry_kind.clone(),
+                                key: dry_key.clone(),
+                                yaml: Arc::from(yaml.as_str()),
+                                dry_run: true,
+                            },
+                            cx,
+                        );
+                    })),
+            );
+
+            let (apply_kind, apply_key) = (kind.clone(), key.clone());
+            actions.push(
+                Button::new("apply")
+                    .outline()
+                    .small()
+                    .label("Apply")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let yaml = this.yaml_view.read(cx).value().to_string();
+                        this.propose(
+                            Mutation::Apply {
+                                kind: apply_kind.clone(),
+                                key: apply_key.clone(),
+                                yaml: Arc::from(yaml.as_str()),
+                                dry_run: false,
+                            },
+                            cx,
+                        );
+                    })),
+            );
+
+            let (delete_kind, delete_key) = (kind.clone(), key.clone());
+            actions.push(
+                Button::new("delete")
+                    .danger()
+                    .small()
+                    .label("Delete")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.propose(
+                            Mutation::Delete {
+                                kind: delete_kind.clone(),
+                                key: delete_key.clone(),
+                                grace_period: None,
+                            },
+                            cx,
+                        );
+                    })),
+            );
+
+            actions
+        };
         let masked_note = match detail {
             Detail::Ready { object, .. } if object.maskable && !object.revealed => {
                 Some("values hidden")
@@ -1806,6 +2068,7 @@ impl Workspace {
                                         .child(note)
                                 })),
                         )
+                        .children(actions)
                         .children(is_pod.then(|| {
                             Button::new("tail-logs")
                                 .outline()
@@ -1833,6 +2096,104 @@ impl Workspace {
                         ),
                 )
                 .child(body),
+        )
+    }
+
+    /// The confirmation dialog.
+    ///
+    /// This is the guardrail the whole phase turns on, so it is deliberately
+    /// dull: one sentence naming the cluster, the namespace, the object and the
+    /// operation, and two buttons. Nothing is pre-selected, and the destructive
+    /// confirm is the only red thing on screen.
+    fn confirmation(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let mutation = self.pending_mutation.clone()?;
+        let cluster = self.state.active()?.clone();
+        let sentence = mutation.confirmation(&cluster);
+        let destructive = mutation.is_destructive();
+
+        let connection = self.state.connection(&cluster);
+        let health = connection
+            .filter(|connection| connection.state.is_problem())
+            .map(|connection| format!("This cluster is currently {}.", connection.state.label()));
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(gpui::black().opacity(0.5))
+                .child(
+                    v_flex()
+                        .absolute()
+                        .top(px(160.))
+                        .left_1_2()
+                        .ml(px(-280.))
+                        .w(px(560.))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(if destructive {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().border
+                        })
+                        .bg(cx.theme().background)
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .p_4()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().foreground)
+                                        .child(sentence),
+                                )
+                                .children(health.map(|health| {
+                                    div().text_xs().text_color(cx.theme().warning).child(health)
+                                }))
+                                .children(destructive.then(|| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("This cannot be undone.")
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_end()
+                                .gap_2()
+                                .px_4()
+                                .pb_4()
+                                .child(
+                                    Button::new("cancel-mutation")
+                                        .outline()
+                                        .small()
+                                        .label("Cancel")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.cancel_mutation(cx)),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("confirm-mutation")
+                                        .small()
+                                        .when(destructive, |button| button.danger())
+                                        .when(!destructive, |button| button.primary())
+                                        .label(match &*mutation {
+                                            Mutation::Delete { .. } => "Delete",
+                                            Mutation::Scale { .. } => "Scale",
+                                            Mutation::Restart { .. } => "Restart",
+                                            Mutation::Cordon { cordon: true, .. } => "Cordon",
+                                            Mutation::Cordon { .. } => "Uncordon",
+                                            Mutation::Apply { dry_run: true, .. } => "Dry run",
+                                            Mutation::Apply { .. } => "Apply",
+                                        })
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.confirm_mutation(cx)),
+                                        ),
+                                ),
+                        ),
+                ),
         )
     }
 
@@ -2002,6 +2363,7 @@ impl Render for Workspace {
                     )
                     .child(self.footer(cx)),
             )
+            .children(self.confirmation(cx))
             .children(self.palette_overlay(cx));
 
         if let Some(stats) = self.frames.finish(frame, Instant::now()) {
@@ -2846,6 +3208,211 @@ mod tests {
             }
             other => panic!("expected a restarted session, got {other:?}"),
         }
+    }
+
+    #[gpui::test]
+    fn a_mutation_is_not_sent_until_it_is_confirmed(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::Status {
+                cluster: "prod".into(),
+                state: ConnectionState::Connected,
+            }],
+        );
+        drain(&rx);
+
+        let delete = Mutation::Delete {
+            kind: pods(),
+            key: ResourceKey::new("default", "api-0"),
+            grace_period: None,
+        };
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.propose(delete, cx);
+        });
+
+        // Proposing sends nothing at all.
+        assert!(drain(&rx).is_empty());
+        assert!(harness.read(cx, |workspace| workspace.pending_mutation.is_some()));
+
+        harness.update(cx, |workspace, _window, cx| workspace.confirm_mutation(cx));
+
+        match drain(&rx).as_slice() {
+            [ClusterCommand::Mutate { cluster, mutation }] => {
+                assert_eq!(cluster, &ClusterId::new("prod"));
+                assert_eq!(mutation.verb(), "delete");
+            }
+            other => panic!("expected one mutation, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    fn cancelling_sends_nothing(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        drain(&rx);
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.propose(
+                Mutation::Delete {
+                    kind: pods(),
+                    key: ResourceKey::new("default", "api-0"),
+                    grace_period: None,
+                },
+                cx,
+            );
+        });
+        harness.keys(cx, "escape");
+
+        assert!(harness.read(cx, |workspace| workspace.pending_mutation.is_none()));
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[gpui::test]
+    fn escape_cancels_a_mutation_before_anything_else(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        harness.update(cx, |workspace, window, cx| {
+            workspace.open_object(ResourceKey::new("default", "api-0"), window, cx);
+            workspace.propose(
+                Mutation::Delete {
+                    kind: pods(),
+                    key: ResourceKey::new("default", "api-0"),
+                    grace_period: None,
+                },
+                cx,
+            );
+        });
+        drain(&rx);
+
+        harness.keys(cx, "escape");
+        harness.read(cx, |workspace| {
+            // The dialog went; the detail pane behind it stayed.
+            assert!(workspace.pending_mutation.is_none());
+            assert!(workspace.state().detail().is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn a_read_only_cluster_refuses_in_the_ui_and_sends_nothing(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::Status {
+                cluster: "prod".into(),
+                state: ConnectionState::Connected,
+            }],
+        );
+        drain(&rx);
+
+        harness.update(cx, |workspace, _window, cx| {
+            let mut permissions = periscope_store::Permissions::permissive();
+            permissions.deny(ClusterId::new("prod"));
+            workspace.state.set_permissions(permissions);
+
+            workspace.propose(
+                Mutation::Delete {
+                    kind: pods(),
+                    key: ResourceKey::new("default", "api-0"),
+                    grace_period: None,
+                },
+                cx,
+            );
+            workspace.confirm_mutation(cx);
+        });
+
+        // Confirmed, and still nothing went out.
+        assert!(drain(&rx).is_empty());
+        harness.read(cx, |workspace| {
+            let last = workspace.state().last_activity().expect("recorded");
+            assert!(last.outcome.is_problem());
+            assert!(last.outcome.message().contains("read-only"));
+        });
+    }
+
+    #[gpui::test]
+    fn a_confirmation_sentence_names_the_cluster_and_the_object(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.propose(
+                Mutation::Scale {
+                    kind: deployments(),
+                    key: ResourceKey::new("payments", "api"),
+                    replicas: 0,
+                    current: Some(3),
+                },
+                cx,
+            );
+
+            let cluster = workspace.state().active().unwrap().clone();
+            let sentence = workspace
+                .pending_mutation
+                .as_ref()
+                .unwrap()
+                .confirmation(&cluster);
+
+            assert!(sentence.contains("prod"), "{sentence}");
+            assert!(sentence.contains("payments"), "{sentence}");
+            assert!(sentence.contains("api"), "{sentence}");
+            assert!(sentence.contains("from 3"), "{sentence}");
+            assert!(sentence.contains("to 0"), "{sentence}");
+        });
+    }
+
+    #[gpui::test]
+    fn an_outcome_from_the_cluster_reaches_the_activity_line(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::MutationDone {
+                cluster: "prod".into(),
+                mutation: Arc::new(Mutation::Restart {
+                    kind: deployments(),
+                    key: ResourceKey::new("payments", "api"),
+                }),
+                outcome: periscope_bridge::MutationOutcome::Applied {
+                    detail: "api restarting".into(),
+                },
+            }],
+        );
+
+        harness.read(cx, |workspace| {
+            let last = workspace.state().last_activity().expect("recorded");
+            assert_eq!(last.outcome.message(), "api restarting");
+        });
     }
 
     #[gpui::test]

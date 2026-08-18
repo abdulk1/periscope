@@ -17,9 +17,12 @@ pub mod errors;
 pub mod handler;
 pub mod kubeconfig;
 pub mod logs;
+pub mod mutate;
 pub mod pods;
 pub mod watch;
+pub mod yaml;
 
 pub use errors::Failure;
 pub use handler::KubeHandler;
 pub use kubeconfig::Contexts;
+pub use mutate::WritePolicy;

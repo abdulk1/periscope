@@ -127,7 +127,8 @@ impl ConnectionRegistry {
             | ClusterEvent::ObjectFailed { .. }
             | ClusterEvent::LogBatch { .. }
             | ClusterEvent::LogSourceChanged { .. }
-            | ClusterEvent::LogsFailed { .. } => false,
+            | ClusterEvent::LogsFailed { .. }
+            | ClusterEvent::MutationDone { .. } => false,
         }
     }
 

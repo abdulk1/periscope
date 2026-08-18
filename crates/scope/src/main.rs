@@ -16,7 +16,7 @@ use gpui::{
 use gpui_component::Root;
 use gpui_component_assets::Assets;
 use periscope_bridge::{ClusterRuntime, LogTarget, PumpConfig, RuntimeConfig, spawn_event_pump};
-use periscope_cluster::KubeHandler;
+use periscope_cluster::{KubeHandler, WritePolicy};
 use periscope_ui::Workspace;
 
 use crate::cli::Cli;
@@ -46,10 +46,24 @@ fn main() -> Result<()> {
         "starting Periscope"
     );
 
+    // Settings decide which clusters may be changed. A malformed file is fatal
+    // rather than ignored: starting with permissive defaults when someone has
+    // written a read-only rule would be the worst possible failure here.
+    let settings = periscope_config::Settings::read().context("could not read settings")?;
+    let audit = periscope_config::AuditLog::open().context("could not open the audit log")?;
+    tracing::info!(
+        read_only = settings.access.read_only.len(),
+        read_only_by_default = settings.access.read_only_by_default,
+        audit = %audit.path().display(),
+        "settings loaded"
+    );
+
     let handler = match cli.kubeconfig.clone() {
         Some(path) => KubeHandler::with_kubeconfig(path),
         None => KubeHandler::new(),
-    };
+    }
+    .with_policy(WritePolicy::from_access(&settings.access))
+    .with_audit(audit);
     let (runtime, events) = ClusterRuntime::start(handler, RuntimeConfig::default())
         .context("could not start the cluster runtime")?;
     let commands = runtime.commands();
@@ -62,6 +76,9 @@ fn main() -> Result<()> {
         .as_deref()
         .zip(cli.namespace.as_deref())
         .map(|(selector, namespace)| LogTarget::labels(namespace, selector));
+    // The store's copy of the policy; the cluster layer has its own.
+    let permissions = periscope_store::Permissions::from_access(&settings.access);
+
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
@@ -79,14 +96,16 @@ fn main() -> Result<()> {
 
                 cx.open_window(window_options(), move |window, cx| {
                     let workspace = cx.new(|cx| {
-                        Workspace::with_tail(
+                        let mut workspace = Workspace::with_tail(
                             commands.clone(),
                             started,
                             perf,
                             tail.clone(),
                             window,
                             cx,
-                        )
+                        );
+                        workspace.set_permissions(permissions.clone());
+                        workspace
                     });
                     *captured.borrow_mut() = Some(workspace.clone());
                     cx.new(|cx| Root::new(workspace, window, cx))

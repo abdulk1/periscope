@@ -42,6 +42,35 @@ therefore tracked against `--release`. Some of the debug cost is the runtime
 shader compilation from ADR-0008; the rest is unoptimised GPUI layout code that
 the `[profile.dev.package]` overrides only partly cover.
 
+## Phase 5 scope — partial
+
+The read-only invariant is over: Periscope can now delete, scale, restart
+(rollout), cordon and uncordon, and apply edited YAML with a server-side dry run
+first. Every one goes through a confirmation naming the cluster, two independent
+read-only gates, and the audit log.
+
+**Three Phase 5 deliverables are not built yet:**
+
+- **Exec into a container.** Terminal emulation is a substantial piece of work
+  in its own right — a VT parser, a grid renderer and a resize protocol — and
+  none of it exists here.
+- **Port-forward.** Nothing forwards yet, so the "port-forwards survive a brief
+  network interruption or die loudly" criterion is untested and unmet.
+- **Drain.** Cordon is implemented; evicting the pods that are already on a node
+  is not.
+
+Smaller gaps in what *is* built:
+
+- **Delete has no cascade choice.** It uses the apiserver's default propagation;
+  there is no orphan/background/foreground selector.
+- **Scale reads its current replica count from the table**, so a confirmation
+  can quote a number one watch event out of date. It says "from 3 to 5" as a
+  courtesy; the apiserver, not that number, decides what happens.
+- **No undo.** There is an audit log, not a journal that can be replayed
+  backwards.
+- **Settings are read once at startup.** Editing `settings.toml` while the app
+  runs has no effect until it is restarted.
+
 ## Phase 4 scope
 
 Several clusters at once: lazy connect when a pane first points at one, warm
@@ -123,6 +152,9 @@ kinds and seeded with 10,009 pods, release build:
 | 5 clusters connected simultaneously stay under 800MB | Five clusters holding 50,110 rows: **29MB** resident, flat over a 45s soak. See the caveat below |
 | Switching between clusters is instant | Under a millisecond for a warm cluster; the rows are already held, so switching is a selection and a filter pass |
 | One unreachable cluster degrades only its own pane | Verified: a context pointing at a closed port reports its own failure with the real reason while its neighbours connect and stream normally |
+| Read-only contexts reject mutations at the store layer | Verified by a unit test on `AppState::authorize`, and end to end against the cluster: a marked context refuses a delete, the object is still there afterwards, and the refusal is in the audit log |
+| Every destructive action is reachable only through a confirmation naming the cluster | Verified: nothing is sent until `confirm_mutation`, and a test asserts every mutation variant's sentence names its cluster |
+| Port-forwards survive a brief interruption or die loudly | **Not met — port-forwarding is not built yet** |
 
 The load fixture is `cargo run --release -p periscope-e2e --bin seed-pods`.
 

@@ -18,8 +18,9 @@ use periscope_bridge::{
 use tokio::task::JoinHandle;
 
 use crate::errors::Failure;
+use crate::mutate::WritePolicy;
 use crate::watch::Filter;
-use crate::{detail, discovery, kubeconfig, logs, watch};
+use crate::{detail, discovery, kubeconfig, logs, mutate, watch};
 
 /// Connects to clusters, discovers what they serve, and streams it.
 #[derive(Debug, Default)]
@@ -27,6 +28,12 @@ pub struct KubeHandler {
     sessions: Arc<Sessions>,
     /// Where kubeconfig comes from; `None` is the standard search.
     source: kubeconfig::Source,
+    /// Which clusters this process will change. Checked again here even though
+    /// the store checks first: see `docs/DECISIONS.md` ADR-0028.
+    policy: Arc<WritePolicy>,
+    /// Where actions are recorded. `None` disables the log, which is only ever
+    /// the case in tests.
+    audit: Option<Arc<periscope_config::AuditLog>>,
 }
 
 /// One connected cluster.
@@ -190,9 +197,21 @@ impl KubeHandler {
     /// A handler that reads one specific kubeconfig file.
     pub fn with_kubeconfig(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
-            sessions: Arc::default(),
             source: Some(path.into()),
+            ..Self::default()
         }
+    }
+
+    /// Sets which clusters may be changed.
+    pub fn with_policy(mut self, policy: WritePolicy) -> Self {
+        self.policy = Arc::new(policy);
+        self
+    }
+
+    /// Sets where actions are recorded.
+    pub fn with_audit(mut self, audit: periscope_config::AuditLog) -> Self {
+        self.audit = Some(Arc::new(audit));
+        self
     }
 
     /// How many clusters are currently connected.
@@ -310,6 +329,8 @@ impl CommandHandler for KubeHandler {
     fn handle(&self, command: ClusterCommand, events: EventSink) -> BoxFuture<'static, ()> {
         let sessions = Arc::clone(&self.sessions);
         let source = self.source.clone();
+        let policy = Arc::clone(&self.policy);
+        let audit = self.audit.clone();
 
         Box::pin(async move {
             match command {
@@ -444,6 +465,43 @@ impl CommandHandler for KubeHandler {
                 ClusterCommand::StopLogs { cluster } => {
                     let stopped = sessions.stop_logs(&cluster);
                     tracing::debug!(%cluster, stopped, "log session stopped");
+                }
+
+                ClusterCommand::Mutate { cluster, mutation } => {
+                    let Some(session) = sessions.session(&cluster) else {
+                        events.send(ClusterEvent::MutationDone {
+                            cluster,
+                            mutation,
+                            outcome: periscope_bridge::MutationOutcome::Refused {
+                                reason: "not connected to this cluster".to_owned(),
+                            },
+                        });
+                        return;
+                    };
+
+                    let namespaced = is_namespaced(&session, &mutation.kind());
+                    let outcome = mutate::run(
+                        cluster.clone(),
+                        session.client,
+                        Arc::clone(&mutation),
+                        namespaced,
+                        &policy,
+                        audit.as_deref(),
+                    )
+                    .await;
+
+                    tracing::info!(
+                        %cluster,
+                        verb = mutation.verb(),
+                        object = %mutation.key(),
+                        outcome = outcome.message(),
+                        "mutation"
+                    );
+                    events.send(ClusterEvent::MutationDone {
+                        cluster,
+                        mutation,
+                        outcome,
+                    });
                 }
 
                 ClusterCommand::Disconnect { cluster } => {

@@ -199,6 +199,123 @@ pub fn delete_pod(namespace: &str, name: &str) -> anyhow::Result<()> {
     })
 }
 
+/// Applies a YAML manifest, for tests that need something to change.
+///
+/// The e2e crate is allowed to write; the application is not.
+pub fn apply_yaml(yaml: &str) -> anyhow::Result<()> {
+    use kube::api::{Patch, PatchParams};
+
+    let object: serde_json::Value = serde_saphyr::from_str(yaml)?;
+    let name = object["metadata"]["name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("the manifest has no name"))?
+        .to_owned();
+    let namespace = object["metadata"]["namespace"]
+        .as_str()
+        .unwrap_or("default")
+        .to_owned();
+
+    blocking(async move {
+        let api: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
+            kube::Api::namespaced(client().await?, &namespace);
+        api.patch(
+            &name,
+            &PatchParams::apply("periscope-e2e").force(),
+            &Patch::Apply(&object),
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+/// Deletes a deployment, ignoring one that is already gone.
+pub fn delete_deployment(namespace: &str, name: &str) -> anyhow::Result<()> {
+    use k8s_openapi::api::apps::v1::Deployment;
+    use kube::api::DeleteParams;
+
+    let (namespace, name) = (namespace.to_owned(), name.to_owned());
+    blocking(async move {
+        let api: kube::Api<Deployment> = kube::Api::namespaced(client().await?, &namespace);
+        match api.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    })
+}
+
+/// Reads a deployment, for asserting what a mutation did.
+fn deployment(namespace: &str, name: &str) -> Option<k8s_openapi::api::apps::v1::Deployment> {
+    use k8s_openapi::api::apps::v1::Deployment;
+
+    let (namespace, name) = (namespace.to_owned(), name.to_owned());
+    let found = std::cell::RefCell::new(None);
+    blocking(async {
+        let api: kube::Api<Deployment> = kube::Api::namespaced(client().await?, &namespace);
+        *found.borrow_mut() = api.get_opt(&name).await?;
+        Ok(())
+    })
+    .ok()?;
+    found.into_inner()
+}
+
+/// Whether a deployment exists.
+pub fn deployment_exists(namespace: &str, name: &str) -> bool {
+    deployment(namespace, name).is_some()
+}
+
+/// A deployment's desired replica count.
+pub fn deployment_replicas(namespace: &str, name: &str) -> Option<i32> {
+    deployment(namespace, name)?.spec?.replicas
+}
+
+/// Whether a deployment carries the annotation `kubectl rollout restart` sets.
+pub fn deployment_has_restart_annotation(namespace: &str, name: &str) -> bool {
+    deployment(namespace, name)
+        .and_then(|deployment| deployment.spec)
+        .and_then(|spec| spec.template.metadata)
+        .and_then(|metadata| metadata.annotations)
+        .is_some_and(|annotations| annotations.contains_key("kubectl.kubernetes.io/restartedAt"))
+}
+
+/// The first node in the cluster.
+pub fn first_node() -> Option<String> {
+    use k8s_openapi::api::core::v1::Node;
+
+    let name = std::cell::RefCell::new(None);
+    blocking(async {
+        let api: kube::Api<Node> = kube::Api::all(client().await?);
+        *name.borrow_mut() = api
+            .list(&kube::api::ListParams::default())
+            .await?
+            .items
+            .first()
+            .and_then(|node| node.metadata.name.clone());
+        Ok(())
+    })
+    .ok()?;
+    name.into_inner()
+}
+
+/// Whether a node is cordoned.
+pub fn node_unschedulable(name: &str) -> Option<bool> {
+    use k8s_openapi::api::core::v1::Node;
+
+    let name = name.to_owned();
+    let flag = std::cell::RefCell::new(None);
+    blocking(async {
+        let api: kube::Api<Node> = kube::Api::all(client().await?);
+        *flag.borrow_mut() = api
+            .get_opt(&name)
+            .await?
+            .and_then(|node| node.spec)
+            .and_then(|spec| spec.unschedulable);
+        Ok(())
+    })
+    .ok()?;
+    flag.into_inner()
+}
+
 /// Runs one future to completion on a throwaway runtime.
 ///
 /// The tests are synchronous — they drive the same bridge the UI does — so the

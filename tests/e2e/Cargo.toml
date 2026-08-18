@@ -20,6 +20,8 @@ periscope-bridge.workspace = true
 periscope-cluster.workspace = true
 periscope-store.workspace = true
 serde_json.workspace = true
+serde-saphyr.workspace = true
+periscope-config.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [[bin]]

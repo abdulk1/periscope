@@ -7,9 +7,11 @@
 pub mod app;
 pub mod connections;
 pub mod logs;
+pub mod permissions;
 pub mod table;
 
 pub use app::{AppState, Detail, Filters};
 pub use connections::{Connection, ConnectionRegistry};
 pub use logs::{FilterSpec, LogBuffer};
+pub use permissions::{Authorized, Permissions, Refusal};
 pub use table::ResourceTable;

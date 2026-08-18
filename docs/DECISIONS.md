@@ -681,3 +681,82 @@ criterion asks for ("two clusters can be viewed side by side"), and the smaller
 mechanism does it. If Phase 6 wants saved layouts or more than two panes, the
 dock system is the thing to reach for then — this is a deliberate deferral, not
 an oversight.
+
+---
+
+## ADR-0028 — Mutations pass two independent gates
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Ends:** the read-only invariant declared in `IMPLEMENTATION.md` §0.6, which
+held from Phase 0 to Phase 4.
+
+Until now the app could not change a cluster because it contained no code that
+could. That property is gone, so it is replaced by two checks that do not share
+an implementation:
+
+1. **The store** (`crates/store/src/permissions.rs`). `AppState::authorize`
+   returns an `Authorized` value, and `Authorized` has no public constructor —
+   so a caller cannot send a mutation it never asked permission for. This is the
+   gate the acceptance criterion names, and the test that proves it lives beside
+   it.
+2. **The cluster layer** (`crates/cluster/src/mutate.rs`). `WritePolicy` is
+   checked again immediately before the request goes out. It is built from the
+   same settings, but it is a separate type with its own tests, because the
+   point is that a bug in the first gate is not enough.
+
+Both refuse the same way, both record the refusal, and the second one logs a
+warning when it fires — a refusal there means something above it skipped a
+check, which is worth knowing about.
+
+Read-only is opt-in. Periscope's default is to have no opinion: it is exactly as
+dangerous as the credentials it was handed, and pretending otherwise would train
+people to ignore the setting that matters.
+
+---
+
+## ADR-0029 — Every attempt is written down, including the refused ones
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+`audit.log` gets one JSON object per line for every mutation Periscope
+attempts — applied, dry-run, refused or failed — written *before* the outcome
+reaches the UI. It answers "what did I do to that cluster at four o'clock"
+without depending on anyone's memory.
+
+Deliberate choices:
+
+- **Refusals are recorded.** A read-only cluster refusing a delete is exactly
+  the kind of thing worth being able to prove later.
+- **Context names, not server URLs.** The audit log is the one file that could
+  leak what the rest of the app is careful never to write down, so it records
+  the name the user chose and nothing about how to reach the cluster. A test
+  asserts a line contains no URL and no token.
+- **A failed write is logged, never fatal.** Losing the ability to record an
+  action is not a reason to refuse to perform one — but it is a reason to say so
+  loudly in the app log.
+- **Read back with `filter_map`.** A line truncated by a crash is skipped rather
+  than making the whole history unreadable.
+
+---
+
+## ADR-0030 — The confirmation is generated from the request
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+"Every mutation requires explicit confirmation showing cluster name, object,
+namespace, and the exact operation" could have been a dialog assembled in the
+view. It is not: `Mutation::confirmation(cluster)` builds the sentence from the
+same value that will be sent, so the two cannot drift. A test asserts that every
+variant's sentence names the cluster.
+
+The sentence leads with the operation and ends with the cluster — *"Delete
+deployments.apps api in namespace payments on cluster prod?"* — because the
+mistake this exists to prevent is doing the right thing to the wrong cluster,
+and the cluster is the last thing read before the pointer moves to the button.
+
+Nothing is pre-selected in the dialog, destructive confirms are the only red
+control on screen, and `Escape` cancels the mutation before it closes anything
+else that happens to be open.

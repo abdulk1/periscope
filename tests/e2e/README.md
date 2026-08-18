@@ -25,6 +25,10 @@ for the same one-node cluster.
 | `tests/discovery.rs` | Discovery with CRDs, generic tables, filters, secret masking, and the detail fetch |
 | `tests/logs.rs` | Tailing one pod and fifty, merging, re-attach after a restart, and the ingest-rate budget |
 | `tests/multicluster.rs` | Five clusters at once, the row budget, warm switching, and one unreachable cluster |
+| `tests/mutations.rs` | Delete, scale, restart, cordon, apply and dry run — plus a read-only cluster refusing, and the audit log |
+
+`tests/mutations.rs` **changes the cluster**: each test creates the deployment it
+acts on and deletes it afterwards, and the cordon test always uncordons.
 
 The auth tests write a throwaway kubeconfig into the temp directory and point the
 app at it with `--kubeconfig`'s programmatic equivalent, so the developer's own

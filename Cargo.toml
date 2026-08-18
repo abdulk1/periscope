@@ -57,6 +57,9 @@ tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 
 # Everything else.
+# Settings live in TOML; edits are applied from YAML.
+toml = "1.1"
+serde-saphyr = "0.0.29"
 # The same fuzzy matcher Zed uses, for the command palette.
 nucleo-matcher = "0.3"
 # Log filtering: substring is hand-rolled, patterns are not.
