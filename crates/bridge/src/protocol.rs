@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::coalesce::CoalesceKey;
-use crate::resource::{ContextInfo, PodSnapshot, ResourceKey};
+use crate::resource::{
+    ColumnSpec, ContextInfo, KindId, KindInfo, ObjectDetail, ResourceKey, ResourceRow,
+};
 
 /// Identifies a connected cluster. This is the kubeconfig context name, which
 /// is what the user sees and what every error message must be able to name.
@@ -62,6 +64,42 @@ pub enum ClusterCommand {
         /// Which kubeconfig context to connect to.
         cluster: ClusterId,
     },
+    /// Ask the apiserver what kinds it serves, including CRDs. Answered with
+    /// [`ClusterEvent::Kinds`].
+    Discover {
+        /// Which cluster to interrogate.
+        cluster: ClusterId,
+    },
+    /// Start streaming a kind. Replaces any watch already running for that
+    /// kind on that cluster, which is how the namespace and selector filters
+    /// are applied.
+    Watch {
+        /// Which cluster.
+        cluster: ClusterId,
+        /// Which kind.
+        kind: KindId,
+        /// Restrict to one namespace, or `None` for every namespace.
+        namespace: Option<Arc<str>>,
+        /// A label selector, e.g. `app=web,tier!=cache`.
+        selector: Option<Arc<str>>,
+    },
+    /// Stop streaming a kind and forget its rows.
+    StopWatch {
+        /// Which cluster.
+        cluster: ClusterId,
+        /// Which kind.
+        kind: KindId,
+    },
+    /// Fetch one object in full, for the detail view. Answered with
+    /// [`ClusterEvent::Object`] or [`ClusterEvent::ObjectFailed`].
+    FetchObject {
+        /// Which cluster.
+        cluster: ClusterId,
+        /// Which kind.
+        kind: KindId,
+        /// Which object.
+        key: ResourceKey,
+    },
     /// Round-trip liveness probe. The cluster layer answers with
     /// [`ClusterEvent::Pong`] carrying the same nonce.
     Ping {
@@ -83,7 +121,11 @@ impl ClusterCommand {
         match self {
             Self::Ping { cluster, .. }
             | Self::Disconnect { cluster }
-            | Self::Connect { cluster } => Some(cluster),
+            | Self::Connect { cluster }
+            | Self::Discover { cluster }
+            | Self::Watch { cluster, .. }
+            | Self::StopWatch { cluster, .. }
+            | Self::FetchObject { cluster, .. } => Some(cluster),
             Self::ListContexts => None,
         }
     }
@@ -191,29 +233,65 @@ pub enum ClusterEvent {
         /// Verbatim underlying reason.
         reason: String,
     },
-    /// A complete pod list for a cluster, replacing whatever the store held.
+    /// The kinds a cluster serves, from the discovery endpoint.
+    Kinds {
+        /// Cluster the kinds belong to.
+        cluster: ClusterId,
+        /// Every kind, including custom resources.
+        kinds: Arc<[KindInfo]>,
+    },
+    /// A complete listing for one kind, replacing whatever the store held.
     ///
     /// Emitted when a watch starts and whenever it has to restart, which is the
     /// only way to learn that objects disappeared while the watch was down.
-    PodsReset {
-        /// Cluster the list belongs to.
+    ResourceReset {
+        /// Cluster the listing belongs to.
         cluster: ClusterId,
-        /// Every pod visible to this client, in no particular order.
-        pods: Arc<[PodSnapshot]>,
+        /// Kind that was listed.
+        kind: KindId,
+        /// The columns these rows carry cells for.
+        columns: Arc<[ColumnSpec]>,
+        /// Every object visible to this client, in no particular order.
+        rows: Arc<[ResourceRow]>,
     },
-    /// A pod was added or changed.
-    PodApplied {
-        /// Cluster the pod belongs to.
+    /// An object was added or changed.
+    ResourceApplied {
+        /// Cluster the object belongs to.
         cluster: ClusterId,
-        /// The pod's current state.
-        pod: Arc<PodSnapshot>,
+        /// Kind of the object.
+        kind: KindId,
+        /// The object's current row.
+        row: Arc<ResourceRow>,
     },
-    /// A pod was deleted.
-    PodDeleted {
-        /// Cluster the pod belonged to.
+    /// An object was deleted.
+    ResourceDeleted {
+        /// Cluster the object belonged to.
         cluster: ClusterId,
-        /// Which pod.
+        /// Kind of the object.
+        kind: KindId,
+        /// Which object.
         key: ResourceKey,
+    },
+    /// A full object, for the detail view.
+    Object {
+        /// Cluster the object belongs to.
+        cluster: ClusterId,
+        /// Kind of the object.
+        kind: KindId,
+        /// The object, its events and its owners.
+        detail: Arc<ObjectDetail>,
+    },
+    /// An object could not be fetched. Shown in place of the detail view, never
+    /// as an empty pane.
+    ObjectFailed {
+        /// Cluster the object belongs to.
+        cluster: ClusterId,
+        /// Kind of the object.
+        kind: KindId,
+        /// Which object.
+        key: ResourceKey,
+        /// Verbatim underlying reason.
+        reason: String,
     },
 }
 
@@ -229,22 +307,28 @@ pub enum EventKey {
     Stale(Option<ClusterId>),
     /// Only the newest reading of kubeconfig matters.
     Contexts,
-    /// Latest state of one pod wins; a delete supersedes an earlier update.
-    Pod(ClusterId, ResourceKey),
-    /// A full resync supersedes every pending pod event for its cluster.
-    PodsReset(ClusterId),
+    /// Only the newest discovery result for a cluster matters.
+    Kinds(ClusterId),
+    /// Latest state of one object wins; a delete supersedes an earlier update.
+    Resource(ClusterId, KindId, ResourceKey),
+    /// A full resync supersedes every pending event for that cluster and kind.
+    ResourceReset(ClusterId, KindId),
+    /// Only the newest detail fetch for an object matters.
+    Object(ClusterId, KindId, ResourceKey),
 }
 
 impl CoalesceKey for EventKey {
     fn is_barrier(&self) -> bool {
-        matches!(self, Self::PodsReset(_))
+        matches!(self, Self::ResourceReset(..))
     }
 
     fn supersedes(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::PodsReset(cluster), Self::Pod(other, _) | Self::PodsReset(other)) => {
-                cluster == other
-            }
+            (
+                Self::ResourceReset(cluster, kind),
+                Self::Resource(other_cluster, other_kind, _)
+                | Self::ResourceReset(other_cluster, other_kind),
+            ) => cluster == other_cluster && kind == other_kind,
             _ => false,
         }
     }
@@ -261,11 +345,34 @@ impl ClusterEvent {
             Self::Contexts { .. } | Self::ConfigFailed { .. } => Some(EventKey::Contexts),
             Self::Status { cluster, .. } => Some(EventKey::Status(cluster.clone())),
             Self::Stale { cluster, .. } => Some(EventKey::Stale(cluster.clone())),
-            Self::PodsReset { cluster, .. } => Some(EventKey::PodsReset(cluster.clone())),
-            Self::PodApplied { cluster, pod } => {
-                Some(EventKey::Pod(cluster.clone(), pod.key.clone()))
+            Self::Kinds { cluster, .. } => Some(EventKey::Kinds(cluster.clone())),
+            Self::ResourceReset { cluster, kind, .. } => {
+                Some(EventKey::ResourceReset(cluster.clone(), kind.clone()))
             }
-            Self::PodDeleted { cluster, key } => Some(EventKey::Pod(cluster.clone(), key.clone())),
+            Self::ResourceApplied { cluster, kind, row } => Some(EventKey::Resource(
+                cluster.clone(),
+                kind.clone(),
+                row.key.clone(),
+            )),
+            Self::ResourceDeleted { cluster, kind, key } => Some(EventKey::Resource(
+                cluster.clone(),
+                kind.clone(),
+                key.clone(),
+            )),
+            // A failure and a success answer the same request, so the newer one
+            // must replace the older rather than both landing.
+            Self::Object {
+                cluster,
+                kind,
+                detail,
+            } => Some(EventKey::Object(
+                cluster.clone(),
+                kind.clone(),
+                detail.key.clone(),
+            )),
+            Self::ObjectFailed {
+                cluster, kind, key, ..
+            } => Some(EventKey::Object(cluster.clone(), kind.clone(), key.clone())),
         }
     }
 
@@ -274,9 +381,12 @@ impl ClusterEvent {
         match self {
             Self::Pong { cluster, .. }
             | Self::Status { cluster, .. }
-            | Self::PodsReset { cluster, .. }
-            | Self::PodApplied { cluster, .. }
-            | Self::PodDeleted { cluster, .. } => Some(cluster),
+            | Self::Kinds { cluster, .. }
+            | Self::ResourceReset { cluster, .. }
+            | Self::ResourceApplied { cluster, .. }
+            | Self::ResourceDeleted { cluster, .. }
+            | Self::Object { cluster, .. }
+            | Self::ObjectFailed { cluster, .. } => Some(cluster),
             Self::Stale { cluster, .. } => cluster.as_ref(),
             Self::Contexts { .. } | Self::ConfigFailed { .. } => None,
         }
@@ -286,6 +396,7 @@ impl ClusterEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::ResourceRow;
 
     #[test]
     fn cluster_id_round_trips() {
@@ -335,47 +446,83 @@ mod tests {
     }
 
     #[test]
-    fn a_resync_supersedes_pending_pod_events_for_its_own_cluster_only() {
-        let reset = EventKey::PodsReset("prod".into());
+    fn a_resync_supersedes_pending_events_for_its_own_cluster_and_kind_only() {
+        let pods = KindId::new("", "v1", "Pod", "pods");
+        let deployments = KindId::new("apps", "v1", "Deployment", "deployments");
+        let reset = EventKey::ResourceReset("prod".into(), pods.clone());
         assert!(reset.is_barrier());
 
-        assert!(reset.supersedes(&EventKey::Pod(
+        assert!(reset.supersedes(&EventKey::Resource(
             "prod".into(),
+            pods.clone(),
             ResourceKey::new("default", "api-0")
         )));
-        assert!(reset.supersedes(&EventKey::PodsReset("prod".into())));
+        assert!(reset.supersedes(&EventKey::ResourceReset("prod".into(), pods.clone())));
 
-        // Another cluster's pods, and this cluster's connection state, survive.
-        assert!(!reset.supersedes(&EventKey::Pod(
+        // Another cluster, another kind, and this cluster's connection state
+        // all survive: a pod resync says nothing about deployments.
+        assert!(!reset.supersedes(&EventKey::Resource(
             "staging".into(),
+            pods.clone(),
             ResourceKey::new("default", "api-0")
+        )));
+        assert!(!reset.supersedes(&EventKey::Resource(
+            "prod".into(),
+            deployments,
+            ResourceKey::new("default", "api")
         )));
         assert!(!reset.supersedes(&EventKey::Status("prod".into())));
     }
 
     #[test]
-    fn pod_events_are_keyed_by_object_so_a_delete_supersedes_an_update() {
-        let pod = PodSnapshot {
+    fn object_events_are_keyed_by_object_so_a_delete_supersedes_an_update() {
+        let kind = KindId::new("", "v1", "Pod", "pods");
+        let row = ResourceRow {
             key: ResourceKey::new("default", "api-0"),
             uid: None,
-            status: Arc::from("Running"),
-            ready: 1,
-            containers: 1,
-            restarts: 0,
-            node: None,
+            cells: Arc::from([] as [Arc<str>; 0]),
+            state: crate::resource::RowState::Healthy,
             created: None,
         };
-        let applied = ClusterEvent::PodApplied {
+        let applied = ClusterEvent::ResourceApplied {
             cluster: "prod".into(),
-            pod: Arc::new(pod.clone()),
+            kind: kind.clone(),
+            row: Arc::new(row.clone()),
         };
-        let deleted = ClusterEvent::PodDeleted {
+        let deleted = ClusterEvent::ResourceDeleted {
             cluster: "prod".into(),
-            key: pod.key.clone(),
+            kind,
+            key: row.key.clone(),
         };
 
         assert_eq!(applied.coalesce_key(), deleted.coalesce_key());
         assert!(!applied.coalesce_key().unwrap().is_barrier());
+    }
+
+    #[test]
+    fn a_detail_fetch_and_its_failure_share_a_key() {
+        let kind = KindId::new("", "v1", "Pod", "pods");
+        let key = ResourceKey::new("default", "api-0");
+        let ok = ClusterEvent::Object {
+            cluster: "prod".into(),
+            kind: kind.clone(),
+            detail: Arc::new(crate::resource::ObjectDetail {
+                key: key.clone(),
+                yaml: Arc::from("kind: Pod"),
+                events: Arc::from([] as [crate::resource::EventLine; 0]),
+                owners: Arc::from([] as [crate::resource::OwnerRef; 0]),
+            }),
+        };
+        let failed = ClusterEvent::ObjectFailed {
+            cluster: "prod".into(),
+            kind,
+            key,
+            reason: "not found".into(),
+        };
+
+        // Both answer the same request; the newer one must win rather than the
+        // detail pane showing an error next to the object it just loaded.
+        assert_eq!(ok.coalesce_key(), failed.coalesce_key());
     }
 
     #[test]

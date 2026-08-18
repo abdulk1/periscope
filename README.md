@@ -5,12 +5,14 @@ affordances: live resource streams, multi-cluster, and log tailing across pods.
 
 **Binary:** `scope` · **Language:** Rust · **UI:** GPUI
 
-> **Status: Phase 1 (reads one cluster).** Connects to a kubeconfig context and
-> renders live pods in a virtualised table — namespace, name, ready, status,
-> restarts, age, node — with the connection state and the real API error text
-> always visible. Pods only: other resources, CRDs, detail views and logs are
-> Phases 2 and 3. See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap
-> and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not work.
+> **Status: Phase 2 (navigate everything).** Connects to a kubeconfig context,
+> discovers every kind the cluster serves — CRDs included — and streams any of
+> them into a virtualised table with the columns `kubectl` prints. Fuzzy jump
+> palette (⌘K), namespace and label-selector filters, and a detail pane with
+> YAML, events and owner-reference navigation. Read-only. Logs are Phase 3 and
+> multi-cluster is Phase 4. See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the
+> roadmap and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not
+> work.
 
 ## Build and run
 
@@ -24,8 +26,15 @@ cargo run --release --bin scope -- --perf              # log watch throughput an
 ```
 
 It connects to the `current-context` on start; the sidebar lists every context
-and connects to whichever you click. Prefer `--release`: debug builds miss the
+and every kind the cluster serves. Prefer `--release`: debug builds miss the
 cold-start budget by a wide margin (`docs/LIMITATIONS.md`).
+
+| Key | Does |
+|---|---|
+| `⌘K` / `ctrl-K` | Jump to a cluster, a kind, or an object by name |
+| `↑` `↓` `enter` | Move through the jump results and open one |
+| `escape` | Close the palette, then the detail pane |
+| `enter` in the namespace or selector field | Re-list with that filter |
 
 Logs are written to a daily-rotating file under the platform's application data
 directory; the path is printed in the log's first line and shown by `--verbose`.

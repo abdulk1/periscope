@@ -6,8 +6,8 @@
 
 pub mod app;
 pub mod connections;
-pub mod pods;
+pub mod table;
 
-pub use app::AppState;
+pub use app::{AppState, Detail, Filters};
 pub use connections::{Connection, ConnectionRegistry};
-pub use pods::PodTable;
+pub use table::ResourceTable;

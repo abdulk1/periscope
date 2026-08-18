@@ -10,6 +10,9 @@
 //! Until Phase 5 no code path in this crate may mutate cluster state. Every
 //! request it makes is a get, list or watch. New commands must be reads.
 
+pub mod columns;
+pub mod detail;
+pub mod discovery;
 pub mod errors;
 pub mod handler;
 pub mod kubeconfig;

@@ -42,38 +42,49 @@ therefore tracked against `--release`. Some of the debug cost is the runtime
 shader compilation from ADR-0008; the rest is unoptimised GPUI layout code that
 the `[profile.dev.package]` overrides only partly cover.
 
-## Phase 1 scope
+## Phase 2 scope
 
-The build connects to a cluster and streams **pods, and only pods**. There is no
-resource discovery, no CRDs, no other built-in kinds, no detail view, no YAML, no
-logs, no namespace or label filtering and no command palette; those are Phases 2
-and 3. The pod table has no sorting controls, no selection, and no keyboard
-navigation — rows are ordered by namespace then name, always.
+The build connects to a cluster, discovers every kind it serves — CRDs included —
+and streams any one of them into a table. What it does **not** do yet:
 
-Pods are watched cluster-wide (`Api::all`). A credential that may only list pods
-in one namespace will fail with a `403` and be reported as an auth failure; the
-namespaced fallback is not implemented.
+- **Logs.** No log tailing at all; that is Phase 3, and it is the differentiator.
+- **Multi-cluster.** One cluster is watched at a time. The store holds rows for
+  clusters you have visited, and switching back is instant, but nothing streams
+  in the background and there are no side-by-side panes (Phase 4).
+- **Mutations.** Still strictly read-only until Phase 5: no delete, scale,
+  edit, exec or port-forward.
+- **Sorting and column choice.** Rows are ordered by namespace then name, always.
+  Columns per kind are what `columns.rs` says; they are not user-configurable.
+- **A describe view.** The detail pane shows YAML, events and owner references.
+  `kubectl describe`'s prose summary is not reimplemented.
+- **CRD printer columns.** A custom resource renders with the generic
+  `STATUS`/`READY` fallback rather than the `additionalPrinterColumns` its CRD
+  declares. Reading those is a natural next step and is not done.
+- **Namespace autocomplete.** The namespace filter is a text field. The
+  namespaces seen in the current table are counted in the toolbar, but there is
+  no picker.
 
-The store holds a table per cluster and switching between them is instant, but
-the UI only auto-connects the cluster you are looking at, and clusters are
-connected one at a time by clicking them. Concurrent multi-cluster watching, warm
-idle clusters and side-by-side panes are Phase 4.
+Two behaviours worth knowing because they are deliberate:
 
-Disconnecting empties the table on purpose: after the watch stops we no longer
-know what is running, and rows that look live but are not are worse than none.
+- Switching kinds **stops** the previous watch (ADR-0019). Rows stay in the
+  store; updates do not.
+- The detail pane fetches the object when you open it (ADR-0018), so its YAML is
+  current rather than a replay of the last watch event.
 
-## Measured against the Phase 1 budgets
+## Measured against the budgets
 
-On an M-series Mac against a one-node `kind` cluster (Kubernetes 1.36) seeded
-with 10,009 pods, release build:
+On an M-series Mac against a one-node `kind` cluster (Kubernetes 1.36) serving 68
+kinds and seeded with 10,009 pods, release build:
 
 | Budget (`IMPLEMENTATION.md` §3, §4) | Measured |
 |---|---|
-| Cold start to window < 500ms | 225–273ms (release) |
-| First render of a 10k-pod list < 3s | 1.6s from process start to 10,009 rows; 406ms of that is list + projection, 0.9ms is store insert and sort |
-| External pod change visible < 1s | 17ms create → event, 15ms delete → event |
-| Memory, 1 cluster / 10k pods < 300MB | 78MB RSS |
-| Scroll frame rate ≥ 60fps, target 120fps | 60.0–60.1fps sustained, 0 dropped frames; the display is 60Hz, so 120 could not be observed |
+| Cold start to window < 500ms | 257–273ms |
+| First render of a 10k-pod list < 3s | 459ms to list and project, 0.7ms to store and sort; ~1.6s from process start to a full table |
+| External pod change visible < 1s | 9–17ms create → event, 8–15ms delete → event |
+| Memory, 1 cluster / 10k pods < 300MB | 87MB RSS (78MB in Phase 1; discovery and 68 kinds account for the rest) |
+| Scroll frame rate ≥ 60fps, target 120fps | 60.0fps sustained, 0 dropped frames; the display is 60Hz, so 120 could not be observed |
+| Command palette < 50ms on a 10k-object cluster | 10,009 candidates scored and ranked well inside the budget; asserted by a unit test that fails over 50ms |
+| Discovery of a CRD-heavy cluster | 68 kinds in ~130ms, custom resources included |
 
 The load fixture is `cargo run --release -p periscope-e2e --bin seed-pods`.
 
@@ -143,10 +154,17 @@ Doing better needs an EKS or GKE cluster, which costs money to run — see
 
 ## Unverified
 
-- **Scroll and click at scale.** The rendered window has been inspected visually
-  with 10,009 rows loaded (columns, colours, truncation, the context picker), but
-  scrolling and context switching were not driven through the real UI — those
-  paths are covered only by unit tests over the store and view state.
+- **Scrolling, clicking and typing in the real window.** The rendered window has
+  been inspected visually with 10,009 rows and 68 kinds loaded, and the palette's
+  key handling is driven through GPUI's real dispatch in tests
+  (`cmd-k`, typing, arrows, `enter`, `escape`). But the environment this was
+  built in does not grant the shell accessibility permission, so no scroll
+  gesture, row click or filter keystroke has been sent to the running app by a
+  human or a script. Those paths are covered by unit tests over the view state,
+  which is not the same thing.
+- **The detail pane's appearance.** Its data path is covered end to end against a
+  real cluster (YAML, events, owner references), but the rendered pane — the
+  syntax-highlighted editor in particular — has not been seen.
 - **Light theme.** The theme toggle is wired and unit-covered; only the dark
   appearance has been looked at.
 - **CI.** `.github/workflows/ci.yml` has still not run; nothing has been pushed

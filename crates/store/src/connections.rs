@@ -119,9 +119,12 @@ impl ConnectionRegistry {
             // health; the store's other tables own those.
             ClusterEvent::Contexts { .. }
             | ClusterEvent::ConfigFailed { .. }
-            | ClusterEvent::PodsReset { .. }
-            | ClusterEvent::PodApplied { .. }
-            | ClusterEvent::PodDeleted { .. } => false,
+            | ClusterEvent::Kinds { .. }
+            | ClusterEvent::ResourceReset { .. }
+            | ClusterEvent::ResourceApplied { .. }
+            | ClusterEvent::ResourceDeleted { .. }
+            | ClusterEvent::Object { .. }
+            | ClusterEvent::ObjectFailed { .. } => false,
         }
     }
 

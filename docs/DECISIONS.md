@@ -426,3 +426,94 @@ stream). The message becomes:
 auth error: unable to run auth exec: No such file or directory (os error 2)
   (credential plugin: `gke-gcloud-auth-plugin`)
 ```
+
+---
+
+## ADR-0017 — Every kind travels the same path, as projected rows plus columns
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Extends:** ADR-0011.
+
+Phase 2 has to render kinds nobody has compiled support for. Rather than a table
+of types, the cluster layer watches everything as `DynamicObject` and projects
+each object into a `ResourceRow`: a key, a state, and a vector of string cells.
+The **column definitions travel with the rows** in the `ResourceReset` event.
+
+Consequences:
+
+- The UI has no knowledge of Kubernetes kinds at all. It renders whatever
+  columns arrive, which is exactly why an Argo CD `Application` needs no code.
+- Adding good columns for a kind is one function in `crates/cluster/src/columns.rs`
+  with a unit test, and touches nothing else.
+- Unknown kinds fall back to `STATUS` and `READY`, read from `status.phase` and a
+  `Ready` condition. Those are conventions, not guarantees, so they render empty
+  rather than wrong when a CRD does something else.
+- A test asserts every built-in projector emits exactly as many cells as it
+  declares columns; a mismatch would silently shift a whole table sideways.
+
+---
+
+## ADR-0018 — Full objects are fetched on demand, never cached
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+The detail view needs the whole object; the tables need thirty bytes of it. If
+the store kept both, memory would scale with the largest ConfigMap in the
+cluster rather than with the number of rows — and a 10,000-object listing has to
+stay under 300MB.
+
+So `FetchObject` issues a `get` when the user opens something, and the result is
+held only while that pane is open. The watch stream additionally clears
+`managedFields` as objects arrive, which is most of the bytes in a typical
+object and is never rendered.
+
+The trade is one round trip per open — single-digit milliseconds against a local
+cluster — in exchange for memory that does not depend on what is stored in the
+cluster. It also means the YAML on screen is what the apiserver says *now*,
+rather than what a watch event said some time ago.
+
+---
+
+## ADR-0019 — One watch at a time, replaced rather than accumulated
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+Watching every kind the user has looked at would be the fastest way back to a
+previous table and the fastest way to a cluster-wide bandwidth problem: a
+watch per kind, per cluster, held forever.
+
+The UI therefore keeps exactly one watch per cluster: switching kinds sends
+`StopWatch` for the old one and `Watch` for the new. Rows already in the store
+stay there — switching back is instant and shows the last known state — but
+nothing is being streamed for a table nobody is looking at. A namespace or
+selector change is the same mechanism: the watch is replaced, because those
+filters are applied by the apiserver.
+
+Phase 4 revisits this when several clusters are live at once and a per-cluster
+budget has to decide what stays warm.
+
+---
+
+## ADR-0020 — The YAML view is written here, not by a serialiser
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+`serde_yaml` is unmaintained, and every YAML crate needs post-processing to
+match what `kubectl -o yaml` prints — sequence items at the same indent as their
+key, block scalars for certificates, and quoting that keeps `"1.20"` a string.
+Kubernetes objects are JSON-shaped, so the general YAML problem never arises:
+maps, arrays, strings, numbers, booleans, null.
+
+`crates/cluster/src/detail.rs` therefore contains a small writer, about eighty
+lines, with tests for the cases that actually bite: values that would round-trip
+as another type, multi-line strings, empty collections, and the exact
+indentation `kubectl` uses. It also drops `managedFields`, `resourceVersion`,
+`generation` and the `last-applied-configuration` annotation, which are noise a
+reader has to scroll past.
+
+If a case turns up that this cannot render, the fallback is a maintained crate
+plus a post-processing pass — but that is a worse trade than it looks.

@@ -1,24 +1,27 @@
-//! The command handler: one session per connected cluster.
+//! The command handler: one session per connected cluster, one task per watch.
 //!
-//! Everything here runs on the tokio runtime owned by the bridge. A session is
-//! a task holding a `kube::Client` and a pod watch; connecting starts one,
-//! disconnecting aborts it. Nothing is shared between clusters, so one
-//! unreachable cluster cannot stall another.
+//! Everything here runs on the tokio runtime owned by the bridge. A session
+//! holds a `kube::Client`; each watched kind is its own task under it, so
+//! switching kinds tears down exactly one stream and an unreachable cluster
+//! cannot stall another.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
+use kube::Client;
 use periscope_bridge::{
-    ClusterCommand, ClusterEvent, ClusterId, CommandHandler, ConnectionState, EventSink,
+    ClusterCommand, ClusterEvent, ClusterId, ColumnSpec, CommandHandler, ConnectionState,
+    EventSink, KindId, KindInfo, ResourceRow,
 };
 use tokio::task::JoinHandle;
 
 use crate::errors::Failure;
-use crate::{kubeconfig, watch};
+use crate::watch::Filter;
+use crate::{detail, discovery, kubeconfig, watch};
 
-/// Connects to clusters and streams their pods.
+/// Connects to clusters, discovers what they serve, and streams it.
 #[derive(Debug, Default)]
 pub struct KubeHandler {
     sessions: Arc<Sessions>,
@@ -26,26 +29,80 @@ pub struct KubeHandler {
     source: kubeconfig::Source,
 }
 
-/// The live sessions, keyed by context name.
+/// One connected cluster.
+#[derive(Clone)]
+struct Session {
+    client: Client,
+    credential_plugin: Option<String>,
+    /// What discovery said, so a watch knows whether its kind is namespaced.
+    kinds: Arc<Vec<KindInfo>>,
+}
+
+/// The live sessions and watches.
 ///
-/// A plain `std::sync::Mutex` is right here: it is held only long enough to
-/// insert or take a `JoinHandle`, never across an await.
-#[derive(Debug, Default)]
+/// Plain `std::sync::Mutex`es are right here: they are held only long enough to
+/// insert or take a handle, never across an await.
+#[derive(Default)]
 struct Sessions {
+    clusters: Mutex<HashMap<ClusterId, Session>>,
     tasks: Mutex<HashMap<ClusterId, JoinHandle<()>>>,
+    watches: Mutex<HashMap<(ClusterId, KindId), JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for Sessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sessions")
+            .field("clusters", &guard(&self.clusters).len())
+            .field("watches", &guard(&self.watches).len())
+            .finish()
+    }
+}
+
+/// Recovers a poisoned lock rather than taking the app down with it: these maps
+/// hold task handles, and a handle map cannot be left half-updated.
+fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        tracing::error!("a session lock was poisoned; recovering");
+        poisoned.into_inner()
+    })
 }
 
 impl Sessions {
-    /// Registers a session, aborting any it replaces.
-    fn insert(&self, cluster: ClusterId, task: JoinHandle<()>) {
-        if let Some(previous) = self.lock().insert(cluster, task) {
+    /// Registers a session task, aborting any it replaces.
+    fn insert_task(&self, cluster: ClusterId, task: JoinHandle<()>) {
+        if let Some(previous) = guard(&self.tasks).insert(cluster, task) {
             previous.abort();
         }
     }
 
-    /// Removes a session and stops it.
-    fn abort(&self, cluster: &ClusterId) -> bool {
-        match self.lock().remove(cluster) {
+    /// Records a connected client.
+    fn connected(&self, cluster: ClusterId, session: Session) {
+        guard(&self.clusters).insert(cluster, session);
+    }
+
+    /// The session for a cluster, if it is connected.
+    fn session(&self, cluster: &ClusterId) -> Option<Session> {
+        guard(&self.clusters).get(cluster).cloned()
+    }
+
+    /// Records what discovery found.
+    fn set_kinds(&self, cluster: &ClusterId, kinds: Vec<KindInfo>) {
+        if let Some(session) = guard(&self.clusters).get_mut(cluster) {
+            session.kinds = Arc::new(kinds);
+        }
+    }
+
+    /// Registers a watch, aborting any watch it replaces. Replacing is how a
+    /// namespace or selector change is applied.
+    fn insert_watch(&self, cluster: ClusterId, kind: KindId, task: JoinHandle<()>) {
+        if let Some(previous) = guard(&self.watches).insert((cluster, kind), task) {
+            previous.abort();
+        }
+    }
+
+    /// Stops one watch.
+    fn stop_watch(&self, cluster: &ClusterId, kind: &KindId) -> bool {
+        match guard(&self.watches).remove(&(cluster.clone(), kind.clone())) {
             Some(task) => {
                 task.abort();
                 true
@@ -54,28 +111,49 @@ impl Sessions {
         }
     }
 
-    /// Whether a session is running for this cluster.
-    fn is_live(&self, cluster: &ClusterId) -> bool {
-        self.lock()
-            .get(cluster)
-            .is_some_and(|task| !task.is_finished())
-    }
+    /// Stops everything belonging to a cluster.
+    fn disconnect(&self, cluster: &ClusterId) -> bool {
+        guard(&self.clusters).remove(cluster);
 
-    /// Stops every session.
-    fn abort_all(&self) {
-        for (_, task) in self.lock().drain() {
-            task.abort();
+        let mut watches = guard(&self.watches);
+        let keys: Vec<_> = watches
+            .keys()
+            .filter(|(watched, _)| watched == cluster)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(task) = watches.remove(&key) {
+                task.abort();
+            }
+        }
+        drop(watches);
+
+        match guard(&self.tasks).remove(cluster) {
+            Some(task) => {
+                task.abort();
+                true
+            }
+            None => false,
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ClusterId, JoinHandle<()>>> {
-        // A poisoned lock here would mean a panic while holding a map of join
-        // handles; the map itself cannot be left inconsistent, so recovering is
-        // strictly better than taking the whole app down with it.
-        self.tasks.lock().unwrap_or_else(|poisoned| {
-            tracing::error!("session map lock was poisoned; recovering");
-            poisoned.into_inner()
-        })
+    /// Whether a cluster is connected or connecting.
+    fn is_live(&self, cluster: &ClusterId) -> bool {
+        guard(&self.clusters).contains_key(cluster)
+            || guard(&self.tasks)
+                .get(cluster)
+                .is_some_and(|task| !task.is_finished())
+    }
+
+    /// Stops every session and watch.
+    fn abort_all(&self) {
+        for (_, task) in guard(&self.watches).drain() {
+            task.abort();
+        }
+        for (_, task) in guard(&self.tasks).drain() {
+            task.abort();
+        }
+        guard(&self.clusters).clear();
     }
 }
 
@@ -93,14 +171,15 @@ impl KubeHandler {
         }
     }
 
-    /// How many sessions are currently running.
+    /// How many clusters are currently connected.
     pub fn live_sessions(&self) -> usize {
-        self.sessions
-            .lock()
-            .values()
-            .filter(|task| !task.is_finished())
-            .count()
+        guard(&self.sessions.clusters).len()
     }
+}
+
+/// The kind the app opens by default.
+pub fn default_kind() -> KindId {
+    KindId::new("", "v1", "Pod", "pods")
 }
 
 /// Reads kubeconfig off the runtime's worker threads and reports the result.
@@ -123,31 +202,84 @@ async fn list_contexts(source: kubeconfig::Source, events: EventSink) {
     events.send(event);
 }
 
-/// Builds a client and watches pods until the session is stopped.
-async fn session(cluster: ClusterId, source: kubeconfig::Source, events: EventSink) {
+/// Reports a failure against a cluster, split by whether it is an auth problem.
+fn report(cluster: ClusterId, failure: Failure, events: &EventSink) {
+    let state = match failure {
+        Failure::Auth(reason) => ConnectionState::AuthFailed { reason },
+        Failure::Other(reason) => ConnectionState::Disconnected {
+            reason: Some(reason),
+        },
+    };
+    events.send(ClusterEvent::Status { cluster, state });
+}
+
+/// Builds a client and discovers what the cluster serves.
+async fn connect(
+    cluster: ClusterId,
+    source: kubeconfig::Source,
+    sessions: Arc<Sessions>,
+    events: EventSink,
+) {
     let connection = match kubeconfig::connect(&cluster, source).await {
         Ok(connection) => connection,
         Err(error) => {
             let failure = error.failure();
             tracing::warn!(%cluster, reason = failure.message(), "connection failed");
-            let state = match failure {
-                Failure::Auth(reason) => ConnectionState::AuthFailed { reason },
-                Failure::Other(reason) => ConnectionState::Disconnected {
-                    reason: Some(reason),
-                },
-            };
-            events.send(ClusterEvent::Status { cluster, state });
+            report(cluster, failure, &events);
             return;
         }
     };
 
-    watch::run(
-        cluster,
-        connection.client,
-        connection.credential_plugin,
-        events,
-    )
-    .await;
+    sessions.connected(
+        cluster.clone(),
+        Session {
+            client: connection.client.clone(),
+            credential_plugin: connection.credential_plugin.clone(),
+            kinds: Arc::default(),
+        },
+    );
+
+    // Discovery is the first request the client makes, so it is also where a
+    // credential that will not work shows up.
+    match discovery::kinds(connection.client).await {
+        Ok(kinds) => {
+            tracing::info!(%cluster, kinds = kinds.len(), "discovered");
+            sessions.set_kinds(&cluster, kinds.clone());
+            events.send(ClusterEvent::Kinds {
+                cluster: cluster.clone(),
+                kinds: Arc::from(kinds),
+            });
+            events.send(ClusterEvent::Status {
+                cluster,
+                state: ConnectionState::Connected,
+            });
+        }
+        Err(error) => {
+            let failure = match crate::errors::classify(&error) {
+                Failure::Auth(reason) => Failure::Auth(crate::errors::attribute_plugin(
+                    reason,
+                    connection.credential_plugin.as_deref(),
+                )),
+                other => other,
+            };
+            tracing::warn!(%cluster, reason = failure.message(), "discovery failed");
+            sessions.disconnect(&cluster);
+            report(cluster, failure, &events);
+        }
+    }
+}
+
+/// Whether a kind is namespaced, according to discovery.
+///
+/// An unknown kind is assumed namespaced: that is true of the overwhelming
+/// majority, and the namespace filter is simply ignored if it turns out not to
+/// be.
+fn is_namespaced(session: &Session, kind: &KindId) -> bool {
+    session
+        .kinds
+        .iter()
+        .find(|known| &known.id == kind)
+        .is_none_or(|info| info.namespaced)
 }
 
 impl CommandHandler for KubeHandler {
@@ -170,22 +302,105 @@ impl CommandHandler for KubeHandler {
                         state: ConnectionState::Connecting,
                     });
 
-                    let task = tokio::spawn(session(cluster.clone(), source, events));
-                    sessions.insert(cluster, task);
+                    let task = tokio::spawn(connect(
+                        cluster.clone(),
+                        source,
+                        Arc::clone(&sessions),
+                        events,
+                    ));
+                    sessions.insert_task(cluster, task);
+                }
+
+                ClusterCommand::Discover { cluster } => {
+                    let Some(session) = sessions.session(&cluster) else {
+                        tracing::debug!(%cluster, "discover requested before connecting");
+                        return;
+                    };
+
+                    match discovery::kinds(session.client).await {
+                        Ok(kinds) => {
+                            sessions.set_kinds(&cluster, kinds.clone());
+                            events.send(ClusterEvent::Kinds {
+                                cluster,
+                                kinds: Arc::from(kinds),
+                            });
+                        }
+                        Err(error) => report(cluster, crate::errors::classify(&error), &events),
+                    };
+                }
+
+                ClusterCommand::Watch {
+                    cluster,
+                    kind,
+                    namespace,
+                    selector,
+                } => {
+                    let Some(session) = sessions.session(&cluster) else {
+                        tracing::debug!(%cluster, %kind, "watch requested before connecting");
+                        return;
+                    };
+
+                    let namespaced = is_namespaced(&session, &kind);
+                    let task = tokio::spawn(watch::run(
+                        cluster.clone(),
+                        kind.clone(),
+                        session.client,
+                        namespaced,
+                        Filter {
+                            namespace,
+                            selector,
+                        },
+                        session.credential_plugin,
+                        events,
+                    ));
+                    sessions.insert_watch(cluster, kind, task);
+                }
+
+                ClusterCommand::StopWatch { cluster, kind } => {
+                    let stopped = sessions.stop_watch(&cluster, &kind);
+                    tracing::debug!(%cluster, %kind, stopped, "watch stopped");
+
+                    // Say the table is empty rather than leaving rows nothing is
+                    // updating any more.
+                    events.send(ClusterEvent::ResourceReset {
+                        cluster,
+                        kind,
+                        columns: Arc::from([] as [ColumnSpec; 0]),
+                        rows: Arc::from([] as [ResourceRow; 0]),
+                    });
+                }
+
+                ClusterCommand::FetchObject { cluster, kind, key } => {
+                    let Some(session) = sessions.session(&cluster) else {
+                        events.send(ClusterEvent::ObjectFailed {
+                            cluster,
+                            kind,
+                            key,
+                            reason: "not connected to this cluster".to_owned(),
+                        });
+                        return;
+                    };
+
+                    let namespaced = is_namespaced(&session, &kind);
+                    match detail::fetch(session.client, &kind, namespaced, &key).await {
+                        Ok(detail) => events.send(ClusterEvent::Object {
+                            cluster,
+                            kind,
+                            detail: Arc::new(detail),
+                        }),
+                        Err(error) => events.send(ClusterEvent::ObjectFailed {
+                            cluster,
+                            kind,
+                            key,
+                            reason: crate::errors::describe(&error),
+                        }),
+                    };
                 }
 
                 ClusterCommand::Disconnect { cluster } => {
-                    let was_live = sessions.abort(&cluster);
+                    let was_live = sessions.disconnect(&cluster);
                     tracing::info!(%cluster, was_live, "disconnect requested");
 
-                    // Report an empty table rather than leaving the last known
-                    // rows on screen: after a disconnect we no longer know what
-                    // is running, and stale rows that look live are worse than
-                    // none.
-                    events.send(ClusterEvent::PodsReset {
-                        cluster: cluster.clone(),
-                        pods: Arc::from([] as [periscope_bridge::PodSnapshot; 0]),
-                    });
                     events.send(ClusterEvent::Status {
                         cluster,
                         state: ConnectionState::Disconnected { reason: None },
@@ -220,7 +435,7 @@ impl CommandHandler for KubeHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use periscope_bridge::{ClusterRuntime, EventStream, RuntimeConfig};
+    use periscope_bridge::{ClusterRuntime, EventStream, ResourceKey, RuntimeConfig};
     use std::time::Duration;
 
     fn recv_timeout(stream: &EventStream, timeout: Duration) -> Option<ClusterEvent> {
@@ -306,7 +521,63 @@ mod tests {
     }
 
     #[test]
-    fn disconnecting_clears_the_table_and_reports_a_deliberate_stop() {
+    fn watching_before_connecting_does_nothing_rather_than_panicking() {
+        let (runtime, stream) =
+            ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
+
+        runtime
+            .send(ClusterCommand::Watch {
+                cluster: "not-connected".into(),
+                kind: default_kind(),
+                namespace: None,
+                selector: None,
+            })
+            .unwrap();
+
+        assert!(recv_timeout(&stream, Duration::from_millis(500)).is_none());
+    }
+
+    #[test]
+    fn fetching_an_object_without_a_connection_says_so() {
+        let (runtime, stream) =
+            ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
+
+        runtime
+            .send(ClusterCommand::FetchObject {
+                cluster: "not-connected".into(),
+                kind: default_kind(),
+                key: ResourceKey::new("default", "api-0"),
+            })
+            .unwrap();
+
+        match recv_timeout(&stream, Duration::from_secs(5)) {
+            Some(ClusterEvent::ObjectFailed { reason, .. }) => {
+                assert!(reason.contains("not connected"), "{reason}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stopping_a_watch_clears_its_table() {
+        let (runtime, stream) =
+            ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
+
+        runtime
+            .send(ClusterCommand::StopWatch {
+                cluster: "prod".into(),
+                kind: default_kind(),
+            })
+            .unwrap();
+
+        match recv_timeout(&stream, Duration::from_secs(5)) {
+            Some(ClusterEvent::ResourceReset { rows, .. }) => assert!(rows.is_empty()),
+            other => panic!("expected the table to be cleared, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disconnecting_reports_a_deliberate_stop() {
         let (runtime, stream) =
             ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
 
@@ -316,10 +587,6 @@ mod tests {
             })
             .unwrap();
 
-        match recv_timeout(&stream, Duration::from_secs(5)) {
-            Some(ClusterEvent::PodsReset { pods, .. }) => assert!(pods.is_empty()),
-            other => panic!("expected the table to be cleared, got {other:?}"),
-        }
         match recv_timeout(&stream, Duration::from_secs(5)) {
             Some(ClusterEvent::Status { state, .. }) => {
                 assert_eq!(state, ConnectionState::Disconnected { reason: None });

@@ -252,6 +252,9 @@ mod tests {
                             current: None,
                         });
                     }
+                    // The fixture exists to prove the bridge carries messages,
+                    // not to imitate a cluster; the rest is the kube handler's.
+                    _ => {}
                 }
             })
         }

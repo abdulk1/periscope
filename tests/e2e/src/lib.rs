@@ -17,7 +17,7 @@ pub mod exec;
 use std::time::{Duration, Instant};
 
 use periscope_bridge::{
-    ClusterCommand, ClusterEvent, ClusterId, ClusterRuntime, EventStream, RuntimeConfig,
+    ClusterCommand, ClusterEvent, ClusterId, ClusterRuntime, EventStream, KindId, RuntimeConfig,
 };
 use periscope_cluster::KubeHandler;
 
@@ -35,6 +35,11 @@ pub fn runtime() -> (ClusterRuntime, EventStream) {
         .expect("the cluster runtime starts")
 }
 
+/// The kind the tests watch unless they say otherwise.
+pub fn pods() -> KindId {
+    KindId::new("", "v1", "Pod", "pods")
+}
+
 /// Connects to the test context and returns the runtime, stream and cluster id.
 pub fn connected() -> (ClusterRuntime, EventStream, ClusterId) {
     let (runtime, stream) = runtime();
@@ -44,6 +49,30 @@ pub fn connected() -> (ClusterRuntime, EventStream, ClusterId) {
             cluster: cluster.clone(),
         })
         .expect("connect is queued");
+    (runtime, stream, cluster)
+}
+
+/// Connects, waits for discovery, and starts watching one kind.
+///
+/// Discovery has to land first: the cluster layer needs to know whether a kind
+/// is namespaced before it can build the right URL.
+pub fn watching(kind: KindId, timeout: Duration) -> (ClusterRuntime, EventStream, ClusterId) {
+    let (runtime, stream, cluster) = connected();
+
+    wait_for(&stream, timeout, |event| {
+        matches!(event, ClusterEvent::Kinds { .. })
+    })
+    .unwrap_or_else(|seen| panic!("discovery never finished; saw: {}", describe(&seen)));
+
+    runtime
+        .send(ClusterCommand::Watch {
+            cluster: cluster.clone(),
+            kind,
+            namespace: None,
+            selector: None,
+        })
+        .expect("watch is queued");
+
     (runtime, stream, cluster)
 }
 
@@ -148,11 +177,18 @@ pub fn describe(events: &[ClusterEvent]) -> String {
         .iter()
         .map(|event| match event {
             ClusterEvent::Status { cluster, state } => format!("Status({cluster}, {state:?})"),
-            ClusterEvent::PodsReset { cluster, pods } => {
-                format!("PodsReset({cluster}, {} pods)", pods.len())
+            ClusterEvent::Kinds { cluster, kinds } => {
+                format!("Kinds({cluster}, {} kinds)", kinds.len())
             }
-            ClusterEvent::PodApplied { pod, .. } => format!("PodApplied({})", pod.key),
-            ClusterEvent::PodDeleted { key, .. } => format!("PodDeleted({key})"),
+            ClusterEvent::ResourceReset { kind, rows, .. } => {
+                format!("ResourceReset({kind}, {} rows)", rows.len())
+            }
+            ClusterEvent::ResourceApplied { kind, row, .. } => {
+                format!("ResourceApplied({kind}, {})", row.key)
+            }
+            ClusterEvent::ResourceDeleted { kind, key, .. } => {
+                format!("ResourceDeleted({kind}, {key})")
+            }
             other => format!("{other:?}"),
         })
         .collect::<Vec<_>>()

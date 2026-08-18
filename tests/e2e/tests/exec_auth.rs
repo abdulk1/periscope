@@ -20,7 +20,7 @@ use periscope_cluster::KubeHandler;
 use periscope_e2e::exec::{
     Scratch, decode, invocations, kubeconfig_with_exec, stub_plugin, test_client_certificate,
 };
-use periscope_e2e::{context, describe, wait_for};
+use periscope_e2e::{context, describe, pods, wait_for};
 
 /// Plugins run a subprocess, so allow for a cold start.
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -208,9 +208,23 @@ fn a_gke_shaped_plugin_returning_credentials_connects_and_streams_pods() {
         &[],
     );
 
-    let (_runtime, stream) = connect_with(&kubeconfig);
+    let (runtime, stream) = connect_with(&kubeconfig);
+    wait_for(&stream, TIMEOUT, |event| {
+        matches!(event, ClusterEvent::Kinds { .. })
+    })
+    .unwrap_or_else(|seen| panic!("discovery never finished; saw: {}", describe(&seen)));
+
+    runtime
+        .send(ClusterCommand::Watch {
+            cluster: context(),
+            kind: pods(),
+            namespace: None,
+            selector: None,
+        })
+        .expect("watch is queued");
+
     let (event, _) = wait_for(&stream, TIMEOUT, |event| {
-        matches!(event, ClusterEvent::PodsReset { .. })
+        matches!(event, ClusterEvent::ResourceReset { .. })
     })
     .unwrap_or_else(|seen| {
         panic!(
@@ -219,7 +233,7 @@ fn a_gke_shaped_plugin_returning_credentials_connects_and_streams_pods() {
         )
     });
 
-    let ClusterEvent::PodsReset { pods, .. } = event else {
+    let ClusterEvent::ResourceReset { rows: pods, .. } = event else {
         unreachable!()
     };
     assert!(!pods.is_empty(), "the cluster listed no pods at all");

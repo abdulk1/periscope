@@ -39,5 +39,8 @@ pub use link::{
     DEFAULT_FLUSH_INTERVAL, DEFAULT_MAX_BATCH, FlushStats, PumpConfig, spawn_event_pump,
 };
 pub use protocol::{ClusterCommand, ClusterEvent, ClusterId, ConnectionState, EventKey};
-pub use resource::{ContextInfo, PodSnapshot, ResourceKey};
+pub use resource::{
+    ColumnSpec, ContextInfo, EventLine, KindId, KindInfo, ObjectDetail, OwnerRef, ResourceKey,
+    ResourceRow, RowState,
+};
 pub use runtime::{ClusterRuntime, CommandHandler, RuntimeConfig, RuntimeError};

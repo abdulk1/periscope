@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use periscope_bridge::{ClusterCommand, ClusterEvent, ConnectionState};
-use periscope_e2e::{connected, describe, runtime, wait_for};
+use periscope_e2e::{describe, pods, runtime, wait_for, watching};
 use periscope_store::AppState;
 
 /// Generous: a cold connection may run an exec plugin and list every pod.
@@ -19,27 +19,49 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 #[test]
 #[ignore = "needs a cluster"]
 fn connecting_lists_the_pods_that_are_running() {
-    let (_runtime, stream, cluster) = connected();
+    let (_runtime, stream, cluster) = watching(pods(), CONNECT_TIMEOUT);
 
     let (event, seen) = wait_for(&stream, CONNECT_TIMEOUT, |event| {
-        matches!(event, ClusterEvent::PodsReset { .. })
+        matches!(event, ClusterEvent::ResourceReset { .. })
     })
     .unwrap_or_else(|seen| panic!("no pod listing arrived; saw: {}", describe(&seen)));
 
-    let ClusterEvent::PodsReset { pods, .. } = &event else {
+    let ClusterEvent::ResourceReset { rows, .. } = &event else {
         unreachable!()
     };
-    let listed = pods.len();
+    let listed = rows.len();
     assert!(listed > 0, "a running cluster always has kube-system pods");
     assert!(
-        pods.iter().any(|pod| &*pod.key.namespace == "kube-system"),
+        rows.iter().any(|row| &*row.key.namespace == "kube-system"),
         "expected control-plane pods, got {:?}",
-        pods.iter()
-            .map(|pod| pod.key.to_string())
+        rows.iter()
+            .map(|row| row.key.to_string())
             .collect::<Vec<_>>()
     );
 
-    // The connection state must have been reported before the data.
+    let _ = seen;
+
+    // And the store must turn that stream into rows.
+    let mut state = AppState::new();
+    state.select_cluster(cluster);
+    state.select_kind(pods());
+    state.apply_batch(std::slice::from_ref(&event), Instant::now());
+    assert_eq!(state.rows().len(), listed);
+    assert!(state.counts().1 > 0, "some pods should be listed");
+}
+
+#[test]
+#[ignore = "needs a cluster"]
+fn the_connection_reports_progress_before_any_data() {
+    let (_runtime, stream, _cluster) = periscope_e2e::connected();
+
+    let (_, seen) = wait_for(&stream, CONNECT_TIMEOUT, |event| {
+        matches!(event, ClusterEvent::Kinds { .. })
+    })
+    .unwrap_or_else(|seen| panic!("discovery never finished; saw: {}", describe(&seen)));
+
+    // "Connecting" has to come first, or the UI has nothing to show for the
+    // seconds an exec plugin can take.
     assert!(
         seen.iter().any(|event| matches!(
             event,
@@ -52,12 +74,23 @@ fn connecting_lists_the_pods_that_are_running() {
         describe(&seen)
     );
 
-    // And the store must turn that stream into rows.
-    let mut state = AppState::new();
-    state.select(cluster);
-    state.apply_batch(std::slice::from_ref(&event), Instant::now());
-    assert_eq!(state.rows().len(), listed);
-    assert!(state.active_counts().1 > 0, "some pods should be ready");
+    // And "Connected" only after discovery has actually answered.
+    let (_, before_connected) = wait_for(&stream, CONNECT_TIMEOUT, |event| {
+        matches!(
+            event,
+            ClusterEvent::Status {
+                state: ConnectionState::Connected,
+                ..
+            }
+        )
+    })
+    .unwrap_or_else(|seen| panic!("never reported connected; saw: {}", describe(&seen)));
+    assert!(
+        !before_connected
+            .iter()
+            .any(|event| matches!(event, ClusterEvent::Kinds { .. })),
+        "discovery should already have been reported"
+    );
 }
 
 /// The budget from `IMPLEMENTATION.md` §3 Phase 1: a change in the cluster must
@@ -68,9 +101,9 @@ const CHANGE_BUDGET: Duration = Duration::from_secs(1);
 #[test]
 #[ignore = "needs a cluster"]
 fn a_pod_created_and_deleted_in_the_cluster_reaches_the_stream() {
-    let (_runtime, stream, _cluster) = connected();
+    let (_runtime, stream, _cluster) = watching(pods(), CONNECT_TIMEOUT);
     wait_for(&stream, CONNECT_TIMEOUT, |event| {
-        matches!(event, ClusterEvent::PodsReset { .. })
+        matches!(event, ClusterEvent::ResourceReset { .. })
     })
     .unwrap_or_else(|seen| panic!("no pod listing arrived; saw: {}", describe(&seen)));
 
@@ -83,7 +116,7 @@ fn a_pod_created_and_deleted_in_the_cluster_reaches_the_stream() {
     let (_, _) = wait_for(
         &stream,
         CHANGE_BUDGET * 2,
-        |event| matches!(event, ClusterEvent::PodApplied { pod, .. } if *pod.key.name == name),
+        |event| matches!(event, ClusterEvent::ResourceApplied { row, .. } if *row.key.name == name),
     )
     .unwrap_or_else(|seen| {
         let _ = periscope_e2e::delete_probe_pod(&name);
@@ -96,7 +129,7 @@ fn a_pod_created_and_deleted_in_the_cluster_reaches_the_stream() {
     wait_for(
         &stream,
         CHANGE_BUDGET * 2,
-        |event| matches!(event, ClusterEvent::PodDeleted { key, .. } if *key.name == name),
+        |event| matches!(event, ClusterEvent::ResourceDeleted { key, .. } if *key.name == name),
     )
     .unwrap_or_else(|seen| panic!("the deletion never arrived; saw: {}", describe(&seen)));
     let delete_latency = deleted.elapsed();
@@ -116,41 +149,42 @@ const LOAD_SIZE: usize = 10_000;
 #[test]
 #[ignore = "needs a cluster seeded with `seed-pods`"]
 fn a_ten_thousand_pod_cluster_lists_inside_the_budget() {
-    let (_runtime, stream, cluster) = connected();
+    let (_runtime, stream, cluster) = watching(pods(), CONNECT_TIMEOUT);
 
     let started = Instant::now();
     let (event, _) = wait_for(&stream, Duration::from_secs(60), |event| {
-        matches!(event, ClusterEvent::PodsReset { .. })
+        matches!(event, ClusterEvent::ResourceReset { .. })
     })
     .unwrap_or_else(|seen| panic!("no pod listing arrived; saw: {}", describe(&seen)));
     let listed = started.elapsed();
 
-    let ClusterEvent::PodsReset { pods, .. } = &event else {
+    let ClusterEvent::ResourceReset { rows, .. } = &event else {
         unreachable!()
     };
     assert!(
-        pods.len() >= LOAD_SIZE,
+        rows.len() >= LOAD_SIZE,
         "expected at least {LOAD_SIZE} pods, found {}. Seed them with: \
          cargo run --release -p periscope-e2e --bin seed-pods -- --count {LOAD_SIZE}",
-        pods.len()
+        rows.len()
     );
 
     // Everything between the wire and the rows the UI indexes into.
     let mut state = AppState::new();
-    state.select(cluster);
+    state.select_cluster(cluster);
+    state.select_kind(pods());
     let applied = Instant::now();
     state.apply_batch(std::slice::from_ref(&event), Instant::now());
     let applied = applied.elapsed();
 
-    assert_eq!(state.rows().len(), pods.len());
+    assert_eq!(state.rows().len(), rows.len());
     println!(
         "{} pods: list+project {listed:?}, store+sort {applied:?} (budget {LIST_BUDGET:?})",
-        pods.len()
+        rows.len()
     );
     assert!(
         listed + applied < LIST_BUDGET,
         "listing {} pods took {:?}, over the {LIST_BUDGET:?} budget",
-        pods.len(),
+        rows.len(),
         listed + applied
     );
 }
@@ -190,9 +224,9 @@ fn a_context_that_does_not_exist_fails_with_the_real_error() {
 #[test]
 #[ignore = "needs a cluster"]
 fn disconnecting_stops_the_stream() {
-    let (runtime, stream, cluster) = connected();
+    let (runtime, stream, cluster) = watching(pods(), CONNECT_TIMEOUT);
     wait_for(&stream, CONNECT_TIMEOUT, |event| {
-        matches!(event, ClusterEvent::PodsReset { .. })
+        matches!(event, ClusterEvent::ResourceReset { .. })
     })
     .unwrap_or_else(|seen| panic!("no pod listing arrived; saw: {}", describe(&seen)));
 
@@ -219,7 +253,7 @@ fn disconnecting_stops_the_stream() {
         assert!(
             !matches!(
                 event,
-                ClusterEvent::PodApplied { .. } | ClusterEvent::PodDeleted { .. }
+                ClusterEvent::ResourceApplied { .. } | ClusterEvent::ResourceDeleted { .. }
             ),
             "the watch kept running after disconnect: {event:?}"
         );

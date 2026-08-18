@@ -1,4 +1,4 @@
-//! Projecting `Pod` objects into the rows the table renders.
+//! The pod projector.
 //!
 //! The STATUS column is not `status.phase`. `kubectl get pods` computes it from
 //! init-container state, waiting reasons, termination reasons and the deletion
@@ -8,13 +8,13 @@
 //! own vocabulary.
 //!
 //! Reference: `printPod` in `kubectl/pkg/printers/internalversion/printers.go`.
+//!
+//! It reads JSON rather than typed `k8s-openapi` structs because every kind
+//! arrives as a `DynamicObject` — one watch path for pods and for a CRD nobody
+//! has seen before.
 
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-
-use k8s_openapi::api::core::v1::{Container, ContainerStatus, Pod, PodCondition};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-use periscope_bridge::{PodSnapshot, ResourceKey};
+use kube::api::DynamicObject;
+use serde_json::Value;
 
 /// The reason the apiserver reports for a pod on a node that stopped answering.
 const NODE_UNREACHABLE: &str = "NodeLost";
@@ -22,127 +22,83 @@ const NODE_UNREACHABLE: &str = "NodeLost";
 /// Waiting reason that means "nothing is wrong, init is simply not done".
 const POD_INITIALIZING: &str = "PodInitializing";
 
-/// Reduces a pod to the columns the table shows.
-pub fn project(pod: &Pod) -> PodSnapshot {
-    let namespace = pod.metadata.namespace.as_deref().unwrap_or_default();
-    let name = pod.metadata.name.as_deref().unwrap_or_default();
-    let counts = counts(pod);
-
-    PodSnapshot {
-        key: ResourceKey::new(namespace, name),
-        uid: pod.metadata.uid.as_deref().map(Arc::from),
-        status: Arc::from(status(pod).as_str()),
-        ready: counts.ready,
-        containers: counts.total,
-        restarts: counts.restarts,
-        node: pod
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.node_name.as_deref())
-            .map(Arc::from),
-        created: pod.metadata.creation_timestamp.as_ref().map(to_system_time),
-    }
+/// READY, RESTARTS and the node a pod is on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PodCounts {
+    /// Containers currently ready.
+    pub ready: u32,
+    /// Containers in the pod, including sidecars.
+    pub total: u32,
+    /// Total restarts.
+    pub restarts: u32,
 }
 
-/// Converts a Kubernetes timestamp to a `SystemTime`.
-///
-/// Pre-1970 timestamps cannot occur on a real object, but the arithmetic is
-/// written so one would produce a sane value rather than an overflow.
-fn to_system_time(time: &Time) -> SystemTime {
-    let seconds = time.0.as_second();
-    if seconds >= 0 {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(seconds as u64)
-    } else {
-        SystemTime::UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs())
+fn array<'a>(value: &'a Value, path: &[&str]) -> &'a [Value] {
+    let mut current = value;
+    for step in path {
+        current = &current[step];
     }
+    current.as_array().map(Vec::as_slice).unwrap_or_default()
 }
 
-/// The READY and RESTARTS columns.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Counts {
-    ready: u32,
-    total: u32,
-    restarts: u32,
+fn text<'a>(value: &'a Value, path: &[&str]) -> &'a str {
+    let mut current = value;
+    for step in path {
+        current = &current[step];
+    }
+    current.as_str().unwrap_or_default()
 }
 
 /// Whether an init container is a sidecar — one that keeps running alongside
 /// the main containers, and so counts towards the READY total.
-fn is_restartable(container: Option<&Container>) -> bool {
-    container.is_some_and(|c| c.restart_policy.as_deref() == Some("Always"))
+fn is_restartable(container: Option<&Value>) -> bool {
+    container.is_some_and(|container| text(container, &["restartPolicy"]) == "Always")
 }
 
-fn container_statuses(pod: &Pod) -> &[ContainerStatus] {
-    pod.status
-        .as_ref()
-        .and_then(|status| status.container_statuses.as_deref())
-        .unwrap_or_default()
-}
-
-fn init_container_statuses(pod: &Pod) -> &[ContainerStatus] {
-    pod.status
-        .as_ref()
-        .and_then(|status| status.init_container_statuses.as_deref())
-        .unwrap_or_default()
-}
-
-fn init_containers(pod: &Pod) -> &[Container] {
-    pod.spec
-        .as_ref()
-        .and_then(|spec| spec.init_containers.as_deref())
-        .unwrap_or_default()
-}
-
-fn conditions(pod: &Pod) -> &[PodCondition] {
-    pod.status
-        .as_ref()
-        .and_then(|status| status.conditions.as_deref())
-        .unwrap_or_default()
-}
-
-fn condition_is_true(pod: &Pod, kind: &str) -> bool {
-    conditions(pod)
+fn init_container(data: &Value, name: &str) -> Option<Value> {
+    array(data, &["spec", "initContainers"])
         .iter()
-        .any(|condition| condition.type_ == kind && condition.status == "True")
+        .find(|container| text(container, &["name"]) == name)
+        .cloned()
 }
 
-fn counts(pod: &Pod) -> Counts {
-    let init = init_containers(pod);
-    let mut total = pod
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.containers.len().try_into().ok())
-        .unwrap_or(0);
-    total += init.iter().filter(|c| is_restartable(Some(c))).count() as u32;
+fn condition_is_true(data: &Value, kind: &str) -> bool {
+    array(data, &["status", "conditions"])
+        .iter()
+        .any(|condition| {
+            text(condition, &["type"]) == kind && text(condition, &["status"]) == "True"
+        })
+}
 
-    let initializing = initializing_reason(pod).is_some();
+/// The READY and RESTARTS columns.
+pub fn counts(data: &Value) -> PodCounts {
+    let init = array(data, &["spec", "initContainers"]);
+    let total = array(data, &["spec", "containers"]).len() as u32
+        + init.iter().filter(|c| is_restartable(Some(c))).count() as u32;
 
     // While a pod is initializing, kubectl reports the init containers'
     // restarts and no ready containers at all.
-    if initializing && !condition_is_true(pod, "Initialized") {
-        return Counts {
+    if initializing_reason(data).is_some() && !condition_is_true(data, "Initialized") {
+        return PodCounts {
             ready: 0,
             total,
-            restarts: init_container_statuses(pod)
+            restarts: array(data, &["status", "initContainerStatuses"])
                 .iter()
-                .map(|status| status.restart_count.max(0) as u32)
+                .map(|status| status["restartCount"].as_u64().unwrap_or(0) as u32)
                 .sum(),
         };
     }
 
     let mut ready = 0;
     let mut restarts = 0;
-    for status in container_statuses(pod) {
-        restarts += status.restart_count.max(0) as u32;
-        let running = status
-            .state
-            .as_ref()
-            .is_some_and(|state| state.running.is_some());
-        if status.ready && running {
+    for status in array(data, &["status", "containerStatuses"]) {
+        restarts += status["restartCount"].as_u64().unwrap_or(0) as u32;
+        if status["ready"].as_bool().unwrap_or(false) && !status["state"]["running"].is_null() {
             ready += 1;
         }
     }
 
-    Counts {
+    PodCounts {
         ready,
         total,
         restarts,
@@ -151,38 +107,44 @@ fn counts(pod: &Pod) -> Counts {
 
 /// The `Init:...` status for a pod still working through its init containers,
 /// or `None` once they are all done.
-fn initializing_reason(pod: &Pod) -> Option<String> {
-    let init = init_containers(pod);
-    let by_name = |name: &str| init.iter().find(|container| container.name == name);
+fn initializing_reason(data: &Value) -> Option<String> {
+    let init_count = array(data, &["spec", "initContainers"]).len();
 
-    for (index, status) in init_container_statuses(pod).iter().enumerate() {
-        let state = status.state.as_ref();
-        let terminated = state.and_then(|state| state.terminated.as_ref());
-        let waiting = state.and_then(|state| state.waiting.as_ref());
+    for (index, status) in array(data, &["status", "initContainerStatuses"])
+        .iter()
+        .enumerate()
+    {
+        let terminated = &status["state"]["terminated"];
+        let waiting = &status["state"]["waiting"];
 
         // A finished init container, or a running sidecar, is not blocking.
-        if terminated.is_some_and(|terminated| terminated.exit_code == 0) {
+        if !terminated.is_null() && terminated["exitCode"].as_i64() == Some(0) {
             continue;
         }
-        if is_restartable(by_name(&status.name)) && status.started == Some(true) {
+        if is_restartable(init_container(data, text(status, &["name"])).as_ref())
+            && status["started"].as_bool() == Some(true)
+        {
             continue;
         }
 
-        return Some(match (terminated, waiting) {
-            (Some(terminated), _) => match terminated.reason.as_deref() {
-                Some(reason) if !reason.is_empty() => format!("Init:{reason}"),
-                _ => match terminated.signal {
+        return Some(if !terminated.is_null() {
+            match text(terminated, &["reason"]) {
+                "" => match terminated["signal"].as_i64() {
                     Some(signal) if signal != 0 => format!("Init:Signal:{signal}"),
-                    _ => format!("Init:ExitCode:{}", terminated.exit_code),
+                    _ => format!(
+                        "Init:ExitCode:{}",
+                        terminated["exitCode"].as_i64().unwrap_or_default()
+                    ),
                 },
-            },
-            (None, Some(waiting)) => match waiting.reason.as_deref() {
-                Some(reason) if !reason.is_empty() && reason != POD_INITIALIZING => {
-                    format!("Init:{reason}")
-                }
-                _ => format!("Init:{index}/{}", init.len()),
-            },
-            (None, None) => format!("Init:{index}/{}", init.len()),
+                reason => format!("Init:{reason}"),
+            }
+        } else if !waiting.is_null() {
+            match text(waiting, &["reason"]) {
+                "" | POD_INITIALIZING => format!("Init:{index}/{init_count}"),
+                reason => format!("Init:{reason}"),
+            }
+        } else {
+            format!("Init:{index}/{init_count}")
         });
     }
 
@@ -190,14 +152,10 @@ fn initializing_reason(pod: &Pod) -> Option<String> {
 }
 
 /// The STATUS column.
-fn status(pod: &Pod) -> String {
-    let pod_status = pod.status.as_ref();
-    let phase = pod_status
-        .and_then(|status| status.phase.as_deref())
-        .unwrap_or_default();
-    let status_reason = pod_status
-        .and_then(|status| status.reason.as_deref())
-        .unwrap_or_default();
+pub fn status(object: &DynamicObject) -> String {
+    let data = &object.data;
+    let phase = text(data, &["status", "phase"]);
+    let status_reason = text(data, &["status", "reason"]);
 
     let mut reason = if status_reason.is_empty() {
         phase.to_owned()
@@ -206,37 +164,41 @@ fn status(pod: &Pod) -> String {
     };
 
     // A gated pod is not pending on resources; say which it is.
-    if conditions(pod).iter().any(|condition| {
-        condition.type_ == "PodScheduled" && condition.reason.as_deref() == Some("SchedulingGated")
-    }) {
+    if array(data, &["status", "conditions"])
+        .iter()
+        .any(|condition| {
+            text(condition, &["type"]) == "PodScheduled"
+                && text(condition, &["reason"]) == "SchedulingGated"
+        })
+    {
         reason = "SchedulingGated".to_owned();
     }
 
-    let initializing = initializing_reason(pod);
-    match &initializing {
-        Some(init) if !condition_is_true(pod, "Initialized") => reason = init.clone(),
+    match initializing_reason(data) {
+        Some(init) if !condition_is_true(data, "Initialized") => reason = init,
         _ => {
             let mut has_running = false;
             // Last container wins, matching kubectl's reverse iteration.
-            for status in container_statuses(pod).iter().rev() {
-                let state = status.state.as_ref();
-                let waiting = state.and_then(|state| state.waiting.as_ref());
-                let terminated = state.and_then(|state| state.terminated.as_ref());
+            for status in array(data, &["status", "containerStatuses"]).iter().rev() {
+                let waiting = &status["state"]["waiting"];
+                let terminated = &status["state"]["terminated"];
 
-                if let Some(waiting_reason) = waiting
-                    .and_then(|waiting| waiting.reason.as_deref())
-                    .filter(|reason| !reason.is_empty())
-                {
-                    reason = waiting_reason.to_owned();
-                } else if let Some(terminated) = terminated {
-                    reason = match terminated.reason.as_deref() {
-                        Some(text) if !text.is_empty() => text.to_owned(),
-                        _ => match terminated.signal {
+                if !waiting.is_null() && !text(waiting, &["reason"]).is_empty() {
+                    reason = text(waiting, &["reason"]).to_owned();
+                } else if !terminated.is_null() {
+                    reason = match text(terminated, &["reason"]) {
+                        "" => match terminated["signal"].as_i64() {
                             Some(signal) if signal != 0 => format!("Signal:{signal}"),
-                            _ => format!("ExitCode:{}", terminated.exit_code),
+                            _ => format!(
+                                "ExitCode:{}",
+                                terminated["exitCode"].as_i64().unwrap_or_default()
+                            ),
                         },
+                        text => text.to_owned(),
                     };
-                } else if status.ready && state.is_some_and(|state| state.running.is_some()) {
+                } else if status["ready"].as_bool().unwrap_or(false)
+                    && !status["state"]["running"].is_null()
+                {
                     has_running = true;
                 }
             }
@@ -244,7 +206,7 @@ fn status(pod: &Pod) -> String {
             // A pod whose last container completed but which still has running
             // containers is not "Completed".
             if reason == "Completed" && has_running {
-                reason = if condition_is_true(pod, "Ready") {
+                reason = if condition_is_true(data, "Ready") {
                     "Running".to_owned()
                 } else {
                     "NotReady".to_owned()
@@ -253,7 +215,7 @@ fn status(pod: &Pod) -> String {
         }
     }
 
-    if pod.metadata.deletion_timestamp.is_some() {
+    if object.metadata.deletion_timestamp.is_some() {
         // A pod on a lost node is not shutting down; nobody knows what it is.
         if status_reason == NODE_UNREACHABLE {
             return "Unknown".to_owned();
@@ -266,17 +228,27 @@ fn status(pod: &Pod) -> String {
     reason
 }
 
+/// The node a pod is scheduled on, once it is scheduled.
+pub fn node(object: &DynamicObject) -> Option<&str> {
+    match text(&object.data, &["spec", "nodeName"]) {
+        "" => None,
+        node => Some(node),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    fn pod(value: serde_json::Value) -> Pod {
-        serde_json::from_value(value).expect("fixture is a valid pod")
+    fn pod(value: serde_json::Value) -> DynamicObject {
+        serde_json::from_value(value).expect("fixture is a valid object")
     }
 
-    fn running_pod() -> Pod {
+    fn running_pod() -> DynamicObject {
         pod(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
             "metadata": {
                 "name": "api-0",
                 "namespace": "payments",
@@ -298,20 +270,18 @@ mod tests {
     }
 
     #[test]
-    fn a_running_pod_projects_every_column() {
-        let snapshot = project(&running_pod());
-
-        assert_eq!(snapshot.key, ResourceKey::new("payments", "api-0"));
-        assert_eq!(snapshot.uid.as_deref(), Some("1f0d"));
-        assert_eq!(&*snapshot.status, "Running");
-        assert_eq!((snapshot.ready, snapshot.containers), (1, 1));
-        assert_eq!(snapshot.restarts, 0);
-        assert_eq!(snapshot.node.as_deref(), Some("node-1"));
-        // 2026-08-17T10:00:00Z.
+    fn a_running_pod_reads_as_running() {
+        let pod = running_pod();
+        assert_eq!(status(&pod), "Running");
         assert_eq!(
-            snapshot.created,
-            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_960_800))
+            counts(&pod.data),
+            PodCounts {
+                ready: 1,
+                total: 1,
+                restarts: 0
+            }
         );
+        assert_eq!(node(&pod), Some("node-1"));
     }
 
     #[test]
@@ -330,10 +300,15 @@ mod tests {
             }
         }));
 
-        let snapshot = project(&pod);
-        assert_eq!(&*snapshot.status, "CrashLoopBackOff");
-        assert_eq!(snapshot.restarts, 7);
-        assert_eq!((snapshot.ready, snapshot.containers), (0, 1));
+        assert_eq!(status(&pod), "CrashLoopBackOff");
+        assert_eq!(
+            counts(&pod.data),
+            PodCounts {
+                ready: 0,
+                total: 1,
+                restarts: 7
+            }
+        );
     }
 
     #[test]
@@ -361,11 +336,10 @@ mod tests {
             }
         }));
 
-        let snapshot = project(&pod);
-        assert_eq!(&*snapshot.status, "Init:0/2");
+        assert_eq!(status(&pod), "Init:0/2");
         // Init-container restarts are what matters while initializing.
-        assert_eq!(snapshot.restarts, 1);
-        assert_eq!((snapshot.ready, snapshot.containers), (0, 1));
+        assert_eq!(counts(&pod.data).restarts, 1);
+        assert_eq!(counts(&pod.data).ready, 0);
     }
 
     #[test]
@@ -384,11 +358,11 @@ mod tests {
             }
         }));
 
-        assert_eq!(&*project(&pod).status, "Init:ImagePullBackOff");
+        assert_eq!(status(&pod), "Init:ImagePullBackOff");
     }
 
     #[test]
-    fn an_init_container_that_exited_nonzero_shows_its_exit_code() {
+    fn an_init_container_that_exited_nonzero_shows_its_reason() {
         let pod = pod(json!({
             "metadata": { "name": "api-0", "namespace": "default" },
             "spec": { "containers": [{ "name": "api" }], "initContainers": [{ "name": "migrate" }] },
@@ -403,7 +377,26 @@ mod tests {
             }
         }));
 
-        assert_eq!(&*project(&pod).status, "Init:Error");
+        assert_eq!(status(&pod), "Init:Error");
+    }
+
+    #[test]
+    fn an_init_container_killed_without_a_reason_shows_its_exit_code() {
+        let pod = pod(json!({
+            "metadata": { "name": "api-0", "namespace": "default" },
+            "spec": { "containers": [{ "name": "api" }], "initContainers": [{ "name": "migrate" }] },
+            "status": {
+                "phase": "Pending",
+                "initContainerStatuses": [{
+                    "name": "migrate",
+                    "ready": false,
+                    "restartCount": 0,
+                    "state": { "terminated": { "exitCode": 137 } }
+                }]
+            }
+        }));
+
+        assert_eq!(status(&pod), "Init:ExitCode:137");
     }
 
     #[test]
@@ -436,28 +429,40 @@ mod tests {
             }
         }));
 
-        let snapshot = project(&pod);
-        assert_eq!(&*snapshot.status, "Running");
+        assert_eq!(status(&pod), "Running");
         // The sidecar is part of the total, but only main containers are
         // counted ready — exactly what `kubectl get pods` prints.
-        assert_eq!((snapshot.ready, snapshot.containers), (1, 2));
+        assert_eq!(
+            counts(&pod.data),
+            PodCounts {
+                ready: 1,
+                total: 2,
+                restarts: 0
+            }
+        );
     }
 
     #[test]
     fn a_deleting_pod_reads_terminating() {
         let mut pod = running_pod();
-        pod.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH));
+        pod.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
+            ));
 
-        assert_eq!(&*project(&pod).status, "Terminating");
+        assert_eq!(status(&pod), "Terminating");
     }
 
     #[test]
     fn a_pod_on_a_lost_node_reads_unknown_rather_than_terminating() {
         let mut pod = running_pod();
-        pod.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH));
-        pod.status.as_mut().unwrap().reason = Some(NODE_UNREACHABLE.to_owned());
+        pod.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
+            ));
+        pod.data["status"]["reason"] = json!(NODE_UNREACHABLE);
 
-        assert_eq!(&*project(&pod).status, "Unknown");
+        assert_eq!(status(&pod), "Unknown");
     }
 
     #[test]
@@ -477,7 +482,7 @@ mod tests {
         }));
 
         // Terminal pods are not "Terminating": there is nothing left to stop.
-        assert_eq!(&*project(&pod).status, "Completed");
+        assert_eq!(status(&pod), "Completed");
     }
 
     #[test]
@@ -495,7 +500,7 @@ mod tests {
             }
         }));
 
-        assert_eq!(&*project(&pod).status, "SchedulingGated");
+        assert_eq!(status(&pod), "SchedulingGated");
     }
 
     #[test]
@@ -506,7 +511,7 @@ mod tests {
             "status": { "phase": "Failed", "reason": "Evicted" }
         }));
 
-        assert_eq!(&*project(&pod).status, "Evicted");
+        assert_eq!(status(&pod), "Evicted");
     }
 
     #[test]
@@ -525,7 +530,7 @@ mod tests {
             }
         }));
 
-        assert_eq!(&*project(&pod).status, "Signal:9");
+        assert_eq!(status(&pod), "Signal:9");
     }
 
     #[test]
@@ -536,9 +541,8 @@ mod tests {
             "status": { "phase": "Pending" }
         }));
 
-        let snapshot = project(&pod);
-        assert_eq!(snapshot.node, None);
-        assert_eq!(&*snapshot.status, "Pending");
-        assert_eq!((snapshot.ready, snapshot.containers), (0, 1));
+        assert_eq!(node(&pod), None);
+        assert_eq!(status(&pod), "Pending");
+        assert_eq!(counts(&pod.data).total, 1);
     }
 }

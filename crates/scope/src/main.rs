@@ -59,6 +59,7 @@ fn main() -> Result<()> {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
+            periscope_ui::init(cx);
             cx.set_global(RuntimeHandle(runtime));
 
             // The window is opened from a task because `open_window` needs to run
@@ -71,7 +72,7 @@ fn main() -> Result<()> {
 
                 cx.open_window(window_options(), move |window, cx| {
                     let workspace =
-                        cx.new(|cx| Workspace::new(commands.clone(), started, perf, cx));
+                        cx.new(|cx| Workspace::new(commands.clone(), started, perf, window, cx));
                     *captured.borrow_mut() = Some(workspace.clone());
                     cx.new(|cx| Root::new(workspace, window, cx))
                 })?;

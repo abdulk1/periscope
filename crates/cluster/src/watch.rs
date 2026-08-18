@@ -1,20 +1,25 @@
-//! Watching pods for one cluster.
+//! Watching one kind for one cluster.
 //!
 //! The stream mechanics live in `kube`; what this module owns is the
 //! translation into [`ClusterEvent`]s and the connection state machine around
 //! it — including the rule that a rejected credential ends the session with a
 //! stated reason rather than retrying silently forever.
+//!
+//! Objects arrive as `DynamicObject`, so pods and a CRD nobody has heard of
+//! take exactly the same path; what differs is the projector that turns them
+//! into rows.
 
 use std::sync::Arc;
 
 use futures::StreamExt as _;
-use k8s_openapi::api::core::v1::Pod;
+use kube::api::{Api, DynamicObject};
+use kube::discovery::ApiResource;
 use kube::runtime::{WatchStreamExt as _, watcher};
-use kube::{Api, Client};
-use periscope_bridge::{ClusterEvent, ClusterId, ConnectionState, EventSink, PodSnapshot};
+use kube::{Client, ResourceExt as _};
+use periscope_bridge::{ClusterEvent, ClusterId, ConnectionState, EventSink, KindId, ResourceRow};
 
+use crate::columns::{self, KindColumns};
 use crate::errors::{Failure, attribute_plugin, classify_watch};
-use crate::pods;
 
 /// What to do after handling a watch error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,26 +31,40 @@ pub enum AfterError {
     Stop,
 }
 
+/// Which objects a watch covers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filter {
+    /// One namespace, or `None` for every namespace.
+    pub namespace: Option<Arc<str>>,
+    /// A label selector, e.g. `app=web,tier!=cache`.
+    pub selector: Option<Arc<str>>,
+}
+
 /// Accumulates watch events into the events the UI understands.
 ///
 /// Kept separate from the stream loop so the whole translation — including the
 /// buffering that turns a resync into one atomic replacement — is testable
 /// without a cluster.
 #[derive(Debug)]
-pub struct PodStream {
+pub struct ResourceStream {
     cluster: ClusterId,
+    kind: KindId,
+    table: KindColumns,
     /// Objects seen since the last `Init`, held back until `InitDone` so the
     /// UI swaps the table in one go rather than growing it row by row.
-    pending: Vec<PodSnapshot>,
+    pending: Vec<ResourceRow>,
     /// The credential plugin this cluster authenticates with, if any.
     credential_plugin: Option<String>,
 }
 
-impl PodStream {
-    /// A stream translator for one cluster.
-    pub fn new(cluster: ClusterId) -> Self {
+impl ResourceStream {
+    /// A stream translator for one kind on one cluster.
+    pub fn new(cluster: ClusterId, kind: KindId) -> Self {
+        let table = columns::for_kind(&kind);
         Self {
             cluster,
+            kind,
+            table,
             pending: Vec::new(),
             credential_plugin: None,
         }
@@ -60,27 +79,31 @@ impl PodStream {
     }
 
     /// Translates one watch event, if it produces anything for the UI.
-    pub fn apply(&mut self, event: watcher::Event<Pod>) -> Option<ClusterEvent> {
+    pub fn apply(&mut self, event: watcher::Event<DynamicObject>) -> Option<ClusterEvent> {
         match event {
             watcher::Event::Init => {
                 self.pending.clear();
                 None
             }
-            watcher::Event::InitApply(pod) => {
-                self.pending.push(pods::project(&pod));
+            watcher::Event::InitApply(object) => {
+                self.pending.push(self.table.row(&object));
                 None
             }
-            watcher::Event::InitDone => Some(ClusterEvent::PodsReset {
+            watcher::Event::InitDone => Some(ClusterEvent::ResourceReset {
                 cluster: self.cluster.clone(),
-                pods: Arc::from(std::mem::take(&mut self.pending)),
+                kind: self.kind.clone(),
+                columns: Arc::clone(&self.table.columns),
+                rows: Arc::from(std::mem::take(&mut self.pending)),
             }),
-            watcher::Event::Apply(pod) => Some(ClusterEvent::PodApplied {
+            watcher::Event::Apply(object) => Some(ClusterEvent::ResourceApplied {
                 cluster: self.cluster.clone(),
-                pod: Arc::new(pods::project(&pod)),
+                kind: self.kind.clone(),
+                row: Arc::new(self.table.row(&object)),
             }),
-            watcher::Event::Delete(pod) => Some(ClusterEvent::PodDeleted {
+            watcher::Event::Delete(object) => Some(ClusterEvent::ResourceDeleted {
                 cluster: self.cluster.clone(),
-                key: pods::project(&pod).key,
+                kind: self.kind.clone(),
+                key: columns::key_of(&object),
             }),
         }
     }
@@ -91,15 +114,21 @@ impl PodStream {
         // Whatever we had buffered belongs to a list that will now be redone.
         self.pending.clear();
 
-        let failure = classify_watch(error);
-        let (state, after) = match failure {
+        let (state, after) = match classify_watch(error) {
             Failure::Auth(reason) => (
                 ConnectionState::AuthFailed {
                     reason: attribute_plugin(reason, self.credential_plugin.as_deref()),
                 },
                 AfterError::Stop,
             ),
-            Failure::Other(reason) => (ConnectionState::Degraded { reason }, AfterError::Retry),
+            Failure::Other(reason) => (
+                ConnectionState::Degraded {
+                    // A watch failure is about one kind; say which, or the user
+                    // reads it as the whole cluster being broken.
+                    reason: format!("{}: {reason}", self.kind),
+                },
+                AfterError::Retry,
+            ),
         };
 
         (
@@ -115,19 +144,70 @@ impl PodStream {
     pub fn cluster(&self) -> &ClusterId {
         &self.cluster
     }
+
+    /// The kind this stream carries.
+    pub fn kind(&self) -> &KindId {
+        &self.kind
+    }
 }
 
-/// Watches pods in every namespace until the task is cancelled, the credential
-/// is rejected, or the UI goes away.
+/// The `ApiResource` handle for a kind.
+pub fn api_resource(kind: &KindId) -> ApiResource {
+    ApiResource {
+        group: kind.group.to_string(),
+        version: kind.version.to_string(),
+        api_version: kind.api_version(),
+        kind: kind.kind.to_string(),
+        plural: kind.plural.to_string(),
+    }
+}
+
+/// Builds the API handle for a kind, honouring the namespace filter.
+pub fn api_for(
+    client: Client,
+    kind: &KindId,
+    namespaced: bool,
+    namespace: Option<&str>,
+) -> Api<DynamicObject> {
+    let resource = api_resource(kind);
+
+    match namespace {
+        // A namespace filter on a cluster-scoped kind is meaningless rather
+        // than an error: nodes do not live anywhere.
+        Some(namespace) if namespaced => Api::namespaced_with(client, namespace, &resource),
+        _ => Api::all_with(client, &resource),
+    }
+}
+
+/// Watches a kind until the task is cancelled, the credential is rejected, or
+/// the UI goes away.
 pub async fn run(
     cluster: ClusterId,
+    kind: KindId,
     client: Client,
+    namespaced: bool,
+    filter: Filter,
     credential_plugin: Option<String>,
     events: EventSink,
 ) {
-    let api: Api<Pod> = Api::all(client);
-    let mut stream = Box::pin(watcher(api, watcher::Config::default()).default_backoff());
-    let mut translator = PodStream::new(cluster.clone()).with_credential_plugin(credential_plugin);
+    let api = api_for(client, &kind, namespaced, filter.namespace.as_deref());
+    let config = watcher::Config {
+        label_selector: filter.selector.as_deref().map(str::to_owned),
+        ..watcher::Config::default()
+    };
+
+    let mut stream = Box::pin(
+        watcher(api, config)
+            // Managed fields are most of the bytes in a typical object and
+            // nothing renders them; dropping them as they arrive keeps a
+            // 10k-object listing out of the hundreds of megabytes.
+            .modify(|object| {
+                object.managed_fields_mut().clear();
+            })
+            .default_backoff(),
+    );
+    let mut translator = ResourceStream::new(cluster.clone(), kind.clone())
+        .with_credential_plugin(credential_plugin);
     // Only report a recovery once, rather than on every event after one.
     let mut degraded = false;
 
@@ -145,7 +225,7 @@ pub async fn run(
 
                 if recovered {
                     degraded = false;
-                    tracing::info!(%cluster, "watch recovered");
+                    tracing::info!(%cluster, %kind, "watch recovered");
                     if events
                         .send(ClusterEvent::Status {
                             cluster: cluster.clone(),
@@ -160,7 +240,7 @@ pub async fn run(
             Err(error) => {
                 let (event, after) = translator.on_error(&error);
                 degraded = true;
-                tracing::warn!(%cluster, %error, ?after, "pod watch failed");
+                tracing::warn!(%cluster, %kind, %error, ?after, "watch failed");
 
                 if events.send(event).is_closed() {
                     return;
@@ -172,7 +252,7 @@ pub async fn run(
         }
     }
 
-    tracing::info!(%cluster, "pod watch ended");
+    tracing::info!(%cluster, %kind, "watch ended");
 }
 
 #[cfg(test)]
@@ -181,13 +261,19 @@ mod tests {
     use periscope_bridge::ResourceKey;
     use serde_json::json;
 
-    fn pod(name: &str) -> Pod {
+    fn pods() -> KindId {
+        KindId::new("", "v1", "Pod", "pods")
+    }
+
+    fn pod(name: &str) -> DynamicObject {
         serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
             "metadata": { "name": name, "namespace": "default" },
             "spec": { "containers": [{ "name": "app" }] },
             "status": { "phase": "Running" }
         }))
-        .expect("fixture is a valid pod")
+        .expect("fixture is a valid object")
     }
 
     fn api_error(code: u16) -> watcher::Error {
@@ -200,7 +286,7 @@ mod tests {
 
     #[test]
     fn an_initial_list_is_held_back_until_it_is_complete() {
-        let mut stream = PodStream::new("prod".into());
+        let mut stream = ResourceStream::new("prod".into(), pods());
 
         assert_eq!(stream.apply(watcher::Event::Init), None);
         assert_eq!(stream.apply(watcher::Event::InitApply(pod("a"))), None);
@@ -208,9 +294,18 @@ mod tests {
 
         // A half-listed table would flash rows in and out; the reset lands once.
         match stream.apply(watcher::Event::InitDone) {
-            Some(ClusterEvent::PodsReset { cluster, pods }) => {
+            Some(ClusterEvent::ResourceReset {
+                cluster,
+                kind,
+                columns,
+                rows,
+            }) => {
                 assert_eq!(cluster.as_str(), "prod");
-                assert_eq!(pods.len(), 2);
+                assert_eq!(kind, pods());
+                assert_eq!(rows.len(), 2);
+                // Columns travel with the data, so the UI needs no table of its own.
+                assert_eq!(&*columns[0].name, "READY");
+                assert_eq!(rows[0].cells.len(), columns.len());
             }
             other => panic!("expected a reset, got {other:?}"),
         }
@@ -218,7 +313,7 @@ mod tests {
 
     #[test]
     fn a_second_list_does_not_inherit_the_first_ones_objects() {
-        let mut stream = PodStream::new("prod".into());
+        let mut stream = ResourceStream::new("prod".into(), pods());
         stream.apply(watcher::Event::Init);
         stream.apply(watcher::Event::InitApply(pod("a")));
 
@@ -227,9 +322,9 @@ mod tests {
         stream.apply(watcher::Event::InitApply(pod("b")));
 
         match stream.apply(watcher::Event::InitDone) {
-            Some(ClusterEvent::PodsReset { pods, .. }) => {
-                assert_eq!(pods.len(), 1);
-                assert_eq!(&*pods[0].key.name, "b");
+            Some(ClusterEvent::ResourceReset { rows, .. }) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(&*rows[0].key.name, "b");
             }
             other => panic!("expected a reset, got {other:?}"),
         }
@@ -237,17 +332,18 @@ mod tests {
 
     #[test]
     fn updates_and_deletes_map_to_their_own_events() {
-        let mut stream = PodStream::new("prod".into());
+        let mut stream = ResourceStream::new("prod".into(), pods());
 
         match stream.apply(watcher::Event::Apply(pod("a"))) {
-            Some(ClusterEvent::PodApplied { pod, .. }) => {
-                assert_eq!(pod.key, ResourceKey::new("default", "a"));
+            Some(ClusterEvent::ResourceApplied { row, kind, .. }) => {
+                assert_eq!(row.key, ResourceKey::new("default", "a"));
+                assert_eq!(kind, pods());
             }
             other => panic!("expected an apply, got {other:?}"),
         }
 
         match stream.apply(watcher::Event::Delete(pod("a"))) {
-            Some(ClusterEvent::PodDeleted { key, .. }) => {
+            Some(ClusterEvent::ResourceDeleted { key, .. }) => {
                 assert_eq!(key, ResourceKey::new("default", "a"));
             }
             other => panic!("expected a delete, got {other:?}"),
@@ -256,7 +352,7 @@ mod tests {
 
     #[test]
     fn a_rejected_credential_stops_the_session_and_says_why() {
-        let mut stream = PodStream::new("prod".into());
+        let mut stream = ResourceStream::new("prod".into(), pods());
         let (event, after) = stream.on_error(&api_error(401));
 
         assert_eq!(after, AfterError::Stop);
@@ -273,7 +369,7 @@ mod tests {
     fn an_auth_failure_names_the_credential_plugin_that_was_run() {
         // Without this the user sees "No such file or directory" and has no way
         // to know which binary kubeconfig asked for.
-        let mut stream = PodStream::new("prod".into())
+        let mut stream = ResourceStream::new("prod".into(), pods())
             .with_credential_plugin(Some("gke-gcloud-auth-plugin".to_owned()));
         let (event, _) = stream.on_error(&watcher::Error::WatchStartFailed(kube::Error::Auth(
             kube::client::AuthError::AuthExecStart(std::io::Error::from(
@@ -292,8 +388,8 @@ mod tests {
 
     #[test]
     fn a_plugin_already_named_in_the_error_is_not_repeated() {
-        let mut stream =
-            PodStream::new("prod".into()).with_credential_plugin(Some("aws".to_owned()));
+        let mut stream = ResourceStream::new("prod".into(), pods())
+            .with_credential_plugin(Some("aws".to_owned()));
         // kube names the command itself when the plugin runs and fails; saying
         // it twice reads like two different problems.
         let error =
@@ -318,23 +414,23 @@ mod tests {
     }
 
     #[test]
-    fn a_transient_failure_degrades_but_keeps_watching() {
-        let mut stream = PodStream::new("prod".into());
+    fn a_transient_failure_degrades_and_names_the_kind_that_failed() {
+        let mut stream = ResourceStream::new("prod".into(), pods());
         let (event, after) = stream.on_error(&api_error(500));
 
         assert_eq!(after, AfterError::Retry);
-        assert!(matches!(
-            event,
+        match event {
             ClusterEvent::Status {
-                state: ConnectionState::Degraded { .. },
+                state: ConnectionState::Degraded { reason },
                 ..
-            }
-        ));
+            } => assert!(reason.starts_with("pods:"), "{reason}"),
+            other => panic!("expected a degraded status, got {other:?}"),
+        }
     }
 
     #[test]
     fn a_failure_discards_a_partial_list() {
-        let mut stream = PodStream::new("prod".into());
+        let mut stream = ResourceStream::new("prod".into(), pods());
         stream.apply(watcher::Event::Init);
         stream.apply(watcher::Event::InitApply(pod("a")));
         stream.on_error(&api_error(500));
@@ -343,8 +439,30 @@ mod tests {
         // the next reset, or deleted objects would reappear.
         stream.apply(watcher::Event::Init);
         match stream.apply(watcher::Event::InitDone) {
-            Some(ClusterEvent::PodsReset { pods, .. }) => assert!(pods.is_empty()),
+            Some(ClusterEvent::ResourceReset { rows, .. }) => assert!(rows.is_empty()),
             other => panic!("expected an empty reset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_custom_resource_streams_through_the_same_path() {
+        let widgets = KindId::new("example.com", "v1", "Widget", "widgets");
+        let mut stream = ResourceStream::new("prod".into(), widgets.clone());
+
+        let widget: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": { "name": "sprocket", "namespace": "default" },
+            "spec": { "size": 3 }
+        }))
+        .expect("fixture is a valid object");
+
+        match stream.apply(watcher::Event::Apply(widget)) {
+            Some(ClusterEvent::ResourceApplied { kind, row, .. }) => {
+                assert_eq!(kind, widgets);
+                assert_eq!(row.key, ResourceKey::new("default", "sprocket"));
+            }
+            other => panic!("expected an apply, got {other:?}"),
         }
     }
 }
