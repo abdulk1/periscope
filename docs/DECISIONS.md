@@ -370,3 +370,59 @@ it is what lets the auth-failure tests point a deliberately broken credential at
 a real apiserver without touching the developer's own kubeconfig — the
 alternative was mutating a process-wide environment variable from a test, which
 needs `unsafe` under the 2024 edition and is forbidden workspace-wide.
+
+---
+
+## ADR-0015 — Frame rate is measured by forcing redraw, and only under `--perf`
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+GPUI draws only when something invalidates the window. That makes an idle app
+free — which is the point — and it makes "what is our frame rate" unanswerable by
+observation: a quiet app measures as perfect and a busy one is only sampled while
+it happens to be busy.
+
+`--perf` therefore switches the window into continuous redraw (`request_animation_frame`
+from `render`) and `FrameMeter` records the interval between consecutive renders,
+reporting p50/p95/max, element-build time and late frames every 120 frames. Every
+frame rebuilds the entire view including the visible rows, so the number is a
+floor rather than a best case.
+
+Two things this deliberately does not do:
+
+- It does not run outside `--perf`. Continuous redraw on a laptop is a battery
+  bug, not a feature.
+- It does not report a single "fps" verdict. On a vsync-locked 60Hz panel the
+  count of frames over the 16.67ms budget sits near half the frames however fast
+  the app is, so the meter reports that raw count *and* `hitches` — intervals
+  over twice the budget, where a frame was genuinely dropped. Only the second
+  number means something is wrong.
+
+---
+
+## ADR-0016 — Every auth failure names the credential plugin
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Extends:** ADR-0013.
+
+Testing the exec-credential path found a message that broke the project's own
+error rule. A kubeconfig pointing at a plugin that is not installed — by far the
+most common GKE failure — produced:
+
+```
+auth error: unable to run auth exec: No such file or directory (os error 2)
+```
+
+True, and useless: it never says which binary. `kube` does not carry the command
+into that error, so Periscope does. The `exec` command for the context is read
+out of kubeconfig when the client is built and travels with the connection, and
+`errors::attribute_plugin` appends it to any auth failure that does not already
+mention it, on both paths that can raise one (client construction and the watch
+stream). The message becomes:
+
+```
+auth error: unable to run auth exec: No such file or directory (os error 2)
+  (credential plugin: `gke-gcloud-auth-plugin`)
+```

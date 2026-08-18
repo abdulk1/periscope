@@ -12,7 +12,7 @@ use kube::config::{KubeConfigOptions, Kubeconfig, KubeconfigError};
 use kube::{Client, Config};
 use periscope_bridge::{ClusterId, ContextInfo};
 
-use crate::errors::{Failure, classify, describe};
+use crate::errors::{Failure, attribute_plugin, classify, describe};
 
 /// What kubeconfig says about the clusters available.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -29,16 +29,32 @@ pub enum ConnectError {
     /// Kubeconfig could not be read, parsed, or did not contain the context.
     #[error("kubeconfig: {0}")]
     Kubeconfig(#[from] KubeconfigError),
-    /// The client could not be constructed — TLS, proxy, or auth setup.
-    #[error("{0}")]
-    Client(#[from] kube::Error),
+    /// The client could not be constructed — TLS, proxy, or auth setup. This is
+    /// where a credential plugin that will not start surfaces, so the plugin's
+    /// name travels with the error.
+    #[error("{source}")]
+    Client {
+        /// What went wrong.
+        #[source]
+        source: kube::Error,
+        /// The `exec` command this context runs, if it runs one.
+        credential_plugin: Option<String>,
+    },
 }
 
 impl ConnectError {
     /// How the UI should present this, with the full error text preserved.
     pub fn failure(&self) -> Failure {
         match self {
-            Self::Client(error) => classify(error),
+            Self::Client {
+                source,
+                credential_plugin,
+            } => match classify(source) {
+                Failure::Auth(reason) => {
+                    Failure::Auth(attribute_plugin(reason, credential_plugin.as_deref()))
+                }
+                other => other,
+            },
             // A kubeconfig that cannot be read is a configuration problem, not
             // a rejected credential, even when it is an auth stanza that is
             // malformed. The distinction matters: one is fixed by re-running a
@@ -108,11 +124,54 @@ fn contexts_of(kubeconfig: &Kubeconfig) -> Contexts {
     Contexts { contexts, current }
 }
 
+/// A client, plus what is known about how it authenticates.
+#[derive(Clone)]
+pub struct Connection {
+    /// The client itself.
+    pub client: Client,
+    /// The credential plugin this context runs, when it runs one.
+    ///
+    /// Carried because `kube` reports a plugin that will not start as a bare
+    /// "No such file or directory": true, and useless. Naming the binary is the
+    /// difference between an error the user can act on and one they cannot.
+    pub credential_plugin: Option<String>,
+}
+
+impl std::fmt::Debug for Connection {
+    // `kube::Client` implements no `Debug`, so this is written by hand rather
+    // than dropped: a connection that cannot be logged is worse than one whose
+    // client prints as a placeholder.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("credential_plugin", &self.credential_plugin)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The `exec` command a context authenticates with, if any.
+fn credential_plugin(kubeconfig: &Kubeconfig, context: &ClusterId) -> Option<String> {
+    let user = kubeconfig
+        .contexts
+        .iter()
+        .find(|named| named.name == context.as_str())
+        .and_then(|named| named.context.as_ref())
+        .and_then(|context| context.user.clone())?;
+
+    let exec = kubeconfig
+        .auth_infos
+        .iter()
+        .find(|named| named.name == user)
+        .and_then(|named| named.auth_info.as_ref())
+        .and_then(|auth| auth.exec.as_ref())?;
+
+    exec.command.clone()
+}
+
 /// Builds a client for one kubeconfig context.
 ///
 /// Running exec credential plugins and OIDC refreshes happens here, which is
 /// why this is async and can take seconds on a cold token.
-pub async fn connect(context: &ClusterId, source: Source) -> Result<Client, ConnectError> {
+pub async fn connect(context: &ClusterId, source: Source) -> Result<Connection, ConnectError> {
     let name = context.to_string();
     let kubeconfig = tokio::task::spawn_blocking(move || load(&source))
         .await
@@ -124,6 +183,7 @@ pub async fn connect(context: &ClusterId, source: Source) -> Result<Client, Conn
             )
         })??;
 
+    let plugin = credential_plugin(&kubeconfig, context);
     let options = KubeConfigOptions {
         context: Some(name),
         ..KubeConfigOptions::default()
@@ -134,10 +194,19 @@ pub async fn connect(context: &ClusterId, source: Source) -> Result<Client, Conn
         cluster = %context,
         server = %config.cluster_url,
         namespace = %config.default_namespace,
+        credential_plugin = plugin.as_deref().unwrap_or("none"),
         "building client"
     );
 
-    Ok(Client::try_from(config)?)
+    let client = Client::try_from(config).map_err(|source| ConnectError::Client {
+        source,
+        credential_plugin: plugin.clone(),
+    })?;
+
+    Ok(Connection {
+        client,
+        credential_plugin: plugin,
+    })
 }
 
 #[cfg(test)]
@@ -215,6 +284,26 @@ users:
         // Offering to connect to a context that is not there would produce an
         // error the user cannot explain; showing nothing selected is honest.
         assert_eq!(contexts_of(&kubeconfig).current, None);
+    }
+
+    #[test]
+    fn the_credential_plugin_a_context_uses_is_reported() {
+        assert_eq!(
+            credential_plugin(&sample(), &ClusterId::new("prod")),
+            Some("aws".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_context_without_an_exec_plugin_has_none() {
+        assert_eq!(
+            credential_plugin(&sample(), &ClusterId::new("kind-local")),
+            None
+        );
+        assert_eq!(
+            credential_plugin(&sample(), &ClusterId::new("absent")),
+            None
+        );
     }
 
     #[test]

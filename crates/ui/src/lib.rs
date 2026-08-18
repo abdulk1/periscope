@@ -5,6 +5,7 @@
 //! store says, so a slow or broken cluster can never stall a frame.
 
 pub mod format;
+pub mod perf;
 pub mod table;
 pub mod theme;
 pub mod workspace;

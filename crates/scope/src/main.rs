@@ -70,7 +70,8 @@ fn main() -> Result<()> {
                 let commands = commands.clone();
 
                 cx.open_window(window_options(), move |window, cx| {
-                    let workspace = cx.new(|cx| Workspace::new(commands.clone(), started, cx));
+                    let workspace =
+                        cx.new(|cx| Workspace::new(commands.clone(), started, perf, cx));
                     *captured.borrow_mut() = Some(workspace.clone());
                     cx.new(|cx| Root::new(workspace, window, cx))
                 })?;

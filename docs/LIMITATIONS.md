@@ -73,17 +73,34 @@ with 10,009 pods, release build:
 | First render of a 10k-pod list < 3s | 1.6s from process start to 10,009 rows; 406ms of that is list + projection, 0.9ms is store insert and sort |
 | External pod change visible < 1s | 17ms create → event, 15ms delete → event |
 | Memory, 1 cluster / 10k pods < 300MB | 78MB RSS |
-| Scroll frame rate ≥ 60fps | **not measured** — see below |
+| Scroll frame rate ≥ 60fps, target 120fps | 60.0–60.1fps sustained, 0 dropped frames; the display is 60Hz, so 120 could not be observed |
 
 The load fixture is `cargo run --release -p periscope-e2e --bin seed-pods`.
 
-## Frame rate is not instrumented
+## What the frame numbers do and do not say
 
-`--perf` logs watch throughput, coalescing, drops and how long each flush takes
-to apply (851µs for a 10,009-row swap). It does **not** log frame times, so the
-60fps floor and 120fps target in §4 are unverified. `uniform_list` builds only
-the visible rows, and scrolling a 10k-row table looks smooth by eye, but no
-number backs that up yet.
+`--perf` puts the window into continuous redraw and logs frame statistics every
+120 frames: fps, p50/p95/max interval, element-build time, and how many frames
+were late. Measured with 10,009 rows loaded:
+
+```
+frames=120 fps=60.0 p50_ms=16.66 p95_ms=17.15 max_ms=21.77
+build_p50_us=198 over_budget=57 hitches=0 rows=10009
+```
+
+The 60fps floor is met with nothing to spare *because the panel is 60Hz*: every
+frame is vsync-locked at 16.67ms and the app is not the limiting factor —
+building the whole view costs ~200µs of that budget. `over_budget` counts
+intervals over 16.67ms and hovers near half the frames purely from vsync jitter;
+`hitches` (over 33ms, i.e. a frame genuinely skipped) stayed at 0.
+
+Two honest caveats:
+
+- **120fps is unverified.** No 120Hz display was available. What can be said is
+  that the app spends ~1.2% of a 60Hz frame building its element tree.
+- **This measures redraw, not scrolling.** Continuous full redraw is strictly
+  more work per frame than scrolling a `uniform_list`, so it is a reasonable
+  floor — but nobody has driven a scroll gesture under instrumentation.
 
 ## Testing
 
@@ -109,11 +126,20 @@ Periscope enables all of those features. What has actually been *exercised*:
 | Client certificates (`kind`) | Verified |
 | Bearer token rejected by the apiserver | Verified — surfaces as auth-failed with the apiserver's own text |
 | Missing / malformed / empty kubeconfig | Verified |
-| exec plugins (EKS, GKE, AKS), OIDC refresh, proxies, custom CAs | **Untested** — no such cluster was available |
+| exec credential plugins, EKS-shaped (`client.authentication.k8s.io/v1beta1`) | Verified against a real apiserver with a stub plugin: the plugin runs, its token is sent, the rejection comes back with the apiserver's words |
+| exec credential plugins, GKE-shaped (`client.authentication.k8s.io/v1`) | Verified — including a plugin returning a working credential, after which pods stream normally |
+| A credential plugin that is not installed | Verified — the error names the missing binary |
+| A credential plugin that exits non-zero | Verified — its stderr and exit status reach the UI |
+| Expired credential re-fetched without user action | Verified — the client re-runs the plugin rather than reusing a dead credential |
+| The real `aws` CLI as the plugin | Verified — `aws eks get-token` is run for real and the token it mints is sent (it signs an STS URL locally, so this works without an EKS cluster) |
+| A real EKS or GKE cluster end to end | **Untested** |
+| OIDC refresh, proxies, custom CA bundles, AKS `kubelogin` | **Untested** |
 
-The §2.5 requirement to test against a real EKS cluster is therefore **not met**.
-The code path is `kube`'s and the error classification is covered by unit tests,
-but nobody has watched `aws eks get-token` expire mid-session in this app.
+So the §2.5 requirement to test against a real EKS cluster is still **not met**:
+what is proven is that Periscope drives the exec-credential protocol correctly
+and reports every way it can fail, not that a real cloud handshake succeeds.
+Doing better needs an EKS or GKE cluster, which costs money to run — see
+`tests/e2e/tests/exec_auth.rs` for what would be reused if one existed.
 
 ## Unverified
 

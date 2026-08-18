@@ -13,7 +13,7 @@ use kube::runtime::{WatchStreamExt as _, watcher};
 use kube::{Api, Client};
 use periscope_bridge::{ClusterEvent, ClusterId, ConnectionState, EventSink, PodSnapshot};
 
-use crate::errors::{Failure, classify_watch};
+use crate::errors::{Failure, attribute_plugin, classify_watch};
 use crate::pods;
 
 /// What to do after handling a watch error.
@@ -37,6 +37,8 @@ pub struct PodStream {
     /// Objects seen since the last `Init`, held back until `InitDone` so the
     /// UI swaps the table in one go rather than growing it row by row.
     pending: Vec<PodSnapshot>,
+    /// The credential plugin this cluster authenticates with, if any.
+    credential_plugin: Option<String>,
 }
 
 impl PodStream {
@@ -45,7 +47,16 @@ impl PodStream {
         Self {
             cluster,
             pending: Vec::new(),
+            credential_plugin: None,
         }
+    }
+
+    /// Names the credential plugin, so auth failures can say which binary was
+    /// involved. `kube` reports a plugin that will not start as "No such file
+    /// or directory" and never mentions what it tried to run.
+    pub fn with_credential_plugin(mut self, plugin: Option<String>) -> Self {
+        self.credential_plugin = plugin;
+        self
     }
 
     /// Translates one watch event, if it produces anything for the UI.
@@ -82,7 +93,12 @@ impl PodStream {
 
         let failure = classify_watch(error);
         let (state, after) = match failure {
-            Failure::Auth(reason) => (ConnectionState::AuthFailed { reason }, AfterError::Stop),
+            Failure::Auth(reason) => (
+                ConnectionState::AuthFailed {
+                    reason: attribute_plugin(reason, self.credential_plugin.as_deref()),
+                },
+                AfterError::Stop,
+            ),
             Failure::Other(reason) => (ConnectionState::Degraded { reason }, AfterError::Retry),
         };
 
@@ -103,10 +119,15 @@ impl PodStream {
 
 /// Watches pods in every namespace until the task is cancelled, the credential
 /// is rejected, or the UI goes away.
-pub async fn run(cluster: ClusterId, client: Client, events: EventSink) {
+pub async fn run(
+    cluster: ClusterId,
+    client: Client,
+    credential_plugin: Option<String>,
+    events: EventSink,
+) {
     let api: Api<Pod> = Api::all(client);
     let mut stream = Box::pin(watcher(api, watcher::Config::default()).default_backoff());
-    let mut translator = PodStream::new(cluster.clone());
+    let mut translator = PodStream::new(cluster.clone()).with_credential_plugin(credential_plugin);
     // Only report a recovery once, rather than on every event after one.
     let mut degraded = false;
 
@@ -246,6 +267,54 @@ mod tests {
             } => assert!(reason.contains("token has expired"), "{reason}"),
             other => panic!("expected an auth failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_auth_failure_names_the_credential_plugin_that_was_run() {
+        // Without this the user sees "No such file or directory" and has no way
+        // to know which binary kubeconfig asked for.
+        let mut stream = PodStream::new("prod".into())
+            .with_credential_plugin(Some("gke-gcloud-auth-plugin".to_owned()));
+        let (event, _) = stream.on_error(&watcher::Error::WatchStartFailed(kube::Error::Auth(
+            kube::client::AuthError::AuthExecStart(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            )),
+        )));
+
+        match event {
+            ClusterEvent::Status {
+                state: ConnectionState::AuthFailed { reason },
+                ..
+            } => assert!(reason.contains("gke-gcloud-auth-plugin"), "{reason}"),
+            other => panic!("expected an auth failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plugin_already_named_in_the_error_is_not_repeated() {
+        let mut stream =
+            PodStream::new("prod".into()).with_credential_plugin(Some("aws".to_owned()));
+        // kube names the command itself when the plugin runs and fails; saying
+        // it twice reads like two different problems.
+        let error =
+            watcher::Error::WatchStartFailed(kube::Error::Api(Box::new(kube::core::Status {
+                code: 401,
+                message: "auth exec command 'aws' failed with status 255".to_owned(),
+                ..kube::core::Status::default()
+            })));
+        let (event, _) = stream.on_error(&error);
+
+        let ClusterEvent::Status {
+            state: ConnectionState::AuthFailed { reason },
+            ..
+        } = event
+        else {
+            panic!("expected an auth failure")
+        };
+        assert!(
+            !reason.contains("credential plugin:"),
+            "the plugin was named twice: {reason}"
+        );
     }
 
     #[test]

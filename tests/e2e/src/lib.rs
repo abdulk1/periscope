@@ -12,6 +12,8 @@
 //! `PERISCOPE_E2E_CONTEXT`. Everything here reads; only the fixture generator
 //! (`seed-pods`) writes, and it writes only to the cluster it is told to.
 
+pub mod exec;
+
 use std::time::{Duration, Instant};
 
 use periscope_bridge::{

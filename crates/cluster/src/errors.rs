@@ -54,6 +54,21 @@ pub fn describe(error: &dyn StdError) -> String {
     message
 }
 
+/// Names the credential plugin in a reason that does not already mention it.
+///
+/// `kube` reports a plugin that will not start as a bare "No such file or
+/// directory", which tells the user nothing about which binary kubeconfig asked
+/// for. Every auth failure goes through here so the answer is always in the
+/// message, wherever the failure was raised.
+pub fn attribute_plugin(reason: String, plugin: Option<&str>) -> String {
+    match plugin {
+        Some(plugin) if !reason.contains(plugin) => {
+            format!("{reason} (credential plugin: `{plugin}`)")
+        }
+        _ => reason,
+    }
+}
+
 /// Classifies a client error.
 pub fn classify(error: &kube::Error) -> Failure {
     let message = describe(error);
@@ -129,6 +144,21 @@ mod tests {
         )));
         assert!(failure.is_auth());
         assert!(failure.message().contains("token expired"), "{failure:?}");
+    }
+
+    #[test]
+    fn an_auth_failure_is_attributed_to_the_plugin_that_caused_it() {
+        assert_eq!(
+            attribute_plugin("unable to run auth exec: No such file".into(), Some("aws")),
+            "unable to run auth exec: No such file (credential plugin: `aws`)"
+        );
+    }
+
+    #[test]
+    fn a_reason_that_already_names_the_plugin_is_left_alone() {
+        let reason = "auth exec command 'aws' failed".to_owned();
+        assert_eq!(attribute_plugin(reason.clone(), Some("aws")), reason);
+        assert_eq!(attribute_plugin(reason.clone(), None), reason);
     }
 
     #[test]

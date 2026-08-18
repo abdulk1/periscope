@@ -23,6 +23,7 @@ use periscope_bridge::{
 use periscope_config::ThemeChoice;
 use periscope_store::AppState;
 
+use crate::perf::FrameMeter;
 use crate::{format, table, theme};
 
 /// How often the view repaints with no events, so the age column keeps moving.
@@ -64,6 +65,8 @@ pub struct Workspace {
     attempted: HashSet<ClusterId>,
     /// The most recent thing that went wrong locally, shown verbatim.
     last_error: Option<SharedString>,
+    /// Frame timing, collected only under `--perf`.
+    frames: FrameMeter,
     /// Repaints the age column while nothing else is happening.
     _ticker: Task<()>,
 }
@@ -81,7 +84,15 @@ impl fmt::Debug for Workspace {
 
 impl Workspace {
     /// Builds the root view and asks the cluster layer what contexts exist.
-    pub fn new(commands: CommandSender, started: Instant, cx: &mut Context<Self>) -> Self {
+    ///
+    /// `perf` turns on continuous redraw and frame timing; see [`crate::perf`]
+    /// for why measuring a frame rate needs the app to stop idling.
+    pub fn new(
+        commands: CommandSender,
+        started: Instant,
+        perf: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(TICK).await;
@@ -100,6 +111,7 @@ impl Workspace {
             cold_start: None,
             attempted: HashSet::new(),
             last_error: None,
+            frames: FrameMeter::new(perf),
             _ticker: ticker,
         };
         workspace.send(ClusterCommand::ListContexts);
@@ -450,14 +462,21 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.cold_start.is_none() {
             let elapsed = self.started.elapsed();
             self.cold_start = Some(elapsed);
             tracing::info!(cold_start_ms = elapsed.as_millis() as u64, "first paint");
         }
 
-        v_flex()
+        let frame = self.frames.start(Instant::now());
+        if frame.is_some() {
+            // Keep frames coming, so there is a continuous series to measure.
+            // Nothing else in the app redraws when nothing has changed.
+            window.request_animation_frame();
+        }
+
+        let rendered = v_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -471,7 +490,24 @@ impl Render for Workspace {
                     .child(self.sidebar(cx))
                     .child(self.content(cx)),
             )
-            .child(self.footer(cx))
+            .child(self.footer(cx));
+
+        if let Some(stats) = self.frames.finish(frame, Instant::now()) {
+            tracing::info!(
+                frames = stats.frames,
+                fps = format!("{:.1}", stats.fps()),
+                p50_ms = format!("{:.2}", stats.p50.as_secs_f64() * 1_000.0),
+                p95_ms = format!("{:.2}", stats.p95.as_secs_f64() * 1_000.0),
+                max_ms = format!("{:.2}", stats.max.as_secs_f64() * 1_000.0),
+                build_p50_us = stats.build_p50.as_micros() as u64,
+                over_budget = stats.over_budget,
+                hitches = stats.hitches,
+                rows = self.state.rows().len(),
+                "frames"
+            );
+        }
+
+        rendered
     }
 }
 
@@ -511,7 +547,7 @@ mod tests {
 
     fn workspace(cx: &mut TestAppContext) -> (Entity<Workspace>, CommandReceiver) {
         let (tx, rx) = command_channel(16);
-        let view = cx.new(|cx| Workspace::new(tx, Instant::now(), cx));
+        let view = cx.new(|cx| Workspace::new(tx, Instant::now(), false, cx));
         (view, rx)
     }
 

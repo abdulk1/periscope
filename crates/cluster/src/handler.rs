@@ -125,8 +125,8 @@ async fn list_contexts(source: kubeconfig::Source, events: EventSink) {
 
 /// Builds a client and watches pods until the session is stopped.
 async fn session(cluster: ClusterId, source: kubeconfig::Source, events: EventSink) {
-    let client = match kubeconfig::connect(&cluster, source).await {
-        Ok(client) => client,
+    let connection = match kubeconfig::connect(&cluster, source).await {
+        Ok(connection) => connection,
         Err(error) => {
             let failure = error.failure();
             tracing::warn!(%cluster, reason = failure.message(), "connection failed");
@@ -141,7 +141,13 @@ async fn session(cluster: ClusterId, source: kubeconfig::Source, events: EventSi
         }
     };
 
-    watch::run(cluster, client, events).await;
+    watch::run(
+        cluster,
+        connection.client,
+        connection.credential_plugin,
+        events,
+    )
+    .await;
 }
 
 impl CommandHandler for KubeHandler {

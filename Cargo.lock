@@ -4787,6 +4787,7 @@ name = "periscope-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "futures",
  "k8s-openapi",
