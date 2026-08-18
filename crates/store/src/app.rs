@@ -10,13 +10,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use periscope_bridge::{
-    ClusterEvent, ClusterId, ColumnSpec, ConnectionState, ContextInfo, KindId, KindInfo, LogTarget,
-    Mutation, MutationOutcome, ObjectDetail, ResourceKey, ResourceRow,
+    ClusterEvent, ClusterId, ColumnSpec, ConnectionState, ContextInfo, ExecStatus, ExecTarget,
+    ForwardId, ForwardInfo, KindId, KindInfo, LogTarget, Mutation, MutationOutcome, ObjectDetail,
+    ResourceKey, ResourceRow,
 };
 
 use crate::connections::{Connection, ConnectionRegistry};
 use crate::logs::{FilterSpec, LogBuffer};
-use crate::permissions::{Authorized, Permissions, Refusal};
+use crate::permissions::{Authorized, AuthorizedExec, Permissions, Refusal};
 use crate::table::ResourceTable;
 
 /// A live log tail.
@@ -30,6 +31,38 @@ pub struct LogSession {
     pub buffer: LogBuffer,
     /// Whether the view sticks to the bottom as lines arrive.
     pub following: bool,
+}
+
+/// A command running in a container, and what it has said so far.
+///
+/// The output reuses [`LogBuffer`], so it is bounded and filterable exactly
+/// like a log tail: a command that prints a gigabyte cannot take the app down,
+/// and `grep` over its output is already written.
+#[derive(Debug)]
+pub struct ExecSession {
+    /// Which cluster the command is running in.
+    pub cluster: ClusterId,
+    /// What is being run, and where.
+    pub target: Arc<ExecTarget>,
+    /// The output, bounded and filtered.
+    pub buffer: LogBuffer,
+    /// How it ended, once it has. `None` means it is still running.
+    pub status: Option<ExecStatus>,
+}
+
+impl ExecSession {
+    /// Whether the command is still running.
+    pub fn is_running(&self) -> bool {
+        self.status.is_none()
+    }
+
+    /// The line under the output: what is happening, or how it ended.
+    pub fn summary(&self) -> String {
+        match &self.status {
+            Some(status) => status.message(),
+            None => "running…".to_owned(),
+        }
+    }
 }
 
 /// What the detail pane is showing.
@@ -187,6 +220,8 @@ pub struct AppState {
     tables: BTreeMap<(ClusterId, KindId), ResourceTable>,
     detail: Option<Detail>,
     logs: Option<LogSession>,
+    /// The command that is running, or the last one that ran.
+    exec: Option<ExecSession>,
     /// One pane, or two side by side.
     panes: Vec<Pane>,
     /// Which pane commands apply to.
@@ -199,6 +234,10 @@ pub struct AppState {
     permissions: Permissions,
     /// What recent mutations did, newest first.
     activity: Vec<Activity>,
+    /// Port forwards, by cluster and id.
+    forwards: BTreeMap<(ClusterId, ForwardId), Arc<ForwardInfo>>,
+    /// The id the next forward gets.
+    next_forward: u64,
 }
 
 /// One thing Periscope did to a cluster, as the UI shows it.
@@ -228,12 +267,15 @@ impl Default for AppState {
             tables: BTreeMap::new(),
             detail: None,
             logs: None,
+            exec: None,
             panes: vec![Pane::default()],
             focus: 0,
             last_viewed: BTreeMap::new(),
             budget: DEFAULT_ROW_BUDGET,
             permissions: Permissions::permissive(),
             activity: Vec::new(),
+            forwards: BTreeMap::new(),
+            next_forward: 1,
         }
     }
 }
@@ -375,6 +417,35 @@ impl AppState {
                 changed = true;
             }
 
+            ClusterEvent::ForwardChanged { cluster, forward } => {
+                let key = (cluster.clone(), forward.id);
+                match forward.state {
+                    // A forward that has stopped is gone from the list; one
+                    // that failed stays, because the reason is the point.
+                    periscope_bridge::ForwardState::Stopped => {
+                        self.forwards.remove(&key);
+                    }
+                    _ => {
+                        self.forwards.insert(key, Arc::clone(forward));
+                    }
+                }
+                changed = true;
+            }
+
+            ClusterEvent::ExecOutput { cluster, lines } => {
+                if let Some(session) = self.exec.as_mut().filter(|s| &s.cluster == cluster) {
+                    session.buffer.extend(lines);
+                    changed = true;
+                }
+            }
+
+            ClusterEvent::ExecFinished { cluster, status } => {
+                if let Some(session) = self.exec.as_mut().filter(|s| &s.cluster == cluster) {
+                    session.status = Some(status.clone());
+                    changed = true;
+                }
+            }
+
             ClusterEvent::Status { .. }
             | ClusterEvent::Pong { .. }
             | ClusterEvent::Stale { .. } => {}
@@ -415,9 +486,11 @@ impl AppState {
         self.last_viewed.insert(cluster.clone(), Instant::now());
         self.panes[self.focus].cluster = Some(cluster);
         self.detail = None;
-        // A tail belongs to the cluster it was opened on; carrying it across
-        // would leave lines on screen that no longer relate to anything.
+        // A tail — or a command's output — belongs to the cluster it was opened
+        // on; carrying it across would leave lines on screen that no longer
+        // relate to anything.
         self.logs = None;
+        self.exec = None;
         self.refresh_pane(self.focus);
     }
 
@@ -605,6 +678,37 @@ impl AppState {
         Ok(Authorized::new(cluster.clone(), mutation))
     }
 
+    /// Authorises a command, or says why not.
+    ///
+    /// Held to the same rule as a mutation: `kubectl exec` needs `create` on
+    /// `pods/exec`, and a command can change anything a container can reach, so
+    /// a read-only cluster refuses one.
+    pub fn authorize_exec(
+        &self,
+        cluster: &ClusterId,
+        target: Arc<ExecTarget>,
+    ) -> Result<AuthorizedExec, Refusal> {
+        if !self.permissions.may_mutate(cluster) {
+            return Err(Refusal::ReadOnly {
+                cluster: cluster.clone(),
+            });
+        }
+
+        let connected = self.connections.get(cluster).is_some_and(|connection| {
+            matches!(
+                connection.state,
+                ConnectionState::Connected | ConnectionState::Degraded { .. }
+            )
+        });
+        if !connected {
+            return Err(Refusal::NotConnected {
+                cluster: cluster.clone(),
+            });
+        }
+
+        Ok(AuthorizedExec::new(cluster.clone(), target))
+    }
+
     /// Records a refusal so it shows up in the activity list like anything
     /// else. A refusal the user cannot see is indistinguishable from a bug.
     pub fn record_refusal(
@@ -637,6 +741,40 @@ impl AppState {
     /// The most recent action, for the status line.
     pub fn last_activity(&self) -> Option<&Activity> {
         self.activity.first()
+    }
+
+    // --- forwards -----------------------------------------------------------
+
+    /// Takes the next forward id.
+    pub fn next_forward_id(&mut self) -> ForwardId {
+        let id = ForwardId(self.next_forward);
+        self.next_forward += 1;
+        id
+    }
+
+    /// Every forward, in the order they were started.
+    pub fn forwards(&self) -> impl ExactSizeIterator<Item = (&ClusterId, &Arc<ForwardInfo>)> {
+        self.forwards
+            .iter()
+            .map(|((cluster, _), forward)| (cluster, forward))
+    }
+
+    /// How many forwards are open.
+    pub fn forward_count(&self) -> usize {
+        self.forwards.len()
+    }
+
+    /// Forwards that need attention.
+    pub fn broken_forwards(&self) -> usize {
+        self.forwards
+            .values()
+            .filter(|forward| forward.state.is_problem())
+            .count()
+    }
+
+    /// Forgets a forward the UI has torn down, without waiting for the event.
+    pub fn forget_forward(&mut self, cluster: &ClusterId, id: ForwardId) {
+        self.forwards.remove(&(cluster.clone(), id));
     }
 
     // --- warm clusters ------------------------------------------------------
@@ -738,6 +876,48 @@ impl AppState {
         if let Some(session) = self.logs.as_mut() {
             session.following = following;
         }
+    }
+
+    /// Opens a command session, replacing any that was running.
+    pub fn open_exec(&mut self, cluster: ClusterId, target: Arc<ExecTarget>, capacity: usize) {
+        self.exec = Some(ExecSession {
+            cluster,
+            target,
+            buffer: LogBuffer::new(capacity),
+            status: None,
+        });
+    }
+
+    /// Closes the command session.
+    pub fn close_exec(&mut self) {
+        self.exec = None;
+    }
+
+    /// The command session, if one is open.
+    pub fn exec(&self) -> Option<&ExecSession> {
+        self.exec.as_ref()
+    }
+
+    /// Marks the running command as cancelled, if one is running.
+    ///
+    /// The cluster layer reports this too, but only when it still had the task;
+    /// saying it here means the pane never sits on "running…" after the user
+    /// pressed stop.
+    pub fn cancel_exec(&mut self) -> bool {
+        match self.exec.as_mut().filter(|session| session.is_running()) {
+            Some(session) => {
+                session.status = Some(ExecStatus::Cancelled);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Applies a filter to the command's output, reporting whether it changed.
+    pub fn set_exec_filter(&mut self, spec: FilterSpec) -> bool {
+        self.exec
+            .as_mut()
+            .is_some_and(|session| session.buffer.set_filter(spec))
     }
 
     /// Records that a detail fetch is in flight.
@@ -1705,6 +1885,136 @@ mod tests {
         );
     }
 
+    fn command(command: &str) -> Arc<ExecTarget> {
+        Arc::new(ExecTarget::parse("default", "api-0", None, command).expect("a command to run"))
+    }
+
+    fn exec_line(text: &str) -> periscope_bridge::LogLine {
+        periscope_bridge::LogLine {
+            source: periscope_bridge::LogSource::new("api-0", "stdout"),
+            timestamp: None,
+            text: Arc::from(text),
+        }
+    }
+
+    #[test]
+    fn a_read_only_cluster_refuses_to_run_a_command() {
+        // Running a command is a write: `kubectl exec` needs `create` on
+        // `pods/exec`, and `rm -rf` is a perfectly ordinary command.
+        let mut state = state_with_contexts();
+        connected(&mut state, "prod");
+
+        let mut permissions = crate::Permissions::permissive();
+        permissions.deny(ClusterId::new("prod"));
+        state.set_permissions(permissions);
+
+        let refusal = state
+            .authorize_exec(&ClusterId::new("prod"), command("rm -rf /data"))
+            .expect_err("a read-only cluster must refuse");
+
+        assert_eq!(
+            refusal,
+            crate::Refusal::ReadOnly {
+                cluster: ClusterId::new("prod")
+            }
+        );
+    }
+
+    #[test]
+    fn a_command_on_a_cluster_that_is_not_connected_is_refused_before_the_api_can() {
+        let state = state_with_contexts();
+
+        assert_eq!(
+            state
+                .authorize_exec(&ClusterId::new("prod"), command("ls"))
+                .expect_err("nothing to act on"),
+            crate::Refusal::NotConnected {
+                cluster: ClusterId::new("prod")
+            }
+        );
+    }
+
+    #[test]
+    fn a_writable_cluster_authorizes_a_command() {
+        let mut state = state_with_contexts();
+        connected(&mut state, "prod");
+
+        let authorized = state
+            .authorize_exec(&ClusterId::new("prod"), command("ls -la"))
+            .expect("a writable, connected cluster authorizes");
+
+        assert_eq!(authorized.cluster(), &ClusterId::new("prod"));
+        assert_eq!(authorized.target().command_line(), "ls -la");
+    }
+
+    #[test]
+    fn command_output_lands_in_the_session_and_the_exit_status_ends_it() {
+        let mut state = state_with_contexts();
+        state.open_exec(ClusterId::new("prod"), command("ls"), 100);
+        assert!(state.exec().expect("open").is_running());
+
+        state.apply(
+            &ClusterEvent::ExecOutput {
+                cluster: "prod".into(),
+                lines: Arc::from([exec_line("bin"), exec_line("etc")]),
+            },
+            Instant::now(),
+        );
+        state.apply(
+            &ClusterEvent::ExecFinished {
+                cluster: "prod".into(),
+                status: periscope_bridge::ExecStatus::Exited {
+                    code: Some(0),
+                    message: String::new(),
+                },
+            },
+            Instant::now(),
+        );
+
+        let session = state.exec().expect("still open after the command ended");
+        assert_eq!(session.buffer.len(), 2);
+        assert!(!session.is_running());
+        assert_eq!(session.summary(), "exited 0");
+    }
+
+    #[test]
+    fn output_from_another_cluster_never_reaches_the_session() {
+        // Two clusters can be on screen; output belongs to exactly one of them.
+        let mut state = state_with_contexts();
+        state.open_exec(ClusterId::new("prod"), command("ls"), 100);
+
+        state.apply(
+            &ClusterEvent::ExecOutput {
+                cluster: "staging".into(),
+                lines: Arc::from([exec_line("not yours")]),
+            },
+            Instant::now(),
+        );
+
+        assert!(state.exec().expect("open").buffer.is_empty());
+    }
+
+    #[test]
+    fn cancelling_says_so_rather_than_leaving_it_running_forever() {
+        let mut state = state_with_contexts();
+        state.open_exec(ClusterId::new("prod"), command("sleep 600"), 100);
+
+        assert!(state.cancel_exec());
+        assert_eq!(state.exec().expect("open").summary(), "cancelled");
+        // Nothing is running any more, so a second stop is a no-op.
+        assert!(!state.cancel_exec());
+    }
+
+    #[test]
+    fn switching_cluster_drops_a_command_that_belonged_to_the_old_one() {
+        let mut state = state_with_contexts();
+        state.open_exec(ClusterId::new("prod"), command("ls"), 100);
+
+        state.select_cluster(ClusterId::new("staging"));
+
+        assert!(state.exec().is_none());
+    }
+
     #[test]
     fn a_writable_cluster_authorizes() {
         let mut state = state_with_contexts();
@@ -1817,6 +2127,122 @@ mod tests {
 
         assert_eq!(state.activity().len(), ACTIVITY_LIMIT);
         assert_eq!(state.activity()[0].outcome.message(), "scaled to 59");
+    }
+
+    fn forward_event(
+        cluster: &str,
+        id: u64,
+        state: periscope_bridge::ForwardState,
+    ) -> ClusterEvent {
+        ClusterEvent::ForwardChanged {
+            cluster: cluster.into(),
+            forward: Arc::new(ForwardInfo {
+                state,
+                ..ForwardInfo::starting(
+                    ForwardId(id),
+                    Arc::new(periscope_bridge::ForwardTarget::new(
+                        "default", "api-0", 8080,
+                    )),
+                )
+            }),
+        }
+    }
+
+    #[test]
+    fn forward_ids_are_unique() {
+        let mut state = AppState::new();
+        assert_ne!(state.next_forward_id(), state.next_forward_id());
+    }
+
+    #[test]
+    fn a_forward_appears_and_shows_its_address() {
+        let mut state = state_with_contexts();
+
+        state.apply_batch(
+            &[forward_event(
+                "prod",
+                1,
+                periscope_bridge::ForwardState::Listening { local_port: 51234 },
+            )],
+            Instant::now(),
+        );
+
+        assert_eq!(state.forward_count(), 1);
+        let (cluster, forward) = state.forwards().next().unwrap();
+        assert_eq!(cluster, &ClusterId::new("prod"));
+        assert_eq!(forward.address().as_deref(), Some("127.0.0.1:51234"));
+        assert_eq!(state.broken_forwards(), 0);
+    }
+
+    #[test]
+    fn a_failed_forward_stays_in_the_list_with_its_reason() {
+        let mut state = state_with_contexts();
+
+        state.apply_batch(
+            &[forward_event(
+                "prod",
+                1,
+                periscope_bridge::ForwardState::Failed {
+                    reason: "address already in use".into(),
+                },
+            )],
+            Instant::now(),
+        );
+
+        // Removing it would hide the only explanation of what went wrong.
+        assert_eq!(state.forward_count(), 1);
+        assert_eq!(state.broken_forwards(), 1);
+    }
+
+    #[test]
+    fn a_stopped_forward_leaves_the_list() {
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[forward_event(
+                "prod",
+                1,
+                periscope_bridge::ForwardState::Listening { local_port: 51234 },
+            )],
+            Instant::now(),
+        );
+
+        state.apply_batch(
+            &[forward_event(
+                "prod",
+                1,
+                periscope_bridge::ForwardState::Stopped,
+            )],
+            Instant::now(),
+        );
+        assert_eq!(state.forward_count(), 0);
+    }
+
+    #[test]
+    fn a_forward_that_recovers_stops_being_a_problem() {
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[forward_event(
+                "prod",
+                1,
+                periscope_bridge::ForwardState::Degraded {
+                    local_port: 51234,
+                    reason: "connection refused".into(),
+                },
+            )],
+            Instant::now(),
+        );
+        assert_eq!(state.broken_forwards(), 1);
+
+        state.apply_batch(
+            &[forward_event(
+                "prod",
+                1,
+                periscope_bridge::ForwardState::Listening { local_port: 51234 },
+            )],
+            Instant::now(),
+        );
+        assert_eq!(state.broken_forwards(), 0);
+        assert_eq!(state.forward_count(), 1);
     }
 
     #[test]

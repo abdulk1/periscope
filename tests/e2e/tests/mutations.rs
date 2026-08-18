@@ -411,6 +411,61 @@ fn cordoning_a_node_and_letting_it_back() {
     assert_ne!(periscope_e2e::node_unschedulable(&node), Some(true));
 }
 
+/// Draining the only node of a one-node cluster evicts everything on it, so
+/// this test puts the node back and lets the workloads reschedule. It is
+/// `#[ignore]`d like the rest, and it is the most disruptive thing in the
+/// suite — which is exactly what it is testing.
+#[test]
+#[ignore = "needs a cluster; evicts every pod on the node"]
+fn draining_a_node_cordons_it_and_evicts_what_it_can() {
+    let (runtime, stream, cluster) = connected_with(WritePolicy::permissive(), None);
+    let node = periscope_e2e::first_node().expect("the cluster has a node");
+
+    let outcome = mutate(
+        &runtime,
+        &stream,
+        &cluster,
+        Mutation::Drain {
+            node: Arc::from(node.as_str()),
+            grace_period: Some(0),
+        },
+    );
+
+    // Put the node back before asserting anything: a panic must not leave the
+    // cluster cordoned for every later test.
+    let uncordon = mutate(
+        &runtime,
+        &stream,
+        &cluster,
+        Mutation::Cordon {
+            node: Arc::from(node.as_str()),
+            cordon: false,
+        },
+    );
+
+    match &outcome {
+        // A one-node cluster refuses some evictions — the apiserver's own
+        // PodDisruptionBudgets protect CoreDNS — and that refusal is the point:
+        // it is reported per pod rather than swallowed.
+        MutationOutcome::Applied { detail } | MutationOutcome::Failed { reason: detail } => {
+            assert!(detail.contains(&node), "{detail}");
+            assert!(detail.contains("cordoned"), "{detail}");
+            assert!(detail.contains("evicted"), "{detail}");
+            assert!(
+                detail.contains("skipped"),
+                "DaemonSet and mirror pods should be reported as skipped: {detail}"
+            );
+        }
+        other => panic!("expected a summary, got {other:?}"),
+    }
+
+    assert!(
+        matches!(uncordon, MutationOutcome::Applied { .. }),
+        "the node must be put back: {uncordon:?}"
+    );
+    assert_ne!(periscope_e2e::node_unschedulable(&node), Some(true));
+}
+
 #[test]
 #[ignore = "needs a cluster"]
 fn a_failure_from_the_apiserver_is_reported_verbatim_and_audited() {

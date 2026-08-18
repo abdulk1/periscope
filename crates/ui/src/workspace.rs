@@ -22,7 +22,7 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use periscope_bridge::{
     ClusterCommand, ClusterEvent, ClusterId, CommandError, CommandSender, ConnectionState,
-    FlushStats, KindId, LogTarget, Mutation, ResourceKey,
+    ExecTarget, FlushStats, ForwardId, ForwardTarget, KindId, LogTarget, Mutation, ResourceKey,
 };
 use periscope_config::ThemeChoice;
 use periscope_store::{AppState, Detail, FilterSpec};
@@ -111,6 +111,69 @@ impl BridgeStats {
     }
 }
 
+/// Something waiting for the user to agree to it.
+///
+/// A command is here alongside mutations rather than beside port forwards,
+/// because it is a change: `kubectl exec` needs `create` on `pods/exec`, and
+/// what it runs is arbitrary. One dialog, one rule, no exceptions to remember.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Proposal {
+    /// A change to an object.
+    Mutation(Arc<Mutation>),
+    /// A command to run in a container.
+    Command(Arc<ExecTarget>),
+}
+
+impl Proposal {
+    /// The sentence the dialog shows.
+    fn confirmation(&self, cluster: &ClusterId) -> String {
+        match self {
+            Self::Mutation(mutation) => mutation.confirmation(cluster),
+            Self::Command(target) => target.confirmation(cluster),
+        }
+    }
+
+    /// Whether the confirm button is the red one.
+    fn is_destructive(&self) -> bool {
+        match self {
+            Self::Mutation(mutation) => mutation.is_destructive(),
+            // A command can be anything, and Periscope cannot tell `ls` from
+            // `rm -rf /`. Treating every one as destructive is the honest
+            // reading, and it is the safe one.
+            Self::Command(_) => true,
+        }
+    }
+
+    /// The line under the sentence, when there is something more to say.
+    fn warning(&self) -> Option<&'static str> {
+        match self {
+            Self::Mutation(mutation) => mutation
+                .is_destructive()
+                .then_some("This cannot be undone."),
+            Self::Command(_) => {
+                Some("Periscope cannot tell what a command does before it runs it.")
+            }
+        }
+    }
+
+    /// What the confirm button says.
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::Mutation(mutation) => match &**mutation {
+                Mutation::Delete { .. } => "Delete",
+                Mutation::Scale { .. } => "Scale",
+                Mutation::Restart { .. } => "Restart",
+                Mutation::Cordon { cordon: true, .. } => "Cordon",
+                Mutation::Cordon { .. } => "Uncordon",
+                Mutation::Drain { .. } => "Drain",
+                Mutation::Apply { dry_run: true, .. } => "Dry run",
+                Mutation::Apply { .. } => "Apply",
+            },
+            Self::Command(_) => "Run",
+        }
+    }
+}
+
 /// The application's root view.
 pub struct Workspace {
     commands: CommandSender,
@@ -145,9 +208,14 @@ pub struct Workspace {
     log_selector_input: Entity<InputState>,
     log_container_input: Entity<InputState>,
     log_scroll: gpui::UniformListScrollHandle,
+    /// The command output's scroll position, kept apart from the log view's so
+    /// the two panes do not fight over it.
+    exec_scroll: gpui::UniformListScrollHandle,
     /// How many lines were visible last frame, so following only scrolls when
     /// there is something new to scroll to.
     log_visible: usize,
+    /// The same, for command output.
+    exec_visible: usize,
     /// What the log view last told the user about an export.
     log_notice: Option<SharedString>,
 
@@ -160,12 +228,18 @@ pub struct Workspace {
 
     /// A tail asked for on the command line, opened once the cluster connects.
     pending_tail: Option<Arc<LogTarget>>,
-    /// A mutation waiting for the user to confirm it.
+    /// A change waiting for the user to confirm it.
     ///
     /// Nothing is sent while this is `Some`: the confirmation *is* the gate.
-    pending_mutation: Option<Arc<Mutation>>,
+    pending: Option<Proposal>,
     /// Replica count for a scale, as typed.
     replicas_input: Entity<InputState>,
+    /// Container port to forward, as typed.
+    port_input: Entity<InputState>,
+    /// The command to run in a container, as typed.
+    exec_input: Entity<InputState>,
+    /// Whether the forwards panel is open.
+    forwards_open: bool,
     /// How many lines a session keeps before dropping the oldest.
     log_capacity: usize,
     /// Counts exports, so two in one session do not overwrite each other.
@@ -232,6 +306,8 @@ impl Workspace {
         let palette_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("jump to a kind or object"));
         let replicas_input = cx.new(|cx| InputState::new(window, cx).placeholder("replicas"));
+        let port_input = cx.new(|cx| InputState::new(window, cx).placeholder("port"));
+        let exec_input = cx.new(|cx| InputState::new(window, cx).placeholder("command"));
         let log_filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("filter lines"));
         let log_selector_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("label selector (all pods)"));
@@ -315,7 +391,9 @@ impl Workspace {
             log_selector_input,
             log_container_input,
             log_scroll: gpui::UniformListScrollHandle::new(),
+            exec_scroll: gpui::UniformListScrollHandle::new(),
             log_visible: 0,
+            exec_visible: 0,
             log_notice: None,
             yaml_view,
             yaml_showing: None,
@@ -326,8 +404,11 @@ impl Workspace {
             palette_index: 0,
             palette_focus: root_focus,
             pending_tail: tail.map(Arc::new),
-            pending_mutation: None,
+            pending: None,
             replicas_input,
+            port_input,
+            exec_input,
+            forwards_open: false,
             log_capacity: periscope_store::logs::DEFAULT_CAPACITY,
             exports: 0,
             frames: FrameMeter::new(perf),
@@ -600,24 +681,32 @@ impl Workspace {
 
     /// Puts a mutation in front of the user. Nothing is sent until they agree.
     fn propose(&mut self, mutation: Mutation, cx: &mut Context<Self>) {
-        self.pending_mutation = Some(Arc::new(mutation));
+        self.pending = Some(Proposal::Mutation(Arc::new(mutation)));
         cx.notify();
     }
 
     /// Drops the proposal without doing anything.
     fn cancel_mutation(&mut self, cx: &mut Context<Self>) {
-        self.pending_mutation = None;
+        self.pending = None;
         cx.notify();
     }
 
-    /// Sends the proposed mutation, if the store allows it.
+    /// Sends whatever was proposed, if the store allows it.
     fn confirm_mutation(&mut self, cx: &mut Context<Self>) {
-        let (Some(mutation), Some(cluster)) =
-            (self.pending_mutation.take(), self.state.active().cloned())
+        let (Some(pending), Some(cluster)) = (self.pending.take(), self.state.active().cloned())
         else {
             return;
         };
 
+        match pending {
+            Proposal::Mutation(mutation) => self.send_mutation(cluster, mutation),
+            Proposal::Command(target) => self.send_command(cluster, target),
+        }
+        cx.notify();
+    }
+
+    /// Sends an authorised mutation, or records why it was refused.
+    fn send_mutation(&mut self, cluster: ClusterId, mutation: Arc<Mutation>) {
         match self.state.authorize(&cluster, Arc::clone(&mutation)) {
             Ok(authorized) => {
                 let (cluster, mutation) = authorized.into_parts();
@@ -637,7 +726,6 @@ impl Workspace {
                     .record_refusal(cluster, mutation, &refusal, Instant::now());
             }
         }
-        cx.notify();
     }
 
     /// The replica count typed into the scale field, if it is a number.
@@ -655,6 +743,138 @@ impl Workspace {
         // Deployments and StatefulSets render READY as `ready/desired`.
         let (_, desired) = row.cell(0).split_once('/')?;
         desired.trim().parse().ok()
+    }
+
+    // --- forwards -----------------------------------------------------------
+
+    /// Opens a local port onto the pod in the detail pane.
+    ///
+    /// A forward is not a mutation — it changes nothing in the cluster — so it
+    /// needs no confirmation, and it works on read-only clusters.
+    fn start_forward(&mut self, cx: &mut Context<Self>) {
+        let (Some(cluster), Some(detail)) = (self.state.active().cloned(), self.state.detail())
+        else {
+            return;
+        };
+        let key = detail.key().clone();
+
+        let Some(port) = self
+            .port_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+        else {
+            self.last_error = Some(SharedString::from(
+                "Type the container port to forward, next to Forward.",
+            ));
+            cx.notify();
+            return;
+        };
+
+        let id = self.state.next_forward_id();
+        let target = Arc::new(ForwardTarget::new(&*key.namespace, &*key.name, port));
+        tracing::info!(%cluster, %id, target = %target.label(), "starting a forward");
+
+        self.forwards_open = true;
+        self.send(ClusterCommand::StartForward {
+            cluster,
+            id,
+            target,
+        });
+        cx.notify();
+    }
+
+    /// Tears a forward down.
+    fn stop_forward(&mut self, cluster: ClusterId, id: ForwardId, cx: &mut Context<Self>) {
+        self.state.forget_forward(&cluster, id);
+        self.send(ClusterCommand::StopForward { cluster, id });
+        cx.notify();
+    }
+
+    fn toggle_forwards(&mut self, cx: &mut Context<Self>) {
+        self.forwards_open = !self.forwards_open;
+        cx.notify();
+    }
+
+    /// Copies a forward's address, which is the only thing anyone wants from it.
+    fn copy_address(&mut self, address: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(address.clone()));
+        self.last_error = None;
+        self.log_notice = Some(SharedString::from(format!("Copied {address}")));
+        cx.notify();
+    }
+
+    // --- commands -----------------------------------------------------------
+
+    /// Proposes running the typed command in the pod in the detail pane.
+    ///
+    /// Nothing is sent here: like every other change, it goes through the
+    /// confirmation dialog first.
+    fn run_command(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = self.state.detail() else {
+            return;
+        };
+        let key = detail.key().clone();
+        let typed = self.exec_input.read(cx).value().to_string();
+
+        // No container is named, so the apiserver picks the pod's default —
+        // the same thing `kubectl exec` does without `-c`.
+        let Some(target) = ExecTarget::parse(&*key.namespace, &*key.name, None, &typed) else {
+            self.last_error = Some(SharedString::from(
+                "Type a command to run next to Run, such as `ls -la /etc`.",
+            ));
+            cx.notify();
+            return;
+        };
+
+        self.pending = Some(Proposal::Command(Arc::new(target)));
+        cx.notify();
+    }
+
+    /// Sends an authorised command, or says why it was refused.
+    fn send_command(&mut self, cluster: ClusterId, target: Arc<ExecTarget>) {
+        match self.state.authorize_exec(&cluster, target) {
+            Ok(authorized) => {
+                let (cluster, target) = authorized.into_parts();
+                tracing::info!(%cluster, target = %target.label(), "running a command");
+
+                // The pane opens now, empty, rather than when the first line
+                // arrives: a command that prints nothing still ran.
+                self.state
+                    .open_exec(cluster.clone(), Arc::clone(&target), self.log_capacity);
+                self.send(ClusterCommand::Exec { cluster, target });
+            }
+            Err(refusal) => {
+                tracing::warn!(%cluster, reason = refusal.reason(), "command refused");
+                self.last_error = Some(SharedString::from(refusal.reason()));
+            }
+        }
+    }
+
+    /// Stops the running command.
+    fn stop_command(&mut self, cx: &mut Context<Self>) {
+        let Some(cluster) = self.state.exec().map(|session| session.cluster.clone()) else {
+            return;
+        };
+        self.state.cancel_exec();
+        self.send(ClusterCommand::CancelExec { cluster });
+        cx.notify();
+    }
+
+    /// Closes the output pane, stopping the command if it is still running.
+    fn close_command(&mut self, cx: &mut Context<Self>) {
+        if self
+            .state
+            .exec()
+            .is_some_and(periscope_store::ExecSession::is_running)
+        {
+            self.stop_command(cx);
+        }
+        self.state.close_exec();
+        cx.notify();
     }
 
     // --- logs ---------------------------------------------------------------
@@ -1001,11 +1221,13 @@ impl Workspace {
     }
 
     fn dismiss(&mut self, _: &Dismiss, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_mutation.is_some() {
+        if self.pending.is_some() {
             // Escape closes the most dangerous thing on screen first.
             self.cancel_mutation(cx);
         } else if self.palette_open {
             self.close_palette(cx);
+        } else if self.state.exec().is_some() {
+            self.close_command(cx);
         } else if self.state.logs().is_some() {
             self.close_logs(cx);
         } else if self.state.detail().is_some() {
@@ -1124,6 +1346,17 @@ impl Workspace {
                                 this.toggle_palette(&TogglePalette, window, cx);
                             })),
                     )
+                    .children((self.state.forward_count() > 0).then(|| {
+                        Button::new("forwards")
+                            .outline()
+                            .small()
+                            .label(if self.state.broken_forwards() > 0 {
+                                format!("Forwards {} ⚠", self.state.forward_count())
+                            } else {
+                                format!("Forwards {}", self.state.forward_count())
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_forwards(cx)))
+                    }))
                     .child(
                         Button::new("split")
                             .outline()
@@ -1739,6 +1972,100 @@ impl Workspace {
         )
     }
 
+    /// The output of a command run in a container.
+    ///
+    /// Deliberately shaped like the log pane and not like a terminal: the
+    /// output is a list of lines with the stream they came from, because that
+    /// is what it is. See `docs/DECISIONS.md` ADR-0033.
+    fn exec_pane(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let session = self.state.exec()?;
+        let buffer = &session.buffer;
+        let running = session.is_running();
+
+        let status = session.summary();
+        let bad = session
+            .status
+            .as_ref()
+            .is_some_and(periscope_bridge::ExecStatus::is_problem);
+
+        let lines = Arc::<[Arc<periscope_bridge::LogLine>]>::from(buffer.visible_lines());
+        let body = if lines.is_empty() {
+            let message = if running {
+                "Running — waiting for output.".to_owned()
+            } else {
+                // A command that printed nothing is a result, not a bug, and
+                // saying so is better than an empty box.
+                "The command printed nothing.".to_owned()
+            };
+            logview::placeholder(message, cx).into_any_element()
+        } else {
+            // The source column is the stream — stdout or stderr — which is the
+            // one thing worth distinguishing here.
+            logview::body(lines, true, self.exec_scroll.clone()).into_any_element()
+        };
+
+        Some(
+            v_flex()
+                .flex_1()
+                .h_full()
+                .overflow_hidden()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .truncate()
+                                .text_color(cx.theme().foreground)
+                                .child(format!("exec · {}", session.target.label())),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .flex_none()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if bad {
+                                            cx.theme().danger
+                                        } else {
+                                            cx.theme().muted_foreground
+                                        })
+                                        .child(status),
+                                )
+                                .children(running.then(|| {
+                                    Button::new("stop-command")
+                                        .outline()
+                                        .small()
+                                        .label("Stop")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.stop_command(cx)),
+                                        )
+                                }))
+                                .child(
+                                    Button::new("close-command")
+                                        .outline()
+                                        .small()
+                                        .label("Close")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.close_command(cx)),
+                                        ),
+                                ),
+                        ),
+                )
+                .child(body),
+        )
+    }
+
     /// The detail pane: YAML, events and owners for one object.
     fn detail_pane(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let detail = self.state.detail()?;
@@ -1827,6 +2154,22 @@ impl Workspace {
                     .iter()
                     .find(|row| row.key == key)
                     .is_some_and(|row| row.cell(0).contains("SchedulingDisabled"));
+                let drain_node = key.name.clone();
+                actions.push(
+                    Button::new("drain")
+                        .outline()
+                        .small()
+                        .label("Drain")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.propose(
+                                Mutation::Drain {
+                                    node: Arc::clone(&drain_node),
+                                    grace_period: None,
+                                },
+                                cx,
+                            );
+                        })),
+                );
                 actions.push(
                     Button::new("cordon")
                         .outline()
@@ -2069,6 +2412,30 @@ impl Workspace {
                                 })),
                         )
                         .children(actions)
+                        .children(
+                            is_pod.then(|| {
+                                div().w(px(70.)).child(Input::new(&self.port_input).small())
+                            }),
+                        )
+                        .children(is_pod.then(|| {
+                            Button::new("forward")
+                                .outline()
+                                .small()
+                                .label("Forward")
+                                .on_click(cx.listener(|this, _, _, cx| this.start_forward(cx)))
+                        }))
+                        .children((is_pod && writable).then(|| {
+                            div()
+                                .w(px(150.))
+                                .child(Input::new(&self.exec_input).small())
+                        }))
+                        .children((is_pod && writable).then(|| {
+                            Button::new("run-command")
+                                .outline()
+                                .small()
+                                .label("Run")
+                                .on_click(cx.listener(|this, _, _, cx| this.run_command(cx)))
+                        }))
                         .children(is_pod.then(|| {
                             Button::new("tail-logs")
                                 .outline()
@@ -2099,6 +2466,123 @@ impl Workspace {
         )
     }
 
+    /// The list of open forwards.
+    ///
+    /// Always reachable from the header, because a forward is a thing running
+    /// on the user's machine: leaving one open by accident should be visible,
+    /// not something you have to remember.
+    fn forwards_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.forwards_open || self.state.forward_count() == 0 {
+            return None;
+        }
+
+        let rows: Vec<_> = self
+            .state
+            .forwards()
+            .map(|(cluster, forward)| {
+                let (cluster, id) = (cluster.clone(), forward.id);
+                let address = forward.address();
+                let problem = forward.state.detail().map(str::to_owned);
+
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        v_flex()
+                            .gap_0p5()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .truncate()
+                                    .text_color(if forward.state.is_problem() {
+                                        cx.theme().danger
+                                    } else {
+                                        cx.theme().foreground
+                                    })
+                                    .child(forward.summary()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .truncate()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(match &problem {
+                                        Some(reason) => reason.clone(),
+                                        None => format!(
+                                            "{cluster} · {} connections",
+                                            forward.connections
+                                        ),
+                                    }),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_none()
+                            .children(address.map(|address| {
+                                Button::new(SharedString::from(format!("copy-{id}")))
+                                    .outline()
+                                    .small()
+                                    .label("Copy")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.copy_address(address.clone(), cx)
+                                    }))
+                            }))
+                            .child(
+                                Button::new(SharedString::from(format!("stop-{id}")))
+                                    .outline()
+                                    .small()
+                                    .label("Stop")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.stop_forward(cluster.clone(), id, cx)
+                                    })),
+                            ),
+                    )
+            })
+            .collect();
+
+        Some(
+            v_flex()
+                .w(px(420.))
+                .flex_none()
+                .h_full()
+                .border_l_1()
+                .border_color(cx.theme().border)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .justify_between()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().foreground)
+                                .child("Port forwards"),
+                        )
+                        .child(
+                            Button::new("close-forwards")
+                                .outline()
+                                .small()
+                                .label("Close")
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_forwards(cx))),
+                        ),
+                )
+                .child(v_flex().id("forwards").overflow_y_scroll().children(rows)),
+        )
+    }
+
     /// The confirmation dialog.
     ///
     /// This is the guardrail the whole phase turns on, so it is deliberately
@@ -2106,10 +2590,10 @@ impl Workspace {
     /// operation, and two buttons. Nothing is pre-selected, and the destructive
     /// confirm is the only red thing on screen.
     fn confirmation(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let mutation = self.pending_mutation.clone()?;
+        let pending = self.pending.clone()?;
         let cluster = self.state.active()?.clone();
-        let sentence = mutation.confirmation(&cluster);
-        let destructive = mutation.is_destructive();
+        let sentence = pending.confirmation(&cluster);
+        let destructive = pending.is_destructive();
 
         let connection = self.state.connection(&cluster);
         let health = connection
@@ -2151,11 +2635,11 @@ impl Workspace {
                                 .children(health.map(|health| {
                                     div().text_xs().text_color(cx.theme().warning).child(health)
                                 }))
-                                .children(destructive.then(|| {
+                                .children(pending.warning().map(|warning| {
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child("This cannot be undone.")
+                                        .child(warning)
                                 })),
                         )
                         .child(
@@ -2179,15 +2663,7 @@ impl Workspace {
                                         .small()
                                         .when(destructive, |button| button.danger())
                                         .when(!destructive, |button| button.primary())
-                                        .label(match &*mutation {
-                                            Mutation::Delete { .. } => "Delete",
-                                            Mutation::Scale { .. } => "Scale",
-                                            Mutation::Restart { .. } => "Restart",
-                                            Mutation::Cordon { cordon: true, .. } => "Cordon",
-                                            Mutation::Cordon { .. } => "Uncordon",
-                                            Mutation::Apply { dry_run: true, .. } => "Dry run",
-                                            Mutation::Apply { .. } => "Apply",
-                                        })
+                                        .label(pending.verb())
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.confirm_mutation(cx)),
                                         ),
@@ -2318,9 +2794,28 @@ impl Render for Workspace {
             window.request_animation_frame();
         }
 
-        let logs = self.log_pane(cx).map(gpui::IntoElement::into_any_element);
-        let main = match logs {
-            Some(logs) => logs,
+        // The newest line of command output stays on screen the same way a
+        // followed tail does; there is no "pause" here because a command ends
+        // by itself.
+        if let Some(session) = self.state.exec() {
+            let visible = session.buffer.visible_len();
+            if visible > 0 && visible != self.exec_visible {
+                self.exec_scroll
+                    .scroll_to_item(visible - 1, gpui::ScrollStrategy::Top);
+            }
+            self.exec_visible = visible;
+        } else if self.exec_visible != 0 {
+            self.exec_visible = 0;
+        }
+
+        // A command's output takes the main pane while it is open: it was just
+        // asked for, and closing it falls back to whatever was there before.
+        let main = self
+            .exec_pane(cx)
+            .map(gpui::IntoElement::into_any_element)
+            .or_else(|| self.log_pane(cx).map(gpui::IntoElement::into_any_element));
+        let main = match main {
+            Some(pane) => pane,
             None => self.content(cx).into_any_element(),
         };
 
@@ -2359,7 +2854,8 @@ impl Render for Workspace {
                             // A tail takes the main pane: reading logs is not a
                             // thing anyone does while watching a table.
                             .child(main)
-                            .children(self.detail_pane(cx)),
+                            .children(self.detail_pane(cx))
+                            .children(self.forwards_panel(cx)),
                     )
                     .child(self.footer(cx)),
             )
@@ -3239,7 +3735,7 @@ mod tests {
 
         // Proposing sends nothing at all.
         assert!(drain(&rx).is_empty());
-        assert!(harness.read(cx, |workspace| workspace.pending_mutation.is_some()));
+        assert!(harness.read(cx, |workspace| workspace.pending.is_some()));
 
         harness.update(cx, |workspace, _window, cx| workspace.confirm_mutation(cx));
 
@@ -3274,7 +3770,7 @@ mod tests {
         });
         harness.keys(cx, "escape");
 
-        assert!(harness.read(cx, |workspace| workspace.pending_mutation.is_none()));
+        assert!(harness.read(cx, |workspace| workspace.pending.is_none()));
         assert!(drain(&rx).is_empty());
     }
 
@@ -3302,7 +3798,264 @@ mod tests {
         harness.keys(cx, "escape");
         harness.read(cx, |workspace| {
             // The dialog went; the detail pane behind it stayed.
-            assert!(workspace.pending_mutation.is_none());
+            assert!(workspace.pending.is_none());
+            assert!(workspace.state().detail().is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn a_command_is_not_run_until_it_is_confirmed(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::Status {
+                cluster: "prod".into(),
+                state: ConnectionState::Connected,
+            }],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        drain(&rx);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace
+                .exec_input
+                .update(cx, |input, cx| input.set_value("ls -la /etc", window, cx));
+            workspace.run_command(cx);
+        });
+
+        // A command is a change, so it waits behind the same dialog as one.
+        assert!(drain(&rx).is_empty());
+        harness.read(cx, |workspace| {
+            let sentence = workspace
+                .pending
+                .as_ref()
+                .expect("a command is waiting")
+                .confirmation(&ClusterId::new("prod"));
+            assert!(sentence.contains("prod"), "{sentence}");
+            assert!(sentence.contains("api-0"), "{sentence}");
+            assert!(sentence.contains("ls -la /etc"), "{sentence}");
+        });
+
+        harness.update(cx, |workspace, _window, cx| workspace.confirm_mutation(cx));
+
+        match drain(&rx).as_slice() {
+            [ClusterCommand::Exec { cluster, target }] => {
+                assert_eq!(cluster, &ClusterId::new("prod"));
+                assert_eq!(target.command_line(), "ls -la /etc");
+                assert_eq!(&*target.pod, "api-0");
+            }
+            other => panic!("expected one exec, got {other:?}"),
+        }
+        // The pane opens straight away: a command that prints nothing still ran.
+        assert!(harness.read(cx, |workspace| workspace.state().exec().is_some()));
+    }
+
+    #[gpui::test]
+    fn command_output_and_its_exit_status_reach_the_pane(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::Status {
+                cluster: "prod".into(),
+                state: ConnectionState::Connected,
+            }],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        harness.update(cx, |workspace, window, cx| {
+            workspace
+                .exec_input
+                .update(cx, |input, cx| input.set_value("cat /missing", window, cx));
+            workspace.run_command(cx);
+            workspace.confirm_mutation(cx);
+        });
+        drain(&rx);
+
+        apply(
+            &harness,
+            cx,
+            vec![
+                ClusterEvent::ExecOutput {
+                    cluster: "prod".into(),
+                    lines: Arc::from([periscope_bridge::LogLine {
+                        source: periscope_bridge::LogSource::new("api-0", "stderr"),
+                        timestamp: None,
+                        text: Arc::from("cat: /missing: No such file or directory"),
+                    }]),
+                },
+                ClusterEvent::ExecFinished {
+                    cluster: "prod".into(),
+                    status: periscope_bridge::ExecStatus::Exited {
+                        code: Some(1),
+                        message: "command terminated with exit code 1".to_owned(),
+                    },
+                },
+            ],
+        );
+
+        harness.read(cx, |workspace| {
+            let session = workspace.state().exec().expect("a session");
+            assert_eq!(session.buffer.len(), 1);
+            assert!(!session.is_running());
+            // A non-zero exit is a result the user must be able to see.
+            assert!(
+                session.summary().contains("exited 1"),
+                "{}",
+                session.summary()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn stopping_a_command_cancels_it_and_says_so(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::Status {
+                cluster: "prod".into(),
+                state: ConnectionState::Connected,
+            }],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        harness.update(cx, |workspace, window, cx| {
+            workspace
+                .exec_input
+                .update(cx, |input, cx| input.set_value("sleep 600", window, cx));
+            workspace.run_command(cx);
+            workspace.confirm_mutation(cx);
+        });
+        drain(&rx);
+
+        harness.update(cx, |workspace, _window, cx| workspace.stop_command(cx));
+
+        match drain(&rx).as_slice() {
+            [ClusterCommand::CancelExec { cluster }] => {
+                assert_eq!(cluster, &ClusterId::new("prod"));
+            }
+            other => panic!("expected a cancel, got {other:?}"),
+        }
+        // The pane does not sit on "running…" waiting for the cluster to agree.
+        harness.read(cx, |workspace| {
+            let session = workspace.state().exec().expect("a session");
+            assert!(!session.is_running());
+            assert_eq!(session.summary(), "cancelled");
+        });
+    }
+
+    #[gpui::test]
+    fn a_read_only_cluster_runs_no_command_and_sends_nothing(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::Status {
+                cluster: "prod".into(),
+                state: ConnectionState::Connected,
+            }],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        drain(&rx);
+
+        harness.update(cx, |workspace, window, cx| {
+            let mut permissions = periscope_store::Permissions::permissive();
+            permissions.deny(ClusterId::new("prod"));
+            workspace.state.set_permissions(permissions);
+
+            workspace
+                .exec_input
+                .update(cx, |input, cx| input.set_value("rm -rf /data", window, cx));
+            workspace.run_command(cx);
+            // Confirmed anyway: the store is what refuses, not the dialog.
+            workspace.confirm_mutation(cx);
+        });
+
+        assert!(drain(&rx).is_empty());
+        harness.read(cx, |workspace| {
+            assert!(workspace.state().exec().is_none());
+            let error = workspace.last_error.as_ref().expect("the refusal is shown");
+            assert!(error.contains("read-only"), "{error}");
+        });
+    }
+
+    #[gpui::test]
+    fn an_empty_command_says_what_to_type_rather_than_running_nothing(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        drain(&rx);
+
+        harness.update(cx, |workspace, _window, cx| workspace.run_command(cx));
+
+        assert!(drain(&rx).is_empty());
+        harness.read(cx, |workspace| {
+            assert!(workspace.pending.is_none());
+            assert!(workspace.last_error.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_command_pane_and_stops_it(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::Status {
+                cluster: "prod".into(),
+                state: ConnectionState::Connected,
+            }],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        harness.update(cx, |workspace, window, cx| {
+            workspace
+                .exec_input
+                .update(cx, |input, cx| input.set_value("sleep 600", window, cx));
+            workspace.run_command(cx);
+            workspace.confirm_mutation(cx);
+        });
+        drain(&rx);
+
+        harness.keys(cx, "escape");
+
+        // Closing the pane must not leave a command running with nowhere to
+        // report to.
+        match drain(&rx).as_slice() {
+            [ClusterCommand::CancelExec { .. }] => {}
+            other => panic!("expected a cancel, got {other:?}"),
+        }
+        harness.read(cx, |workspace| {
+            assert!(workspace.state().exec().is_none());
+            // The detail pane behind it stayed.
             assert!(workspace.state().detail().is_some());
         });
     }
@@ -3371,11 +4124,7 @@ mod tests {
             );
 
             let cluster = workspace.state().active().unwrap().clone();
-            let sentence = workspace
-                .pending_mutation
-                .as_ref()
-                .unwrap()
-                .confirmation(&cluster);
+            let sentence = workspace.pending.as_ref().unwrap().confirmation(&cluster);
 
             assert!(sentence.contains("prod"), "{sentence}");
             assert!(sentence.contains("payments"), "{sentence}");

@@ -12,7 +12,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use kube::api::{DeleteParams, Patch, PatchParams};
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::{DeleteParams, EvictParams, ListParams, Patch, PatchParams};
 use kube::{Client, api::DynamicObject};
 use periscope_bridge::{ClusterId, KindId, Mutation, MutationOutcome, ResourceKey};
 use periscope_config::{AuditEntry, AuditLog, AuditOutcome};
@@ -148,6 +149,7 @@ async fn perform(client: &Client, mutation: &Mutation, namespaced: bool) -> Muta
         Mutation::Scale { replicas, .. } => scale(&api, &key, *replicas).await,
         Mutation::Restart { .. } => restart(&api, &key).await,
         Mutation::Cordon { cordon, .. } => cordon_node(&api, &key, *cordon).await,
+        Mutation::Drain { node, grace_period } => drain(client, &api, node, *grace_period).await,
         Mutation::Apply { yaml, dry_run, .. } => apply(&api, &key, yaml, *dry_run).await,
     }
 }
@@ -252,6 +254,122 @@ async fn cordon_node(
             reason: describe(&error),
         },
     }
+}
+
+/// Cordons a node and evicts the pods already on it.
+///
+/// The same two steps `kubectl drain` takes, and the same exclusions: pods
+/// owned by a DaemonSet come straight back, so evicting them is churn, and
+/// mirror pods are the kubelet's own and cannot be evicted at all.
+///
+/// It does **not** wait for the pods to finish terminating. Eviction is a
+/// request the apiserver either accepts or refuses — a PodDisruptionBudget can
+/// refuse it, and that refusal is what the user needs to see — while waiting
+/// for termination can take as long as the longest `terminationGracePeriod` on
+/// the node. What is reported is what the apiserver said, immediately.
+async fn drain(
+    client: &Client,
+    nodes: &kube::Api<DynamicObject>,
+    node: &str,
+    grace_period: Option<u32>,
+) -> MutationOutcome {
+    // Cordon first: draining a node that still accepts pods is a treadmill.
+    let cordoned = cordon_node(nodes, &ResourceKey::cluster_scoped(node), true).await;
+    if let MutationOutcome::Failed { reason } = cordoned {
+        return MutationOutcome::Failed {
+            reason: format!("could not cordon {node}: {reason}"),
+        };
+    }
+
+    let pods: kube::Api<Pod> = kube::Api::all(client.clone());
+    let on_node = ListParams::default().fields(&format!("spec.nodeName={node}"));
+    let list = match pods.list(&on_node).await {
+        Ok(list) => list,
+        Err(error) => {
+            return MutationOutcome::Failed {
+                reason: format!(
+                    "cordoned {node}, but could not list its pods: {}",
+                    describe(&error)
+                ),
+            };
+        }
+    };
+
+    let mut evicted = 0;
+    let mut skipped = 0;
+    let mut refused: Vec<String> = Vec::new();
+
+    for pod in list.items {
+        let (Some(name), Some(namespace)) =
+            (pod.metadata.name.clone(), pod.metadata.namespace.clone())
+        else {
+            continue;
+        };
+
+        if is_daemonset_pod(&pod) || is_mirror_pod(&pod) {
+            skipped += 1;
+            continue;
+        }
+
+        let api: kube::Api<Pod> = kube::Api::namespaced(client.clone(), &namespace);
+        let mut delete = DeleteParams::default();
+        if let Some(seconds) = grace_period {
+            delete = delete.grace_period(seconds);
+        }
+
+        match api
+            .evict(
+                &name,
+                &EvictParams {
+                    delete_options: Some(delete),
+                    ..EvictParams::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => evicted += 1,
+            Err(error) => {
+                // A PodDisruptionBudget refusing an eviction is the single most
+                // useful thing a drain can tell you, so it is reported per pod
+                // rather than as one failure.
+                refused.push(format!("{namespace}/{name}: {}", describe(&error)));
+            }
+        }
+    }
+
+    let summary = format!(
+        "{node} cordoned, {evicted} pod(s) evicted, {skipped} skipped (DaemonSet or mirror pods)"
+    );
+
+    if refused.is_empty() {
+        MutationOutcome::Applied { detail: summary }
+    } else {
+        MutationOutcome::Failed {
+            reason: format!(
+                "{summary}; {} refused — {}",
+                refused.len(),
+                refused.join("; ")
+            ),
+        }
+    }
+}
+
+/// Whether a pod is managed by a DaemonSet, which would recreate it at once.
+fn is_daemonset_pod(pod: &Pod) -> bool {
+    pod.metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|owner| owner.kind == "DaemonSet")
+}
+
+/// Whether a pod is a mirror of a static kubelet pod, which cannot be evicted.
+fn is_mirror_pod(pod: &Pod) -> bool {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|annotations| annotations.contains_key("kubernetes.io/config.mirror"))
 }
 
 /// Applies edited YAML, optionally as a dry run.
@@ -377,6 +495,53 @@ mod tests {
 
         assert!(policy.may_mutate(&ClusterId::new("scratch")));
         assert!(!policy.may_mutate(&prod()));
+    }
+
+    fn pod(value: serde_json::Value) -> Pod {
+        serde_json::from_value(value).expect("fixture is a valid pod")
+    }
+
+    #[test]
+    fn daemonset_pods_are_skipped_by_a_drain() {
+        // Evicting one is churn: the DaemonSet controller puts it straight back.
+        let managed = pod(serde_json::json!({
+            "metadata": {
+                "name": "kube-proxy-abc",
+                "namespace": "kube-system",
+                "ownerReferences": [
+                    { "apiVersion": "apps/v1", "kind": "DaemonSet", "name": "kube-proxy", "uid": "1" }
+                ]
+            }
+        }));
+        assert!(is_daemonset_pod(&managed));
+
+        let ordinary = pod(serde_json::json!({
+            "metadata": {
+                "name": "api-0",
+                "namespace": "default",
+                "ownerReferences": [
+                    { "apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "api", "uid": "2" }
+                ]
+            }
+        }));
+        assert!(!is_daemonset_pod(&ordinary));
+    }
+
+    #[test]
+    fn mirror_pods_are_skipped_because_they_cannot_be_evicted() {
+        let mirror = pod(serde_json::json!({
+            "metadata": {
+                "name": "kube-apiserver-cp",
+                "namespace": "kube-system",
+                "annotations": { "kubernetes.io/config.mirror": "abc123" }
+            }
+        }));
+        assert!(is_mirror_pod(&mirror));
+
+        let ordinary = pod(serde_json::json!({
+            "metadata": { "name": "api-0", "namespace": "default" }
+        }));
+        assert!(!is_mirror_pod(&ordinary));
     }
 
     #[test]

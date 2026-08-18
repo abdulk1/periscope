@@ -25,10 +25,18 @@ for the same one-node cluster.
 | `tests/discovery.rs` | Discovery with CRDs, generic tables, filters, secret masking, and the detail fetch |
 | `tests/logs.rs` | Tailing one pod and fifty, merging, re-attach after a restart, and the ingest-rate budget |
 | `tests/multicluster.rs` | Five clusters at once, the row budget, warm switching, and one unreachable cluster |
-| `tests/mutations.rs` | Delete, scale, restart, cordon, apply and dry run — plus a read-only cluster refusing, and the audit log |
+| `tests/mutations.rs` | Delete, scale, restart, cordon, drain, apply and dry run — plus a read-only cluster refusing, and the audit log |
+| `tests/forwards.rs` | Real HTTP traffic through a forward, several connections, teardown closing the port, a dead port reported, and recovery after a broken connection |
+| `tests/exec.rs` | Running a command, its exit code, stdout and stderr kept apart, a command that does not exist, cancellation, and the audit log |
 
 `tests/mutations.rs` **changes the cluster**: each test creates the deployment it
-acts on and deletes it afterwards, and the cordon test always uncordons.
+acts on and deletes it afterwards, the cordon test always uncordons, and the
+drain test drains the one `kind` node and uncordons it again — the node's pods
+are evicted and rescheduled, which takes a minute or so to settle.
+
+`tests/exec.rs` runs commands inside the `webby` fixture's container. They are
+all reads (`cat`, `ls`, `seq`, `id`); the one command that would write anything
+is in the read-only test, which asserts it never ran.
 
 The auth tests write a throwaway kubeconfig into the temp directory and point the
 app at it with `--kubeconfig`'s programmatic equivalent, so the developer's own
@@ -36,13 +44,19 @@ kubeconfig is never touched.
 
 ## Workload fixtures
 
-Two of the suites need workloads that produce something to read:
+Some suites need workloads that produce something to read, or something to talk
+to:
 
 ```sh
 kubectl apply -f tests/e2e/fixtures/chatty.yaml     # three pods, five lines a second each
 kubectl apply -f tests/e2e/fixtures/firehose.yaml   # four pods writing as fast as they can
 kubectl delete -f tests/e2e/fixtures/firehose.yaml  # it burns CPU; delete it when done
+kubectl apply -f tests/e2e/fixtures/webby.yaml      # one busybox pod serving a fixed string on 8080
 ```
+
+`webby` is what the forward and exec suites use: it answers on a port, and its
+busybox container has the handful of commands the exec tests run. Both suites
+skip themselves, with instructions, when it is missing.
 
 `chatty` scales up for the "tail fifty pods" measurement:
 `kubectl scale deployment chatty --replicas=50`.

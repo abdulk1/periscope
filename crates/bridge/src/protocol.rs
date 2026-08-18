@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::coalesce::CoalesceKey;
+use crate::exec::{ExecStatus, ExecTarget};
+use crate::forward::{ForwardId, ForwardInfo, ForwardTarget};
 use crate::logs::{LogLine, LogSource, LogSourceState, LogTarget};
 use crate::mutation::{Mutation, MutationOutcome};
 use crate::resource::{
@@ -118,6 +120,35 @@ pub enum ClusterCommand {
         /// Which cluster.
         cluster: ClusterId,
     },
+    /// Run a command in a container and stream its output.
+    Exec {
+        /// Which cluster.
+        cluster: ClusterId,
+        /// What to run, and where.
+        target: Arc<ExecTarget>,
+    },
+    /// Stop a running command.
+    CancelExec {
+        /// Which cluster.
+        cluster: ClusterId,
+    },
+    /// Open a local port that forwards to a pod's port.
+    StartForward {
+        /// Which cluster.
+        cluster: ClusterId,
+        /// Which forward this is, chosen by the caller so it can be matched up
+        /// with the events that follow.
+        id: ForwardId,
+        /// What to forward to.
+        target: Arc<ForwardTarget>,
+    },
+    /// Tear a forward down.
+    StopForward {
+        /// Which cluster.
+        cluster: ClusterId,
+        /// Which forward.
+        id: ForwardId,
+    },
     /// Change something in a cluster.
     ///
     /// The UI sends this only after the store has authorised it and the user
@@ -159,7 +190,11 @@ impl ClusterCommand {
             | Self::FetchObject { cluster, .. }
             | Self::StartLogs { cluster, .. }
             | Self::StopLogs { cluster }
-            | Self::Mutate { cluster, .. } => Some(cluster),
+            | Self::Mutate { cluster, .. }
+            | Self::StartForward { cluster, .. }
+            | Self::StopForward { cluster, .. }
+            | Self::Exec { cluster, .. }
+            | Self::CancelExec { cluster } => Some(cluster),
             Self::ListContexts => None,
         }
     }
@@ -334,6 +369,27 @@ pub enum ClusterEvent {
         /// What it is doing now.
         state: LogSourceState,
     },
+    /// Output from a running command.
+    ExecOutput {
+        /// Cluster it is running on.
+        cluster: ClusterId,
+        /// The lines, in the order they were read.
+        lines: Arc<[LogLine]>,
+    },
+    /// A command ended.
+    ExecFinished {
+        /// Cluster it ran on.
+        cluster: ClusterId,
+        /// How it ended.
+        status: ExecStatus,
+    },
+    /// A forward's state changed.
+    ForwardChanged {
+        /// Cluster it belongs to.
+        cluster: ClusterId,
+        /// The forward, as it now stands.
+        forward: Arc<ForwardInfo>,
+    },
     /// A mutation finished, one way or another.
     MutationDone {
         /// Cluster it was aimed at.
@@ -388,6 +444,8 @@ pub enum EventKey {
     LogSource(ClusterId, LogSource),
     /// Only the newest log failure for a cluster matters.
     LogsFailed(ClusterId),
+    /// Latest state of one forward wins.
+    Forward(ClusterId, ForwardId),
 }
 
 impl CoalesceKey for EventKey {
@@ -456,6 +514,11 @@ impl ClusterEvent {
             // Every outcome is reported: two deletes are two things that
             // happened, and collapsing them would hide one.
             Self::MutationDone { .. } => None,
+            Self::ForwardChanged { cluster, forward } => {
+                Some(EventKey::Forward(cluster.clone(), forward.id))
+            }
+            // Output is text: collapsing two chunks would lose one of them.
+            Self::ExecOutput { .. } | Self::ExecFinished { .. } => None,
         }
     }
 
@@ -473,7 +536,10 @@ impl ClusterEvent {
             | Self::LogBatch { cluster, .. }
             | Self::LogSourceChanged { cluster, .. }
             | Self::LogsFailed { cluster, .. }
-            | Self::MutationDone { cluster, .. } => Some(cluster),
+            | Self::MutationDone { cluster, .. }
+            | Self::ForwardChanged { cluster, .. }
+            | Self::ExecOutput { cluster, .. }
+            | Self::ExecFinished { cluster, .. } => Some(cluster),
             Self::Stale { cluster, .. } => cluster.as_ref(),
             Self::Contexts { .. } | Self::ConfigFailed { .. } => None,
         }

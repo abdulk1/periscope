@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use crate::errors::Failure;
 use crate::mutate::WritePolicy;
 use crate::watch::Filter;
-use crate::{detail, discovery, kubeconfig, logs, mutate, watch};
+use crate::{detail, discovery, exec, forward, kubeconfig, logs, mutate, watch};
 
 /// Connects to clusters, discovers what they serve, and streams it.
 #[derive(Debug, Default)]
@@ -56,7 +56,21 @@ struct Sessions {
     watches: Mutex<HashMap<(ClusterId, KindId), JoinHandle<()>>>,
     /// One log session per cluster: one log view, one tail.
     logs: Mutex<HashMap<ClusterId, JoinHandle<()>>>,
+    /// One command per cluster, for the same reason: there is one output pane.
+    /// Starting another replaces it, which is also how it is cancelled.
+    execs: Mutex<HashMap<ClusterId, JoinHandle<()>>>,
+    /// Port forwards, which outlive the view that started them.
+    forwards: Mutex<Forwards>,
 }
+
+/// The running forwards, by cluster and id.
+///
+/// The target is kept alongside the task so tearing one down can still say what
+/// it was pointing at.
+type Forwards = HashMap<
+    (ClusterId, periscope_bridge::ForwardId),
+    (JoinHandle<()>, Arc<periscope_bridge::ForwardTarget>),
+>;
 
 impl std::fmt::Debug for Sessions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -127,6 +141,49 @@ impl Sessions {
         }
     }
 
+    /// Starts a command, cancelling the one it replaces.
+    fn insert_exec(&self, cluster: ClusterId, task: JoinHandle<()>) {
+        if let Some(previous) = guard(&self.execs).insert(cluster, task) {
+            previous.abort();
+        }
+    }
+
+    /// Cancels a cluster's running command.
+    fn stop_exec(&self, cluster: &ClusterId) -> bool {
+        match guard(&self.execs).remove(cluster) {
+            Some(task) => {
+                let running = !task.is_finished();
+                task.abort();
+                running
+            }
+            None => false,
+        }
+    }
+
+    /// Registers a forward, replacing one with the same id.
+    fn insert_forward(
+        &self,
+        cluster: ClusterId,
+        id: periscope_bridge::ForwardId,
+        task: JoinHandle<()>,
+        target: Arc<periscope_bridge::ForwardTarget>,
+    ) {
+        if let Some((previous, _)) = guard(&self.forwards).insert((cluster, id), (task, target)) {
+            previous.abort();
+        }
+    }
+
+    /// Tears one forward down, returning what it was pointing at.
+    fn stop_forward(
+        &self,
+        cluster: &ClusterId,
+        id: periscope_bridge::ForwardId,
+    ) -> Option<Arc<periscope_bridge::ForwardTarget>> {
+        let (task, target) = guard(&self.forwards).remove(&(cluster.clone(), id))?;
+        task.abort();
+        Some(target)
+    }
+
     /// Stops one watch.
     fn stop_watch(&self, cluster: &ClusterId, kind: &KindId) -> bool {
         match guard(&self.watches).remove(&(cluster.clone(), kind.clone())) {
@@ -142,6 +199,22 @@ impl Sessions {
     fn disconnect(&self, cluster: &ClusterId) -> bool {
         guard(&self.clusters).remove(cluster);
         self.stop_logs(cluster);
+        self.stop_exec(cluster);
+
+        // A forward whose cluster has gone can only fail; taking it down is
+        // more honest than leaving a listener that accepts and then errors.
+        let mut forwards = guard(&self.forwards);
+        let ids: Vec<_> = forwards
+            .keys()
+            .filter(|(forwarded, _)| forwarded == cluster)
+            .cloned()
+            .collect();
+        for id in ids {
+            if let Some((task, _)) = forwards.remove(&id) {
+                task.abort();
+            }
+        }
+        drop(forwards);
 
         let mut watches = guard(&self.watches);
         let keys: Vec<_> = watches
@@ -173,8 +246,14 @@ impl Sessions {
                 .is_some_and(|task| !task.is_finished())
     }
 
-    /// Stops every session, watch and log tail.
+    /// Stops every session, watch, log tail and forward.
     fn abort_all(&self) {
+        for (_, (task, _)) in guard(&self.forwards).drain() {
+            task.abort();
+        }
+        for (_, task) in guard(&self.execs).drain() {
+            task.abort();
+        }
         for (_, task) in guard(&self.logs).drain() {
             task.abort();
         }
@@ -465,6 +544,90 @@ impl CommandHandler for KubeHandler {
                 ClusterCommand::StopLogs { cluster } => {
                     let stopped = sessions.stop_logs(&cluster);
                     tracing::debug!(%cluster, stopped, "log session stopped");
+                }
+
+                ClusterCommand::Exec { cluster, target } => {
+                    let Some(session) = sessions.session(&cluster) else {
+                        events.send(ClusterEvent::ExecFinished {
+                            cluster,
+                            status: periscope_bridge::ExecStatus::Failed {
+                                reason: "not connected to this cluster".to_owned(),
+                            },
+                        });
+                        return;
+                    };
+
+                    tracing::info!(%cluster, target = %target.label(), "running a command");
+                    let running = cluster.clone();
+                    let task = tokio::spawn(async move {
+                        exec::run(
+                            running,
+                            session.client,
+                            target,
+                            &policy,
+                            audit.as_deref(),
+                            events,
+                        )
+                        .await;
+                    });
+                    sessions.insert_exec(cluster, task);
+                }
+
+                ClusterCommand::CancelExec { cluster } => {
+                    let running = sessions.stop_exec(&cluster);
+                    tracing::info!(%cluster, running, "command cancelled");
+
+                    // The task is gone, so it cannot report its own ending.
+                    if running {
+                        events.send(ClusterEvent::ExecFinished {
+                            cluster,
+                            status: periscope_bridge::ExecStatus::Cancelled,
+                        });
+                    }
+                }
+
+                ClusterCommand::StartForward {
+                    cluster,
+                    id,
+                    target,
+                } => {
+                    let Some(session) = sessions.session(&cluster) else {
+                        events.send(ClusterEvent::ForwardChanged {
+                            cluster,
+                            forward: Arc::new(periscope_bridge::ForwardInfo {
+                                state: periscope_bridge::ForwardState::Failed {
+                                    reason: "not connected to this cluster".to_owned(),
+                                },
+                                ..periscope_bridge::ForwardInfo::starting(id, target)
+                            }),
+                        });
+                        return;
+                    };
+
+                    let task = tokio::spawn(forward::run(
+                        cluster.clone(),
+                        id,
+                        session.client,
+                        Arc::clone(&target),
+                        events,
+                    ));
+                    sessions.insert_forward(cluster, id, task, target);
+                }
+
+                ClusterCommand::StopForward { cluster, id } => {
+                    let target = sessions.stop_forward(&cluster, id);
+                    tracing::info!(%cluster, %id, stopped = target.is_some(), "forward stopped");
+
+                    // The task is gone, so it cannot report its own ending.
+                    if let Some(target) = target {
+                        events.send(ClusterEvent::ForwardChanged {
+                            cluster,
+                            forward: Arc::new(periscope_bridge::ForwardInfo {
+                                state: periscope_bridge::ForwardState::Stopped,
+                                ..periscope_bridge::ForwardInfo::starting(id, target)
+                            }),
+                        });
+                    }
                 }
 
                 ClusterCommand::Mutate { cluster, mutation } => {

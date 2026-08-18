@@ -10,8 +10,8 @@ pub mod logs;
 pub mod permissions;
 pub mod table;
 
-pub use app::{AppState, Detail, Filters};
+pub use app::{AppState, Detail, ExecSession, Filters};
 pub use connections::{Connection, ConnectionRegistry};
 pub use logs::{FilterSpec, LogBuffer};
-pub use permissions::{Authorized, Permissions, Refusal};
+pub use permissions::{Authorized, AuthorizedExec, Permissions, Refusal};
 pub use table::ResourceTable;

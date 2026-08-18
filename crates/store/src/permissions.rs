@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use periscope_bridge::{ClusterId, Mutation};
+use periscope_bridge::{ClusterId, ExecTarget, Mutation};
 
 /// Why a mutation was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +143,40 @@ impl Authorized {
     /// Takes it apart to send.
     pub fn into_parts(self) -> (ClusterId, std::sync::Arc<Mutation>) {
         (self.cluster, self.mutation)
+    }
+}
+
+/// A command that has been authorised to run in a container.
+///
+/// Separate from [`Authorized`] because a command is not a [`Mutation`], but
+/// held to the same rule and for the same reason: running `rm -rf` in a
+/// container is a change, so a read-only cluster must refuse it. There is no
+/// public constructor, so an unchecked command cannot be sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedExec {
+    cluster: ClusterId,
+    target: std::sync::Arc<ExecTarget>,
+}
+
+impl AuthorizedExec {
+    /// Only this crate may mint one, and only after checking.
+    pub(crate) fn new(cluster: ClusterId, target: std::sync::Arc<ExecTarget>) -> Self {
+        Self { cluster, target }
+    }
+
+    /// Which cluster it will run in.
+    pub fn cluster(&self) -> &ClusterId {
+        &self.cluster
+    }
+
+    /// What will be run, and where.
+    pub fn target(&self) -> &std::sync::Arc<ExecTarget> {
+        &self.target
+    }
+
+    /// Takes it apart to send.
+    pub fn into_parts(self) -> (ClusterId, std::sync::Arc<ExecTarget>) {
+        (self.cluster, self.target)
     }
 }
 

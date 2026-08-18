@@ -760,3 +760,102 @@ and the cluster is the last thing read before the pointer moves to the button.
 Nothing is pre-selected in the dialog, destructive confirms are the only red
 control on screen, and `Escape` cancels the mutation before it closes anything
 else that happens to be open.
+
+## ADR-0031 — A forward is a listener plus a stream per connection
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+Port forwarding could have opened one stream to the apiserver and multiplexed
+every local connection through it. It does not: the listener stays bound for the
+life of the forward, and each accepted connection opens its own port-forward
+stream, copies bytes both ways, and closes.
+
+That is what makes a forward survive a hiccup. A stream that breaks takes down
+one connection; the next one gets a fresh stream, and the address the user
+copied keeps working. It also means a forward has three honest states rather
+than two — `Listening`, `Degraded` (bound, but the last connection failed, with
+the reason kept verbatim), and `Failed` (not bound at all) — so a forward that
+has stopped working never looks identical to one that is merely idle.
+
+Forwards bind `127.0.0.1` only. Binding `0.0.0.0` would put a cluster-internal
+service on whatever network the laptop is attached to, which is not something a
+debugging tool should do without being asked very explicitly.
+
+The apiserver reports per-port problems — "port not open", "pod not running" —
+on a side channel rather than by failing the request, so the forward takes that
+error and prefers it over the copy error it caused. Its own words are useless on
+their own (`404 Not Found` names nothing), so the target is prefixed:
+`default/api-0:8080: 404 Not Found`.
+
+## ADR-0032 — Drain is cordon plus eviction, and it says what it skipped
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+`Mutation::Drain` cordons the node, lists the pods on it with a
+`spec.nodeName` field selector, and evicts them through the eviction API — which
+respects PodDisruptionBudgets, where a delete would not.
+
+It skips what `kubectl drain` skips by default: DaemonSet pods, which would come
+straight back, and mirror pods, which cannot be evicted at all. A pod the
+apiserver refuses to evict does not fail the drain; the refusal is collected and
+reported alongside everything that worked, because "drained, except these three"
+is the truth and "failed" is not.
+
+There is no `--force` and no deletion fallback. A drain that cannot evict
+something says so and leaves it running, which is recoverable; deleting a pod
+with no controller behind it is not.
+
+## ADR-0033 — Exec runs a command; it is not a terminal
+
+**Date:** 2026-08-18
+**Status:** Accepted — and a deliberate deviation from the spec
+
+`IMPLEMENTATION.md` §Phase 5 asks for "exec into a container (terminal emulation
+inside the app)". This does not do that. It implements *run a command and stream
+its output*: no pseudo-terminal, no VT parser, no cursor addressing, no stdin,
+no resize protocol.
+
+That is a deviation, not a reading of an ambiguity, and it is recorded here as
+one. The reasoning: terminal emulation is a component on the scale of the log
+view, not a detail of this phase — a VT/ANSI parser, a character grid renderer
+with its own virtualisation, a `terminal_size` channel wired to layout, and
+stdin plumbed through the websocket. Half of it is worse than none: a box that
+accepts `top` and then renders escape sequences is a bug report, not a feature.
+
+What is built covers what people actually reach for during an incident: `ls`,
+`cat /etc/config`, `env`, `ps`, `nslookup`. It does not cover interactive `sh`,
+`vi` or `top`. `docs/LIMITATIONS.md` says so in those words, and the protocol is
+already shaped so a terminal can be added later without changing it: the target
+carries a container name, and the transport is the same exec subresource a PTY
+would use.
+
+Consequences of drawing the line there:
+
+* Output is emitted as `LogLine`s, so it lands in the same bounded, filterable
+  ring buffer the log view already has. A command that prints a gigabyte cannot
+  take the app down.
+* stdout and stderr are read concurrently and tagged, because "was that stdout
+  or stderr" is usually the next question.
+* The command line is split on whitespace and is **not** a shell. A pipe is
+  passed to the program as an argument. Anyone who wants a shell asks for one:
+  `sh -c "ls | wc -l"` runs a shell *in the container*, which is honest about
+  what is happening.
+* A non-zero exit is a result, not a Periscope failure, and it is shown as
+  `exited 2`. A command that never started — no such executable, no such
+  container — is a `Failed`, not an exit with an unknown code. The distinction
+  is load-bearing: the first version reported both as `Exited { code: None }`,
+  which made "executable file not found" render as if the command had finished
+  fine. The e2e test against a real cluster is what caught it.
+
+Exec goes through the same two gates as a mutation (ADR-0028) and is written to
+the same audit log (ADR-0029), with the command line as the detail. `kubectl
+exec` needs `create` on `pods/exec`, and `rm -rf /data` is a perfectly ordinary
+command: a cluster marked read-only refuses to run one, in the store and again
+in the cluster layer. The confirmation names the cluster, the namespace, the pod
+and the exact command, and every command is treated as destructive, because
+Periscope cannot tell `ls` from `rm -rf` before it runs it.
+
+The audit line is written *before* the command runs, not after: a command that
+hangs, or one Periscope is killed in the middle of, still has to leave a trace.

@@ -48,6 +48,13 @@ pub enum Mutation {
         /// `true` to cordon, `false` to uncordon.
         cordon: bool,
     },
+    /// Cordon a node and evict the pods already on it.
+    Drain {
+        /// Which node.
+        node: Arc<str>,
+        /// Seconds to allow each pod for graceful shutdown.
+        grace_period: Option<u32>,
+    },
     /// Apply an edited object.
     Apply {
         /// Kind of the object.
@@ -69,7 +76,7 @@ impl Mutation {
                 kind.clone()
             }
             Self::Apply { kind, .. } => kind.clone(),
-            Self::Cordon { .. } => KindId::new("", "v1", "Node", "nodes"),
+            Self::Cordon { .. } | Self::Drain { .. } => KindId::new("", "v1", "Node", "nodes"),
         }
     }
 
@@ -80,7 +87,9 @@ impl Mutation {
             | Self::Scale { key, .. }
             | Self::Restart { key, .. }
             | Self::Apply { key, .. } => key.clone(),
-            Self::Cordon { node, .. } => ResourceKey::cluster_scoped(&**node),
+            Self::Cordon { node, .. } | Self::Drain { node, .. } => {
+                ResourceKey::cluster_scoped(&**node)
+            }
         }
     }
 
@@ -90,6 +99,7 @@ impl Mutation {
             Self::Delete { .. } => "delete",
             Self::Scale { .. } => "scale",
             Self::Restart { .. } => "restart",
+            Self::Drain { .. } => "drain",
             Self::Cordon { cordon: true, .. } => "cordon",
             Self::Cordon { cordon: false, .. } => "uncordon",
             Self::Apply { dry_run: true, .. } => "dry-run",
@@ -106,6 +116,10 @@ impl Mutation {
                 ..
             } => format!("grace={seconds}s"),
             Self::Apply { yaml, .. } => format!("{} bytes", yaml.len()),
+            Self::Drain {
+                grace_period: Some(seconds),
+                ..
+            } => format!("grace={seconds}s"),
             _ => String::new(),
         }
     }
@@ -120,6 +134,7 @@ impl Mutation {
             Self::Delete { .. }
                 | Self::Scale { replicas: 0, .. }
                 | Self::Cordon { cordon: true, .. }
+                | Self::Drain { .. }
                 | Self::Restart { .. }
         )
     }
@@ -173,6 +188,10 @@ impl Mutation {
             Self::Cordon { cordon: false, .. } => {
                 format!("Uncordon {target} on cluster {cluster}?")
             }
+            Self::Drain { .. } => format!(
+                "Drain {target} on cluster {cluster}? Every pod on it will be evicted, and \
+                 nothing new will be scheduled there."
+            ),
             Self::Apply { dry_run: true, .. } => {
                 format!("Ask cluster {cluster} what applying {target} would do?")
             }
@@ -263,6 +282,10 @@ mod tests {
                 node: Arc::from("worker-0"),
                 cordon: true,
             },
+            Mutation::Drain {
+                node: Arc::from("worker-0"),
+                grace_period: None,
+            },
             Mutation::Apply {
                 kind: deployments(),
                 key: api(),
@@ -297,6 +320,26 @@ mod tests {
         assert_eq!(
             sentence,
             "Delete deployments.apps api in namespace payments on cluster prod?"
+        );
+    }
+
+    #[test]
+    fn a_drain_says_what_it_will_do_to_the_pods() {
+        let sentence = Mutation::Drain {
+            node: Arc::from("worker-0"),
+            grace_period: None,
+        }
+        .confirmation(&prod());
+
+        assert!(sentence.contains("worker-0"), "{sentence}");
+        assert!(sentence.contains("prod"), "{sentence}");
+        assert!(sentence.contains("evicted"), "{sentence}");
+        assert!(
+            Mutation::Drain {
+                node: Arc::from("worker-0"),
+                grace_period: None
+            }
+            .is_destructive()
         );
     }
 

@@ -5,13 +5,21 @@ affordances: live resource streams, multi-cluster, and log tailing across pods.
 
 **Binary:** `scope` · **Language:** Rust · **UI:** GPUI
 
-> **Status: Phase 5 (actions), partially.** Connects to kubeconfig contexts on
+> **Status: Phase 5 (actions), with one deliberate deviation — exec runs a
+> command, it is not a terminal.** Connects to kubeconfig contexts on
 > demand, discovers every kind each serves — CRDs included — streams any of them
 > into a virtualised table, tails logs from one pod or from every pod matching a
 > label selector, and shows two clusters side by side. Clusters you have visited
 > stay warm, so switching back is instant. Fuzzy jump palette (⌘K) searches
-> every warm cluster at once. Read-only until Phase 5. See
-> [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap and
+> every warm cluster at once.
+>
+> It can now change things: delete, scale, restart, cordon, drain, apply edited
+> YAML (with a dry run first), forward a local port onto a pod, and run a command
+> in a container. Everything that changes anything shows a confirmation naming
+> the cluster, passes two independent read-only gates, and is written to a local
+> audit log. Exec runs a command and streams its output; the spec asked for
+> terminal emulation and that is not built — see ADR-0033.
+> See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap and
 > [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not work.
 
 ## Build and run
@@ -108,10 +116,14 @@ you where.
 ## Changing things
 
 Open an object and the detail pane offers what its kind supports: **Scale**,
-**Restart**, **Cordon**, **Dry run**, **Apply** and **Delete**. Nothing happens
-until you confirm a sentence that names the cluster, the namespace, the object
-and the operation — *"Delete deployments.apps api in namespace payments on
-cluster prod?"* — and `Escape` cancels it.
+**Restart**, **Cordon**, **Drain**, **Dry run**, **Apply** and **Delete**.
+Nothing happens until you confirm a sentence that names the cluster, the
+namespace, the object and the operation — *"Delete deployments.apps api in
+namespace payments on cluster prod?"* — and `Escape` cancels it.
+
+A drain cordons the node and evicts its pods through the eviction API, so
+PodDisruptionBudgets are respected. DaemonSet and mirror pods are skipped, and a
+pod the apiserver refuses to evict is reported rather than forced.
 
 Mark the clusters that must never change in `settings.toml`:
 
@@ -128,6 +140,26 @@ Those names are refused twice: once by the store, before anything is sent, and
 again by the cluster layer, immediately before the request. Every attempt —
 applied, dry-run, refused or failed — is appended to `audit.log` beside the
 application logs.
+
+## Port forwards and commands
+
+A pod's detail pane has a port field and **Forward**: it binds a local port on
+`127.0.0.1` — never `0.0.0.0` — and the forwards panel shows the address to
+paste, how many connections it has served, and, if something breaks, the
+apiserver's own reason. Each connection gets its own stream, so one broken
+connection does not take the forward down; a port nothing is listening on is
+reported rather than accepted silently. Forwards outlive the pane that started
+them, which is why the panel is always reachable from the header.
+
+Next to it is a command field and **Run**. It runs one command in the pod's
+default container and streams stdout and stderr into the output pane, labelled
+by stream, ending with the exit code. It is **not** a terminal: no interactive
+input, no `vi`, no `top`. The command line is split on whitespace and is not a
+shell — `sh -c "ls | wc -l"` is how you get one, and it runs in the container.
+
+Running a command is treated as a change, because it is: it needs the same
+confirmation, is refused on read-only clusters, and is written to the audit log
+with the command line as its detail.
 
 ## Security posture
 

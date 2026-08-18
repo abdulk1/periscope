@@ -42,25 +42,51 @@ therefore tracked against `--release`. Some of the debug cost is the runtime
 shader compilation from ADR-0008; the rest is unoptimised GPUI layout code that
 the `[profile.dev.package]` overrides only partly cover.
 
-## Phase 5 scope — partial
+## Phase 5 scope — one deliberate deviation
 
-The read-only invariant is over: Periscope can now delete, scale, restart
-(rollout), cordon and uncordon, and apply edited YAML with a server-side dry run
-first. Every one goes through a confirmation naming the cluster, two independent
+The read-only invariant is over: Periscope can delete, scale, restart (rollout),
+cordon, uncordon, drain, apply edited YAML with a server-side dry run first,
+forward a local port onto a pod, and run a command in a container. Every one that
+changes anything goes through a confirmation naming the cluster, two independent
 read-only gates, and the audit log.
 
-**Three Phase 5 deliverables are not built yet:**
+**Exec is not a terminal, and the spec asked for one.** `IMPLEMENTATION.md`
+Phase 5 says "exec into a container (terminal emulation inside the app)". What is
+built runs a command and streams its output: no pseudo-terminal, no VT parsing,
+no cursor addressing, no stdin, no resize. `ls`, `cat`, `env`, `ps` and
+`nslookup` work. Interactive `sh`, `vi` and `top` do not.
 
-- **Exec into a container.** Terminal emulation is a substantial piece of work
-  in its own right — a VT parser, a grid renderer and a resize protocol — and
-  none of it exists here.
-- **Port-forward.** Nothing forwards yet, so the "port-forwards survive a brief
-  network interruption or die loudly" criterion is untested and unmet.
-- **Drain.** Cordon is implemented; evicting the pods that are already on a node
-  is not.
+This is a deviation, not an interpretation — see ADR-0033 for the reasoning
+(a VT parser, a grid renderer, and stdin plumbing are a component on the scale of
+the log view, and a half-built one that accepts `top` and prints escape sequences
+is worse than none). The transport and the protocol are the ones a PTY would use,
+so adding it later changes the view, not the layers underneath.
+
+The command line is also split on whitespace and is not a shell: `sh -c "…"` is
+how you get one, and it runs in the container.
 
 Smaller gaps in what *is* built:
 
+- **Exec picks the container the apiserver picks.** There is no container
+  selector next to Run, so a multi-container pod runs the command in its default
+  container — the same thing `kubectl exec` does without `-c`. The protocol and
+  the confirmation sentence both carry a container name already; only the
+  control is missing.
+- **Command output cannot be filtered from the UI.** It goes into the same
+  bounded, filterable buffer as logs, and the store exposes the filter, but the
+  output pane has no filter box, no export and no copy button — the log pane
+  has all three.
+- **One command at a time, per cluster.** Running another replaces the first,
+  which is also how it is cancelled.
+- **Forwards use an OS-chosen local port.** There is no field for asking for a
+  specific one; the protocol supports it, the UI does not offer it.
+- **A forward's failure is only visible in the forwards panel.** It is not
+  raised anywhere else, so a forward that broke while the panel was closed is
+  quiet until it is opened.
+- **Drain has no `--force` and no deletion fallback.** A pod the apiserver
+  refuses to evict is reported and left running (ADR-0032). There is no
+  `--delete-emptydir-data` equivalent and no timeout: the drain returns when the
+  evictions have been accepted, not when the pods are actually gone.
 - **Delete has no cascade choice.** It uses the apiserver's default propagation;
   there is no orphan/background/foreground selector.
 - **Scale reads its current replica count from the table**, so a confirmation
@@ -154,7 +180,8 @@ kinds and seeded with 10,009 pods, release build:
 | One unreachable cluster degrades only its own pane | Verified: a context pointing at a closed port reports its own failure with the real reason while its neighbours connect and stream normally |
 | Read-only contexts reject mutations at the store layer | Verified by a unit test on `AppState::authorize`, and end to end against the cluster: a marked context refuses a delete, the object is still there afterwards, and the refusal is in the audit log |
 | Every destructive action is reachable only through a confirmation naming the cluster | Verified: nothing is sent until `confirm_mutation`, and a test asserts every mutation variant's sentence names its cluster |
-| Port-forwards survive a brief interruption or die loudly | **Not met — port-forwarding is not built yet** |
+| Port-forwards survive a brief interruption or die loudly | Verified against a real pod: a broken connection kills its own stream and the next connection works; a port nothing is listening on is reported as `Degraded` with the apiserver's reason, naming the pod, rather than being accepted silently |
+| Exec runs a command in a container and reports how it ended | Verified end to end: output arrives split by stream, a non-zero exit is reported as `exited 1`, a command that never started is a failure rather than a quiet finish, cancellation stops it, and a read-only cluster refuses and records the refusal. Not a terminal — see the Phase 5 scope above |
 
 The load fixture is `cargo run --release -p periscope-e2e --bin seed-pods`.
 
