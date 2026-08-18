@@ -133,3 +133,31 @@ jobs:
           cargo test --release -p periscope-e2e --test logs -- --ignored --nocapture \
             a_firehose_is_ingested_at_rate_and_stays_bounded
           kubectl delete -f tests/e2e/fixtures/firehose.yaml
+
+  bundle:
+    name: macOS bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Unsigned: signing needs a Developer ID this repository does not have and
+      # must never contain. The script picks credentials up from the environment
+      # when they exist, so a release build is the same script with two more
+      # variables set.
+      - name: Build Periscope.app and the disk image
+        run: packaging/macos/bundle.sh
+
+      - name: Check the bundle is well-formed
+        run: |
+          plutil -lint target/bundle/Periscope.app/Contents/Info.plist
+          test -x target/bundle/Periscope.app/Contents/MacOS/scope
+          test -f target/bundle/Periscope.app/Contents/Resources/AppIcon.icns
+          hdiutil verify target/bundle/Periscope.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Periscope-macos-unsigned
+          path: target/bundle/Periscope.dmg
+          if-no-files-found: error

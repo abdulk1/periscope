@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Periscope</string>
+	<key>CFBundleDisplayName</key>
+	<string>Periscope</string>
+	<!-- Matches the identifier `directories` derives the log, settings and
+	     audit paths from, so the sandbox container and the app agree. -->
+	<key>CFBundleIdentifier</key>
+	<string>dev.periscope.Periscope</string>
+	<key>CFBundleExecutable</key>
+	<string>scope</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<!-- GPUI renders through Metal; Apple silicon and Intel Macs from Big Sur
+	     on have it. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<!-- A console, not a document editor: no file types, no URL schemes, and
+	     nothing that would put it in the Open With menu. -->
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Periscope contributors</string>
+</dict>
+</plist>

@@ -38,6 +38,18 @@ It connects to the `current-context` on start; the sidebar lists every context
 and every kind the cluster serves. Prefer `--release`: debug builds miss the
 cold-start budget by a wide margin (`docs/LIMITATIONS.md`).
 
+For a real application bundle on macOS:
+
+```sh
+packaging/macos/bundle.sh      # -> target/bundle/Periscope.app and Periscope.dmg
+```
+
+The bundle is **unsigned** unless `PERISCOPE_CODESIGN_IDENTITY` and
+`PERISCOPE_NOTARY_PROFILE` are set, so on a machine other than the one that
+built it Gatekeeper refuses to open it until you right-click and choose Open.
+There is no Developer ID behind this project yet; `docs/LIMITATIONS.md` is
+explicit about what that costs.
+
 | Key | Does |
 |---|---|
 | `⌘K` / `ctrl-K` / `:` | Jump to a cluster, a kind, or an object by name |
