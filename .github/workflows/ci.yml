@@ -100,5 +100,36 @@ jobs:
       - name: Seed the load fixture
         run: cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000
 
+      # Without these, the log, port-forward and exec suites skip themselves and
+      # CI passes with fifteen tests silently absent. `firehose` is deliberately
+      # left out here: it saturates the CPU by design, and this runner has two
+      # cores to share with every timing-sensitive test in the suite.
+      - name: Install the workload fixtures
+        run: |
+          kubectl apply -f tests/e2e/fixtures/chatty.yaml
+          kubectl apply -f tests/e2e/fixtures/webby.yaml
+          kubectl wait --for=condition=Available --timeout=300s \
+            deployment/chatty deployment/webby
+
+      # PERISCOPE_E2E_REQUIRE_FIXTURES turns "the fixture is missing, skipping"
+      # into a failure. Without it an apply that quietly did nothing would leave
+      # the suite green and empty, which is the hole this whole section closes.
       - name: End-to-end tests
-        run: cargo test --release -p periscope-e2e -- --ignored --test-threads 1 --nocapture
+        env:
+          PERISCOPE_E2E_REQUIRE_FIXTURES: "1"
+        run: |
+          cargo test --release -p periscope-e2e -- --ignored --test-threads 1 --nocapture \
+            --skip a_firehose_is_ingested_at_rate_and_stays_bounded
+
+      # The ingest-rate budget needs the unthrottled producer, so it runs on its
+      # own after everything else — including the drain test, which evicts every
+      # pod on the one node this cluster has.
+      - name: Ingest-rate budget
+        env:
+          PERISCOPE_E2E_REQUIRE_FIXTURES: "1"
+        run: |
+          kubectl apply -f tests/e2e/fixtures/firehose.yaml
+          kubectl wait --for=condition=Available --timeout=300s deployment/firehose
+          cargo test --release -p periscope-e2e --test logs -- --ignored --nocapture \
+            a_firehose_is_ingested_at_rate_and_stays_bounded
+          kubectl delete -f tests/e2e/fixtures/firehose.yaml

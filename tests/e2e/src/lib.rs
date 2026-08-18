@@ -184,6 +184,33 @@ pub fn first_pod_named(selector: &str) -> Option<String> {
     name.into_inner()
 }
 
+/// Environment variable that turns a missing fixture into a failure.
+pub const REQUIRE_FIXTURES_VAR: &str = "PERISCOPE_E2E_REQUIRE_FIXTURES";
+
+/// A running pod from the named fixture, or `None` if it is not installed.
+///
+/// Skipping when a fixture is absent is right on a developer's machine, where
+/// `firehose` burns CPU and nobody wants it running all day. It is wrong in CI:
+/// a suite that skips itself is indistinguishable from one that passes, and
+/// fifteen tests were silently absent from every pull request until this
+/// existed. Setting `PERISCOPE_E2E_REQUIRE_FIXTURES` makes the absence a
+/// failure, which is what CI does after applying them.
+pub fn fixture(name: &str, selector: &str) -> Option<String> {
+    if let Some(pod) = first_pod_named(selector) {
+        return Some(pod);
+    }
+
+    let instructions = format!("kubectl apply -f tests/e2e/fixtures/{name}.yaml");
+    assert!(
+        std::env::var_os(REQUIRE_FIXTURES_VAR).is_none(),
+        "the {name} fixture is required here but no pod matches `{selector}` \
+         ({REQUIRE_FIXTURES_VAR} is set). Install it with: {instructions}"
+    );
+
+    eprintln!("skipping: the {name} fixture is not installed ({instructions})");
+    None
+}
+
 /// Deletes a pod, so its replacement can be watched for.
 pub fn delete_pod(namespace: &str, name: &str) -> anyhow::Result<()> {
     use k8s_openapi::api::core::v1::Pod;

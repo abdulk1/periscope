@@ -58,6 +58,16 @@ kubectl apply -f tests/e2e/fixtures/webby.yaml      # one busybox pod serving a 
 busybox container has the handful of commands the exec tests run. Both suites
 skip themselves, with instructions, when it is missing.
 
+Skipping is right on a laptop — nobody wants `firehose` burning a core all day —
+and wrong in CI, where a suite that skips itself is indistinguishable from one
+that passes. `PERISCOPE_E2E_REQUIRE_FIXTURES=1` turns a missing fixture into a
+failure that names the fixture and the command to install it; CI sets it after
+applying them. Use it locally to prove a run really covered everything:
+
+```sh
+PERISCOPE_E2E_REQUIRE_FIXTURES=1 cargo test -p periscope-e2e -- --ignored --test-threads 1
+```
+
 `chatty` scales up for the "tail fifty pods" measurement:
 `kubectl scale deployment chatty --replicas=50`.
 

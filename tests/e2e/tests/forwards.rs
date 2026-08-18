@@ -89,25 +89,12 @@ fn get(port: u16) -> std::io::Result<String> {
     Ok(response)
 }
 
-fn fixture_running() -> bool {
-    periscope_e2e::first_pod_named(FIXTURE).is_some()
-}
-
-fn skip() {
-    eprintln!(
-        "skipping: the webby fixture is not installed \
-         (kubectl apply -f tests/e2e/fixtures/webby.yaml)"
-    );
-}
-
 #[test]
 #[ignore = "needs the webby fixture"]
 fn a_forward_carries_real_traffic() {
-    if !fixture_running() {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
-    }
-    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("checked");
+    };
     let (runtime, stream, cluster) = connected();
 
     let port = listening(
@@ -129,11 +116,9 @@ fn a_forward_carries_real_traffic() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn a_forward_serves_more_than_one_connection() {
-    if !fixture_running() {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
-    }
-    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("checked");
+    };
     let (runtime, stream, cluster) = connected();
 
     let port = listening(
@@ -155,11 +140,9 @@ fn a_forward_serves_more_than_one_connection() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn stopping_a_forward_closes_the_port() {
-    if !fixture_running() {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
-    }
-    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("checked");
+    };
     let (runtime, stream, cluster) = connected();
 
     let port = listening(
@@ -202,11 +185,9 @@ fn stopping_a_forward_closes_the_port() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn forwarding_a_port_the_pod_does_not_serve_fails_loudly() {
-    if !fixture_running() {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
-    }
-    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("checked");
+    };
     let (runtime, stream, cluster) = connected();
 
     // The listener binds — nothing is wrong locally — and the failure appears
@@ -247,11 +228,9 @@ fn forwarding_a_port_the_pod_does_not_serve_fails_loudly() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn a_forward_recovers_after_a_failed_connection() {
-    if !fixture_running() {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
-    }
-    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("checked");
+    };
     let (runtime, stream, cluster) = connected();
 
     let port = listening(

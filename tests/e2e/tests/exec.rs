@@ -114,22 +114,10 @@ fn from_stream<'a>(lines: &'a [LogLine], stream: &str) -> Vec<&'a LogLine> {
         .collect()
 }
 
-fn fixture_pod() -> Option<String> {
-    periscope_e2e::first_pod_named(FIXTURE)
-}
-
-fn skip() {
-    eprintln!(
-        "skipping: the webby fixture is not installed \
-         (kubectl apply -f tests/e2e/fixtures/webby.yaml)"
-    );
-}
-
 #[test]
 #[ignore = "needs the webby fixture"]
 fn a_command_runs_and_its_output_comes_back() {
-    let Some(pod) = fixture_pod() else {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
     };
     let (runtime, stream, cluster) = connected();
@@ -155,8 +143,7 @@ fn a_command_runs_and_its_output_comes_back() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn a_failing_command_reports_its_exit_code_rather_than_looking_successful() {
-    let Some(pod) = fixture_pod() else {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
     };
     let (runtime, stream, cluster) = connected();
@@ -181,8 +168,7 @@ fn a_failing_command_reports_its_exit_code_rather_than_looking_successful() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn stderr_is_labelled_separately_from_stdout() {
-    let Some(pod) = fixture_pod() else {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
     };
     let (runtime, stream, cluster) = connected();
@@ -217,8 +203,7 @@ fn stderr_is_labelled_separately_from_stdout() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn a_command_that_does_not_exist_says_so_instead_of_hanging() {
-    let Some(pod) = fixture_pod() else {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
     };
     let (runtime, stream, cluster) = connected();
@@ -242,8 +227,7 @@ fn a_command_that_does_not_exist_says_so_instead_of_hanging() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn output_arrives_before_the_status_that_follows_it() {
-    let Some(pod) = fixture_pod() else {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
     };
     let (runtime, stream, cluster) = connected();
@@ -261,8 +245,7 @@ fn output_arrives_before_the_status_that_follows_it() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn cancelling_a_command_stops_it() {
-    let Some(pod) = fixture_pod() else {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
     };
     let (runtime, stream, cluster) = connected();
@@ -299,8 +282,7 @@ fn cancelling_a_command_stops_it() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn a_read_only_cluster_runs_nothing_and_records_the_refusal() {
-    let Some(pod) = fixture_pod() else {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
     };
     let scratch = periscope_e2e::exec::Scratch::new("audit-exec-readonly");
@@ -353,8 +335,7 @@ fn a_read_only_cluster_runs_nothing_and_records_the_refusal() {
 #[test]
 #[ignore = "needs the webby fixture"]
 fn every_command_is_written_to_the_audit_log() {
-    let Some(pod) = fixture_pod() else {
-        skip();
+    let Some(pod) = periscope_e2e::fixture("webby", FIXTURE) else {
         return;
     };
     let scratch = periscope_e2e::exec::Scratch::new("audit-exec");

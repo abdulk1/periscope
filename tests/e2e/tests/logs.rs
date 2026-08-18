@@ -23,12 +23,6 @@ const FIXTURE: &str = "app=chatty";
 /// The unthrottled fixture's label.
 const FIREHOSE: &str = "app=firehose";
 
-/// Whether a fixture is running, so a test can say "not installed" rather than
-/// failing in a way that teaches people to ignore failures.
-fn fixture_running(selector: &str) -> bool {
-    periscope_e2e::first_pod_named(selector).is_some()
-}
-
 /// Connects, waits for discovery, and starts a log session.
 fn tailing(
     target: LogTarget,
@@ -88,15 +82,9 @@ fn collect(
 #[test]
 #[ignore = "needs the chatty fixture"]
 fn tailing_one_pod_streams_its_output() {
-    if !fixture_running(FIXTURE) {
-        eprintln!(
-            "skipping: the chatty fixture is not installed \
-             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
-        );
+    let Some(pod) = periscope_e2e::fixture("chatty", FIXTURE) else {
         return;
-    }
-
-    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("checked just above");
+    };
     let (_runtime, stream) = tailing(LogTarget::pod("default", &pod));
 
     let (buffer, seen) = collect(&stream, TIMEOUT, 5);
@@ -127,11 +115,7 @@ fn tailing_one_pod_streams_its_output() {
 #[test]
 #[ignore = "needs the chatty fixture"]
 fn a_label_selector_merges_every_matching_pod() {
-    if !fixture_running(FIXTURE) {
-        eprintln!(
-            "skipping: the chatty fixture is not installed \
-             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
-        );
+    if periscope_e2e::fixture("chatty", FIXTURE).is_none() {
         return;
     }
 
@@ -178,11 +162,7 @@ fn a_label_selector_merges_every_matching_pod() {
 #[test]
 #[ignore = "needs the chatty fixture"]
 fn filtering_narrows_the_buffer_without_dropping_it() {
-    if !fixture_running(FIXTURE) {
-        eprintln!(
-            "skipping: the chatty fixture is not installed \
-             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
-        );
+    if periscope_e2e::fixture("chatty", FIXTURE).is_none() {
         return;
     }
 
@@ -207,11 +187,7 @@ fn filtering_narrows_the_buffer_without_dropping_it() {
 #[test]
 #[ignore = "needs the chatty fixture"]
 fn a_pod_that_restarts_is_re_attached() {
-    if !fixture_running(FIXTURE) {
-        eprintln!(
-            "skipping: the chatty fixture is not installed \
-             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
-        );
+    if periscope_e2e::fixture("chatty", FIXTURE).is_none() {
         return;
     }
 
@@ -274,15 +250,9 @@ fn a_pod_that_restarts_is_re_attached() {
 #[test]
 #[ignore = "needs a cluster"]
 fn a_container_that_does_not_exist_is_reported_rather_than_silently_empty() {
-    if !fixture_running(FIXTURE) {
-        eprintln!(
-            "skipping: the chatty fixture is not installed \
-             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
-        );
+    let Some(pod) = periscope_e2e::fixture("chatty", FIXTURE) else {
         return;
-    }
-
-    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("checked just above");
+    };
     let (_runtime, stream) =
         tailing(LogTarget::pod("default", &pod).container(Some(Arc::from("no-such-container"))));
 
@@ -307,11 +277,7 @@ fn a_container_that_does_not_exist_is_reported_rather_than_silently_empty() {
 #[test]
 #[ignore = "needs the firehose fixture"]
 fn a_firehose_is_ingested_at_rate_and_stays_bounded() {
-    if !fixture_running(FIREHOSE) {
-        eprintln!(
-            "skipping: the firehose fixture is not installed \
-             (kubectl apply -f tests/e2e/fixtures/firehose.yaml)"
-        );
+    if periscope_e2e::fixture("firehose", FIREHOSE).is_none() {
         return;
     }
 
@@ -367,11 +333,7 @@ fn a_firehose_is_ingested_at_rate_and_stays_bounded() {
 #[test]
 #[ignore = "needs the chatty fixture"]
 fn a_high_rate_stream_is_bounded_by_the_ring() {
-    if !fixture_running(FIXTURE) {
-        eprintln!(
-            "skipping: the chatty fixture is not installed \
-             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
-        );
+    if periscope_e2e::fixture("chatty", FIXTURE).is_none() {
         return;
     }
 
