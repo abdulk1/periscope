@@ -24,6 +24,7 @@ for the same one-node cluster.
 | `tests/exec_auth.rs` | Exec credential plugins shaped like EKS's and GKE's, including the real `aws` CLI |
 | `tests/discovery.rs` | Discovery with CRDs, generic tables, filters, secret masking, and the detail fetch |
 | `tests/logs.rs` | Tailing one pod and fifty, merging, re-attach after a restart, and the ingest-rate budget |
+| `tests/multicluster.rs` | Five clusters at once, the row budget, warm switching, and one unreachable cluster |
 
 The auth tests write a throwaway kubeconfig into the temp directory and point the
 app at it with `--kubeconfig`'s programmatic equivalent, so the developer's own
@@ -44,6 +45,11 @@ kubectl delete -f tests/e2e/fixtures/firehose.yaml  # it burns CPU; delete it wh
 
 The CRD-heavy discovery test needs cert-manager and Argo CD installed; the test
 says so when they are missing.
+
+The multi-cluster suite writes its own kubeconfig with five contexts pointing at
+the test cluster and one pointing at a closed port; nothing extra is needed.
+`PERISCOPE_E2E_SOAK=45` keeps those five sessions streaming for 45 seconds so
+resident memory can be sampled from outside the process.
 
 ## Load fixture
 

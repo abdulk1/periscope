@@ -12,7 +12,16 @@ use std::sync::Arc;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32String};
-use periscope_bridge::{KindId, KindInfo, ResourceKey, ResourceRow};
+use periscope_bridge::{ClusterId, KindId, KindInfo, ResourceKey, ResourceRow};
+
+/// How many objects, across every cluster, are offered as candidates.
+///
+/// Scoring is linear in the candidates, so this is what keeps the palette
+/// inside its 50ms budget when several large clusters are warm at once. It is
+/// far above any cluster this has been tested against; the cap exists so that
+/// "several enormous clusters" degrades by offering fewer objects rather than
+/// by becoming unusable.
+pub const MAX_OBJECTS: usize = 50_000;
 
 /// How many results the palette shows.
 ///
@@ -23,16 +32,19 @@ pub const MAX_RESULTS: usize = 50;
 /// Something the palette can jump to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
-    /// Switch the table to a kind.
+    /// Switch the focused pane to a kind.
     Kind(KindId),
-    /// Open an object's detail view.
+    /// Open an object's detail view, switching cluster and kind if the object
+    /// is not on the pane's current one.
     Object {
+        /// Which cluster it lives on.
+        cluster: ClusterId,
         /// Kind of the object.
         kind: KindId,
         /// Which object.
         key: ResourceKey,
     },
-    /// Switch to a cluster.
+    /// Point the focused pane at a cluster.
     Cluster(Arc<str>),
 }
 
@@ -90,13 +102,17 @@ impl Palette {
     /// Rebuilds the candidate list.
     ///
     /// Called when the palette opens rather than on every keystroke: the
-    /// candidates only change when the cluster does.
-    pub fn rebuild(
+    /// candidates only change when the clusters do.
+    ///
+    /// `objects` spans **every** cluster the store holds rows for, not just the
+    /// one on screen. "Find this pod" is most useful precisely when you cannot
+    /// remember which cluster it is on.
+    pub fn rebuild<'a>(
         &mut self,
         clusters: &[Arc<str>],
         kinds: &[KindInfo],
-        kind: Option<&KindId>,
-        rows: &[Arc<ResourceRow>],
+        objects: impl Iterator<Item = (&'a ClusterId, &'a KindId, &'a Arc<ResourceRow>)>,
+        home: Option<&ClusterId>,
     ) {
         self.candidates.clear();
 
@@ -120,17 +136,25 @@ impl Palette {
             });
         }
 
-        if let Some(kind) = kind {
-            for row in rows {
-                self.candidates.push(Candidate {
-                    label: row.key.to_string(),
-                    detail: kind.label(),
-                    target: Target::Object {
-                        kind: kind.clone(),
-                        key: row.key.clone(),
-                    },
-                });
-            }
+        for (cluster, kind, row) in objects.take(MAX_OBJECTS) {
+            // The cluster is only worth saying when it is not the one already
+            // on screen; on a single-cluster day it would be noise on every
+            // line.
+            let detail = if Some(cluster) == home {
+                kind.label()
+            } else {
+                format!("{} · {cluster}", kind.label())
+            };
+
+            self.candidates.push(Candidate {
+                label: row.key.to_string(),
+                detail,
+                target: Target::Object {
+                    cluster: cluster.clone(),
+                    kind: kind.clone(),
+                    key: row.key.clone(),
+                },
+            });
         }
 
         // Scoring wants UTF-32; converting once per rebuild rather than once
@@ -233,11 +257,15 @@ mod tests {
         ];
         let rows = [row("default", "api-0"), row("kube-system", "coredns-abc")];
 
+        let pods = KindId::new("", "v1", "Pod", "pods");
+        let prod = ClusterId::new("prod");
+        let objects: Vec<_> = rows.iter().map(|row| (&prod, &pods, row)).collect();
+
         palette.rebuild(
             &[Arc::from("prod"), Arc::from("staging")],
             &kinds,
-            Some(&KindId::new("", "v1", "Pod", "pods")),
-            &rows,
+            objects.into_iter(),
+            Some(&prod),
         );
         palette
     }
@@ -316,6 +344,32 @@ mod tests {
     }
 
     #[test]
+    fn objects_on_another_cluster_say_which_one() {
+        let mut palette = Palette::new();
+        let pods = KindId::new("", "v1", "Pod", "pods");
+        let (prod, staging) = (ClusterId::new("prod"), ClusterId::new("staging"));
+        let rows = [row("default", "api-0")];
+        let objects: Vec<_> = rows.iter().map(|row| (&staging, &pods, row)).collect();
+
+        palette.rebuild(&[], &[], objects.into_iter(), Some(&prod));
+        let found = palette.search("api-0");
+
+        assert_eq!(found[0].candidate.detail, "pods · staging");
+        match &found[0].candidate.target {
+            Target::Object { cluster, .. } => assert_eq!(cluster, &staging),
+            other => panic!("expected an object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_object_on_the_cluster_already_shown_does_not_repeat_its_name() {
+        let mut palette = palette();
+        let found = palette.search("api-0");
+        // The pane is on `prod`; saying so on every line would be noise.
+        assert_eq!(found[0].candidate.detail, "pods");
+    }
+
+    #[test]
     fn custom_resources_say_that_they_are_custom() {
         let mut palette = palette();
         let found = palette.search("applications");
@@ -336,10 +390,13 @@ mod tests {
     #[test]
     fn results_are_capped_so_a_huge_cluster_stays_typeable() {
         let mut palette = Palette::new();
+        let pods = KindId::new("", "v1", "Pod", "pods");
+        let cluster = ClusterId::new("prod");
         let rows: Vec<_> = (0..10_000)
             .map(|i| row("default", &format!("worker-{i:05}")))
             .collect();
-        palette.rebuild(&[], &[], Some(&KindId::new("", "v1", "Pod", "pods")), &rows);
+        let objects: Vec<_> = rows.iter().map(|row| (&cluster, &pods, row)).collect();
+        palette.rebuild(&[], &[], objects.into_iter(), Some(&cluster));
 
         assert_eq!(palette.len(), 10_000);
         assert_eq!(palette.search("worker").len(), MAX_RESULTS);
@@ -350,10 +407,13 @@ mod tests {
     fn a_ten_thousand_object_search_stays_well_inside_the_budget() {
         // The Phase 2 budget is 50ms on a 10k-object cluster.
         let mut palette = Palette::new();
+        let pods = KindId::new("", "v1", "Pod", "pods");
+        let cluster = ClusterId::new("prod");
         let rows: Vec<_> = (0..10_000)
             .map(|i| row("default", &format!("worker-{i:05}")))
             .collect();
-        palette.rebuild(&[], &[], Some(&KindId::new("", "v1", "Pod", "pods")), &rows);
+        let objects: Vec<_> = rows.iter().map(|row| (&cluster, &pods, row)).collect();
+        palette.rebuild(&[], &[], objects.into_iter(), Some(&cluster));
 
         let started = std::time::Instant::now();
         let found = palette.search("wk9");
@@ -369,7 +429,7 @@ mod tests {
     #[test]
     fn rebuilding_replaces_the_previous_candidates() {
         let mut palette = palette();
-        palette.rebuild(&[], &[], None, &[]);
+        palette.rebuild(&[], &[], std::iter::empty(), None);
 
         assert!(palette.is_empty());
         assert!(palette.search("pods").is_empty());

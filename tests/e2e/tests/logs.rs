@@ -20,6 +20,15 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// The label the fixture's pods carry.
 const FIXTURE: &str = "app=chatty";
 
+/// The unthrottled fixture's label.
+const FIREHOSE: &str = "app=firehose";
+
+/// Whether a fixture is running, so a test can say "not installed" rather than
+/// failing in a way that teaches people to ignore failures.
+fn fixture_running(selector: &str) -> bool {
+    periscope_e2e::first_pod_named(selector).is_some()
+}
+
 /// Connects, waits for discovery, and starts a log session.
 fn tailing(
     target: LogTarget,
@@ -79,7 +88,15 @@ fn collect(
 #[test]
 #[ignore = "needs the chatty fixture"]
 fn tailing_one_pod_streams_its_output() {
-    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("the chatty fixture is running");
+    if !fixture_running(FIXTURE) {
+        eprintln!(
+            "skipping: the chatty fixture is not installed \
+             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
+        );
+        return;
+    }
+
+    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("checked just above");
     let (_runtime, stream) = tailing(LogTarget::pod("default", &pod));
 
     let (buffer, seen) = collect(&stream, TIMEOUT, 5);
@@ -110,6 +127,14 @@ fn tailing_one_pod_streams_its_output() {
 #[test]
 #[ignore = "needs the chatty fixture"]
 fn a_label_selector_merges_every_matching_pod() {
+    if !fixture_running(FIXTURE) {
+        eprintln!(
+            "skipping: the chatty fixture is not installed \
+             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
+        );
+        return;
+    }
+
     let (_runtime, stream) = tailing(live(LogTarget::labels("default", FIXTURE)));
 
     // Enough lines that all three replicas have had time to attach and speak:
@@ -153,6 +178,14 @@ fn a_label_selector_merges_every_matching_pod() {
 #[test]
 #[ignore = "needs the chatty fixture"]
 fn filtering_narrows_the_buffer_without_dropping_it() {
+    if !fixture_running(FIXTURE) {
+        eprintln!(
+            "skipping: the chatty fixture is not installed \
+             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
+        );
+        return;
+    }
+
     let (_runtime, stream) = tailing(live(LogTarget::labels("default", FIXTURE)));
     let (mut buffer, _) = collect(&stream, TIMEOUT, 40);
 
@@ -174,6 +207,14 @@ fn filtering_narrows_the_buffer_without_dropping_it() {
 #[test]
 #[ignore = "needs the chatty fixture"]
 fn a_pod_that_restarts_is_re_attached() {
+    if !fixture_running(FIXTURE) {
+        eprintln!(
+            "skipping: the chatty fixture is not installed \
+             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
+        );
+        return;
+    }
+
     let (_runtime, stream) = tailing(live(LogTarget::labels("default", FIXTURE)));
     let (before, _) = collect(&stream, TIMEOUT, 20);
     let victim = before
@@ -233,7 +274,15 @@ fn a_pod_that_restarts_is_re_attached() {
 #[test]
 #[ignore = "needs a cluster"]
 fn a_container_that_does_not_exist_is_reported_rather_than_silently_empty() {
-    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("the chatty fixture is running");
+    if !fixture_running(FIXTURE) {
+        eprintln!(
+            "skipping: the chatty fixture is not installed \
+             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
+        );
+        return;
+    }
+
+    let pod = periscope_e2e::first_pod_named(FIXTURE).expect("checked just above");
     let (_runtime, stream) =
         tailing(LogTarget::pod("default", &pod).container(Some(Arc::from("no-such-container"))));
 
@@ -258,7 +307,15 @@ fn a_container_that_does_not_exist_is_reported_rather_than_silently_empty() {
 #[test]
 #[ignore = "needs the firehose fixture"]
 fn a_firehose_is_ingested_at_rate_and_stays_bounded() {
-    let (_runtime, stream) = tailing(live(LogTarget::labels("default", "app=firehose")));
+    if !fixture_running(FIREHOSE) {
+        eprintln!(
+            "skipping: the firehose fixture is not installed \
+             (kubectl apply -f tests/e2e/fixtures/firehose.yaml)"
+        );
+        return;
+    }
+
+    let (_runtime, stream) = tailing(live(LogTarget::labels("default", FIREHOSE)));
 
     // A ring far smaller than what will arrive, so the cap is what holds memory
     // down rather than the stream running out.
@@ -310,6 +367,14 @@ fn a_firehose_is_ingested_at_rate_and_stays_bounded() {
 #[test]
 #[ignore = "needs the chatty fixture"]
 fn a_high_rate_stream_is_bounded_by_the_ring() {
+    if !fixture_running(FIXTURE) {
+        eprintln!(
+            "skipping: the chatty fixture is not installed \
+             (kubectl apply -f tests/e2e/fixtures/chatty.yaml)"
+        );
+        return;
+    }
+
     let (_runtime, stream) = tailing(live(LogTarget::labels("default", FIXTURE)));
 
     // A ring far smaller than what will arrive, so eviction is guaranteed.

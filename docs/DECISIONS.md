@@ -590,3 +590,94 @@ It requires `--namespace`, because logs are a pod subresource: there is no
 cluster-wide log endpoint to fall back on when no namespace is given. The same
 constraint shapes the in-app path — tailing by label selector needs the
 namespace filter set first, and says so rather than failing at the API.
+
+---
+
+## ADR-0024 — Panes are selections; the tables underneath are shared
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+Viewing two clusters side by side could have been two independent stores. It is
+not: `AppState` keeps one map of tables keyed by `(cluster, kind)`, and a `Pane`
+holds only a selection — a cluster, a kind, its filters, and the materialised
+rows it renders.
+
+That has three consequences worth stating:
+
+- Two panes on the same cluster and kind cost one table, not two, and one watch,
+  not two. Pointing both panes at the same place is a legitimate thing to do
+  (different filters on the same data) and it is nearly free.
+- An event updates every pane that shows it, in one pass. `apply_batch` collects
+  the affected pane indexes and rebuilds each at most once per flush, so a
+  fifty-event batch still costs two rebuilds at most.
+- Closing a pane throws away a selection, not data. The cluster stays warm until
+  the idle sweep decides otherwise (ADR-0025).
+
+---
+
+## ADR-0025 — Clusters stay warm until nobody has looked at them for a while
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Supersedes:** the one-watch-at-a-time rule in ADR-0019.
+
+Phase 2 stopped the previous watch whenever the kind changed, which kept
+bandwidth honest and made switching back a re-listing. Phase 4's acceptance
+criterion is the opposite: *switching between clusters is instant, with no
+re-fetch of warm clusters*. So:
+
+- **Lazy connect.** A cluster is connected when a pane first points at it, not
+  at startup. Ten contexts in kubeconfig cost ten rows in a list.
+- **Warm.** Watches keep running when a pane moves elsewhere. Going back is a
+  selection change and nothing else — measured at well under a millisecond
+  against five warm clusters.
+- **Released.** A sweep every 30 seconds stops the watches of any cluster that
+  has been out of every pane for five minutes, and drops its rows with them.
+  The *connection* is kept: coming back should not mean re-running an exec
+  plugin and waiting on a cloud IAM round trip.
+
+Both intervals are constants today rather than settings; Phase 6 owns the
+config file, and that is where they belong.
+
+---
+
+## ADR-0026 — The row budget releases what nobody is looking at
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+"Per-cluster resource budget so one huge cluster cannot starve the others" could
+mean truncating a listing. It does not here: a table that silently held half a
+cluster's pods would be a lie the UI could not correct.
+
+Instead the budget (200,000 rows per cluster) is enforced by **releasing whole
+tables that no pane is showing**, largest first, until the cluster is back under
+it. What a pane is showing is never released — dropping what is on screen to
+save memory would be absurd — so one enormous table can still exceed the budget
+by itself. What the budget prevents is a cluster accumulating every kind the
+user has ever visited while another cluster needs the memory.
+
+Measured: five clusters holding 50,110 rows between them settle at 29MB
+resident, flat over a 45-second soak.
+
+---
+
+## ADR-0027 — Split panes use resizable panels, not the docking framework
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Amends:** the "split panes / docking (`gpui-component` docking)" line in
+`IMPLEMENTATION.md` §3 Phase 4.
+
+`gpui-component` ships a dock system — tab strips, drag-to-dock, panel
+registration — and a much smaller `h_resizable`. Periscope uses the latter: two
+panes with a draggable divider.
+
+The dock system would buy tear-off tabs and arbitrary layouts, and cost a panel
+registry, serialisable layout state, and a tab abstraction over views that
+currently have no identity of their own. Two panes is what the acceptance
+criterion asks for ("two clusters can be viewed side by side"), and the smaller
+mechanism does it. If Phase 6 wants saved layouts or more than two panes, the
+dock system is the thing to reach for then — this is a deliberate deferral, not
+an oversight.

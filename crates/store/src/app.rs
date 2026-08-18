@@ -109,26 +109,110 @@ impl Filters {
     }
 }
 
-/// The application's state.
+/// One view onto one cluster.
+///
+/// Two of these side by side is what "view two clusters at once" means; the
+/// tables themselves are shared, so a pane costs a selection and a materialised
+/// row list, not a second copy of the data.
 #[derive(Debug, Default)]
+pub struct Pane {
+    cluster: Option<ClusterId>,
+    kind: Option<KindId>,
+    filters: Filters,
+    /// Materialised rows for this pane, for indexed access by the virtualised
+    /// list. Rebuilt only when something it shows changes, and shared as an
+    /// `Arc` so a render that captures them costs one refcount bump rather
+    /// than a copy of ten thousand pointers.
+    rows: Arc<[Arc<ResourceRow>]>,
+    columns: Arc<[ColumnSpec]>,
+}
+
+impl Pane {
+    /// The cluster this pane shows.
+    pub fn cluster(&self) -> Option<&ClusterId> {
+        self.cluster.as_ref()
+    }
+
+    /// The kind this pane shows.
+    pub fn kind(&self) -> Option<&KindId> {
+        self.kind.as_ref()
+    }
+
+    /// The filters applied to it.
+    pub fn filters(&self) -> &Filters {
+        &self.filters
+    }
+
+    /// The rows it renders.
+    pub fn rows(&self) -> &[Arc<ResourceRow>] {
+        &self.rows
+    }
+
+    /// The same rows, shared, for a virtualised list.
+    pub fn rows_shared(&self) -> Arc<[Arc<ResourceRow>]> {
+        Arc::clone(&self.rows)
+    }
+
+    /// The columns those rows carry cells for.
+    pub fn columns(&self) -> &[ColumnSpec] {
+        &self.columns
+    }
+
+    /// Whether this pane shows a given cluster and kind.
+    fn shows(&self, cluster: &ClusterId, kind: &KindId) -> bool {
+        self.cluster.as_ref() == Some(cluster) && self.kind.as_ref() == Some(kind)
+    }
+}
+
+/// How many rows one cluster may hold across every kind before the oldest
+/// tables are released.
+///
+/// Twenty times the largest cluster this has been tested against. The point is
+/// not to be tight: it is that one enormous cluster cannot consume every byte
+/// the process has and starve the others.
+pub const DEFAULT_ROW_BUDGET: usize = 200_000;
+
+/// How long a cluster nobody is looking at keeps streaming before it is let go.
+pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The application's state.
+#[derive(Debug)]
 pub struct AppState {
     connections: ConnectionRegistry,
     contexts: Vec<ContextInfo>,
     current: Option<ClusterId>,
     config_error: Option<String>,
-    active: Option<ClusterId>,
     kinds: BTreeMap<ClusterId, Arc<[KindInfo]>>,
-    kind: Option<KindId>,
-    filters: Filters,
     tables: BTreeMap<(ClusterId, KindId), ResourceTable>,
     detail: Option<Detail>,
     logs: Option<LogSession>,
-    /// Materialised rows for the active view, for indexed access by the
-    /// virtualised list. Rebuilt only when something it shows changes, and
-    /// shared as an `Arc` so a render that captures them costs one refcount
-    /// bump rather than a copy of ten thousand pointers.
-    rows: Arc<[Arc<ResourceRow>]>,
-    columns: Arc<[ColumnSpec]>,
+    /// One pane, or two side by side.
+    panes: Vec<Pane>,
+    /// Which pane commands apply to.
+    focus: usize,
+    /// When each cluster was last in a pane, for the idle sweep.
+    last_viewed: BTreeMap<ClusterId, Instant>,
+    /// Rows one cluster may hold before its unviewed tables are released.
+    budget: usize,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            connections: ConnectionRegistry::default(),
+            contexts: Vec::new(),
+            current: None,
+            config_error: None,
+            kinds: BTreeMap::new(),
+            tables: BTreeMap::new(),
+            detail: None,
+            logs: None,
+            panes: vec![Pane::default()],
+            focus: 0,
+            last_viewed: BTreeMap::new(),
+            budget: DEFAULT_ROW_BUDGET,
+        }
+    }
 }
 
 impl AppState {
@@ -154,8 +238,11 @@ impl AppState {
                 // Selecting the current context on first read is what the user
                 // means by "open my cluster"; re-reading kubeconfig later must
                 // not yank the view away from whatever they are looking at.
-                if self.active.is_none() {
-                    self.active = current.clone();
+                if self.panes[0].cluster.is_none()
+                    && let Some(current) = current.clone()
+                {
+                    self.last_viewed.insert(current.clone(), now);
+                    self.panes[0].cluster = Some(current);
                 }
                 changed = true;
             }
@@ -184,6 +271,7 @@ impl AppState {
                 // A completed resync is the moment dropped events stop
                 // mattering: the table was just rebuilt from scratch.
                 self.connections.mark_fresh(cluster);
+                self.enforce_budget(cluster);
                 changed |= self.touch(cluster, kind, touched);
             }
 
@@ -265,63 +353,234 @@ impl AppState {
         now: Instant,
     ) -> bool {
         let mut changed = false;
-        let mut rows_stale = false;
+        let mut stale: Vec<usize> = Vec::new();
 
         for event in events {
             changed |= self.apply(event, now);
-            rows_stale |= self.affects_active(event);
+            for pane in self.affected_panes(event) {
+                if !stale.contains(&pane) {
+                    stale.push(pane);
+                }
+            }
         }
 
-        if rows_stale {
-            self.refresh_rows();
+        for pane in stale {
+            self.refresh_pane(pane);
         }
         changed
     }
 
-    /// Switches which cluster is being viewed.
+    /// Switches which cluster the focused pane shows.
     pub fn select_cluster(&mut self, cluster: ClusterId) {
-        if self.active.as_ref() == Some(&cluster) {
+        if self.panes[self.focus].cluster.as_ref() == Some(&cluster) {
             return;
         }
-        self.active = Some(cluster);
+        self.last_viewed.insert(cluster.clone(), Instant::now());
+        self.panes[self.focus].cluster = Some(cluster);
         self.detail = None;
         // A tail belongs to the cluster it was opened on; carrying it across
         // would leave lines on screen that no longer relate to anything.
         self.logs = None;
-        self.refresh_rows();
+        self.refresh_pane(self.focus);
     }
 
-    /// Switches which kind is being viewed.
+    /// Switches which kind the focused pane shows.
     pub fn select_kind(&mut self, kind: KindId) {
-        if self.kind.as_ref() == Some(&kind) {
+        if self.panes[self.focus].kind.as_ref() == Some(&kind) {
             return;
         }
-        self.kind = Some(kind);
+        self.panes[self.focus].kind = Some(kind);
         self.detail = None;
-        self.refresh_rows();
+        self.refresh_pane(self.focus);
     }
 
-    /// Applies a namespace filter, or clears it with `None`.
+    /// Applies a namespace filter to the focused pane, or clears it.
     pub fn set_namespace(&mut self, namespace: Option<Arc<str>>) {
-        self.filters.namespace = namespace.filter(|namespace| !namespace.is_empty());
-        self.refresh_rows();
+        self.panes[self.focus].filters.namespace =
+            namespace.filter(|namespace| !namespace.is_empty());
+        self.refresh_pane(self.focus);
     }
 
-    /// Applies a label selector, or clears it with `None`.
+    /// Applies a label selector to the focused pane, or clears it.
     pub fn set_selector(&mut self, selector: Option<Arc<str>>) {
-        self.filters.selector = selector.filter(|selector| !selector.is_empty());
-        self.refresh_rows();
+        self.panes[self.focus].filters.selector = selector.filter(|selector| !selector.is_empty());
+        self.refresh_pane(self.focus);
     }
 
-    /// Applies the client-side text filter.
+    /// Applies the client-side text filter to the focused pane.
     pub fn set_search(&mut self, search: Option<Arc<str>>) {
-        self.filters.search = search.filter(|search| !search.is_empty());
-        self.refresh_rows();
+        self.panes[self.focus].filters.search = search.filter(|search| !search.is_empty());
+        self.refresh_pane(self.focus);
     }
 
-    /// The filters currently applied.
+    /// The filters on the focused pane.
     pub fn filters(&self) -> &Filters {
-        &self.filters
+        &self.panes[self.focus].filters
+    }
+
+    // --- panes --------------------------------------------------------------
+
+    /// Every pane, left to right.
+    pub fn panes(&self) -> &[Pane] {
+        &self.panes
+    }
+
+    /// Which pane commands apply to.
+    pub fn focus(&self) -> usize {
+        self.focus
+    }
+
+    /// Focuses a pane. Out-of-range indexes are ignored rather than panicking
+    /// mid-render.
+    pub fn focus_pane(&mut self, index: usize) {
+        if index < self.panes.len() && index != self.focus {
+            self.focus = index;
+            self.detail = None;
+            if let Some(cluster) = self.panes[index].cluster.clone() {
+                self.last_viewed.insert(cluster, Instant::now());
+            }
+        }
+    }
+
+    /// Adds a second pane, showing the same cluster until it is pointed
+    /// somewhere else. Returns whether the layout changed.
+    pub fn split(&mut self) -> bool {
+        if self.panes.len() > 1 {
+            return false;
+        }
+
+        let mut pane = Pane {
+            cluster: self.panes[0].cluster.clone(),
+            kind: self.panes[0].kind.clone(),
+            ..Pane::default()
+        };
+        // Start the new pane on a different cluster when there is one: opening
+        // two identical panes is never what "split" means.
+        if let Some(other) = self
+            .contexts
+            .iter()
+            .map(|context| ClusterId::new(&*context.name))
+            .find(|candidate| Some(candidate) != self.panes[0].cluster.as_ref())
+        {
+            pane.cluster = Some(other);
+        }
+
+        self.panes.push(pane);
+        self.focus = 1;
+        if let Some(cluster) = self.panes[1].cluster.clone() {
+            self.last_viewed.insert(cluster, Instant::now());
+        }
+        self.refresh_pane(1);
+        true
+    }
+
+    /// Drops the second pane. Returns whether the layout changed.
+    pub fn unsplit(&mut self) -> bool {
+        if self.panes.len() < 2 {
+            return false;
+        }
+        self.panes.truncate(1);
+        self.focus = 0;
+        self.detail = None;
+        true
+    }
+
+    /// Whether two panes are open.
+    pub fn is_split(&self) -> bool {
+        self.panes.len() > 1
+    }
+
+    /// The clusters currently in a pane.
+    pub fn clusters_in_view(&self) -> Vec<ClusterId> {
+        let mut clusters: Vec<ClusterId> = self
+            .panes
+            .iter()
+            .filter_map(|pane| pane.cluster.clone())
+            .collect();
+        clusters.dedup();
+        clusters
+    }
+
+    /// Everything a pane needs watched: its cluster, kind and server-side
+    /// filters.
+    pub fn watch_targets(&self) -> Vec<(ClusterId, KindId, Filters)> {
+        self.panes
+            .iter()
+            .filter_map(|pane| {
+                Some((
+                    pane.cluster.clone()?,
+                    pane.kind.clone()?,
+                    pane.filters.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    // --- warm clusters ------------------------------------------------------
+
+    /// Records that a cluster is being looked at.
+    pub fn touch_cluster(&mut self, cluster: &ClusterId, now: Instant) {
+        self.last_viewed.insert(cluster.clone(), now);
+    }
+
+    /// Clusters that have been out of view longer than `timeout`.
+    ///
+    /// Warm means "still streaming so that going back is instant"; past the
+    /// timeout the streaming is just cost, and the rows are dropped with it.
+    pub fn idle_clusters(&self, now: Instant, timeout: std::time::Duration) -> Vec<ClusterId> {
+        let in_view = self.clusters_in_view();
+        self.last_viewed
+            .iter()
+            .filter(|(cluster, _)| !in_view.contains(cluster))
+            .filter(|(_, seen)| now.saturating_duration_since(**seen) >= timeout)
+            .map(|(cluster, _)| cluster.clone())
+            .collect()
+    }
+
+    /// Drops everything held for a cluster, keeping its connection state.
+    pub fn release(&mut self, cluster: &ClusterId) {
+        self.tables.retain(|(held, _), _| held != cluster);
+        self.last_viewed.remove(cluster);
+        for index in 0..self.panes.len() {
+            if self.panes[index].cluster.as_ref() == Some(cluster) {
+                self.refresh_pane(index);
+            }
+        }
+    }
+
+    /// Rows held for one cluster, across every kind.
+    pub fn cluster_rows(&self, cluster: &ClusterId) -> usize {
+        self.tables
+            .iter()
+            .filter(|((held, _), _)| held == cluster)
+            .map(|(_, table)| table.len())
+            .sum()
+    }
+
+    /// Rows held for every cluster.
+    pub fn total_rows(&self) -> usize {
+        self.tables.values().map(ResourceTable::len).sum()
+    }
+
+    /// The per-cluster row budget.
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// Sets the per-cluster row budget.
+    pub fn set_budget(&mut self, budget: usize) {
+        self.budget = budget.max(1);
+    }
+
+    /// Every row held, with the cluster and kind it belongs to.
+    ///
+    /// This is what cross-cluster search reads: it deliberately includes
+    /// clusters that are not in a pane, because "find this pod" is most useful
+    /// when you cannot remember which cluster it is on.
+    pub fn all_rows(&self) -> impl Iterator<Item = (&ClusterId, &KindId, &Arc<ResourceRow>)> {
+        self.tables
+            .iter()
+            .flat_map(|((cluster, kind), table)| table.iter().map(move |row| (cluster, kind, row)))
     }
 
     /// Opens a log session, replacing any that was running.
@@ -373,20 +632,24 @@ impl AppState {
         self.detail.as_ref()
     }
 
-    /// The cluster currently being viewed.
+    /// The cluster the focused pane shows.
     pub fn active(&self) -> Option<&ClusterId> {
-        self.active.as_ref()
+        self.panes[self.focus].cluster.as_ref()
     }
 
-    /// The kind currently being viewed.
+    /// The kind the focused pane shows.
     pub fn kind(&self) -> Option<&KindId> {
-        self.kind.as_ref()
+        self.panes[self.focus].kind.as_ref()
     }
 
-    /// The kinds the active cluster serves.
+    /// The kinds the focused pane's cluster serves.
     pub fn kinds(&self) -> &[KindInfo] {
-        self.active
-            .as_ref()
+        self.kinds_of(self.active())
+    }
+
+    /// The kinds a cluster serves.
+    pub fn kinds_of(&self, cluster: Option<&ClusterId>) -> &[KindInfo] {
+        cluster
             .and_then(|cluster| self.kinds.get(cluster))
             .map(|kinds| &**kinds)
             .unwrap_or_default()
@@ -397,20 +660,21 @@ impl AppState {
         self.kinds().iter().find(|info| &info.id == kind)
     }
 
-    /// The rows the table renders, filtered and in namespace-then-name order.
+    /// The rows the focused pane renders, filtered and in namespace-then-name
+    /// order.
     pub fn rows(&self) -> &[Arc<ResourceRow>] {
-        &self.rows
+        self.panes[self.focus].rows()
     }
 
     /// The same rows, shared, for a virtualised list that must own what it
     /// renders from.
     pub fn rows_shared(&self) -> Arc<[Arc<ResourceRow>]> {
-        Arc::clone(&self.rows)
+        self.panes[self.focus].rows_shared()
     }
 
     /// The columns those rows carry cells for.
     pub fn columns(&self) -> &[ColumnSpec] {
-        &self.columns
+        self.panes[self.focus].columns()
     }
 
     /// Every context kubeconfig defines.
@@ -433,9 +697,9 @@ impl AppState {
         self.connections.get(cluster)
     }
 
-    /// Connection health for the cluster being viewed.
+    /// Connection health for the cluster the focused pane shows.
     pub fn active_connection(&self) -> Option<&Connection> {
-        self.active.as_ref().and_then(|id| self.connections.get(id))
+        self.active().and_then(|id| self.connections.get(id))
     }
 
     /// How many rows the active view holds before and after filtering.
@@ -443,13 +707,12 @@ impl AppState {
         let total = self
             .active_table()
             .map_or(0, |(_, table): (_, &ResourceTable)| table.len());
-        (total, self.rows.len())
+        (total, self.rows().len())
     }
 
-    /// How many rows a kind holds on the active cluster, for the picker.
+    /// How many rows a kind holds on the focused pane's cluster, for the picker.
     pub fn row_count(&self, kind: &KindId) -> usize {
-        self.active
-            .as_ref()
+        self.active()
             .and_then(|cluster| self.tables.get(&(cluster.clone(), kind.clone())))
             .map_or(0, ResourceTable::len)
     }
@@ -462,10 +725,53 @@ impl AppState {
     }
 
     fn active_table(&self) -> Option<(&KindId, &ResourceTable)> {
-        let cluster = self.active.as_ref()?;
-        let kind = self.kind.as_ref()?;
+        self.pane_table(self.focus)
+    }
+
+    fn pane_table(&self, index: usize) -> Option<(&KindId, &ResourceTable)> {
+        let pane = self.panes.get(index)?;
+        let cluster = pane.cluster.as_ref()?;
+        let kind = pane.kind.as_ref()?;
         let table = self.tables.get(&(cluster.clone(), kind.clone()))?;
         Some((kind, table))
+    }
+
+    /// Releases a cluster's least useful tables when it is over budget.
+    ///
+    /// The kinds a pane is showing are never released — dropping what is on
+    /// screen to save memory would be absurd — so a single enormous table can
+    /// exceed the budget. What the budget prevents is a cluster accumulating
+    /// every kind the user has ever visited while another cluster needs the
+    /// memory.
+    fn enforce_budget(&mut self, cluster: &ClusterId) {
+        if self.cluster_rows(cluster) <= self.budget {
+            return;
+        }
+
+        let shown: Vec<KindId> = self
+            .panes
+            .iter()
+            .filter(|pane| pane.cluster.as_ref() == Some(cluster))
+            .filter_map(|pane| pane.kind.clone())
+            .collect();
+
+        let mut releasable: Vec<(KindId, usize)> = self
+            .tables
+            .iter()
+            .filter(|((held, kind), _)| held == cluster && !shown.contains(kind))
+            .map(|((_, kind), table)| (kind.clone(), table.len()))
+            .collect();
+        // Biggest first: the point is to get back under budget in as few
+        // releases as possible.
+        releasable.sort_by_key(|(_, rows)| std::cmp::Reverse(*rows));
+
+        for (kind, _) in releasable {
+            if self.cluster_rows(cluster) <= self.budget {
+                break;
+            }
+            tracing::debug!(%cluster, %kind, "releasing a table to stay inside the row budget");
+            self.tables.remove(&(cluster.clone(), kind));
+        }
     }
 
     fn table_mut(&mut self, cluster: &ClusterId, kind: &KindId) -> &mut ResourceTable {
@@ -481,46 +787,60 @@ impl AppState {
             .is_some_and(|detail| detail.kind() == kind && detail.key() == key)
     }
 
-    /// Reports a table change, and whether it is one the user can see.
+    /// Reports a table change, and whether any pane can see it.
     fn touch(&mut self, cluster: &ClusterId, kind: &KindId, changed: bool) -> bool {
-        changed && self.active.as_ref() == Some(cluster) && self.kind.as_ref() == Some(kind)
+        changed && self.panes.iter().any(|pane| pane.shows(cluster, kind))
     }
 
-    fn affects_active(&self, event: &ClusterEvent) -> bool {
+    /// Which panes an event changes the contents of.
+    fn affected_panes(&self, event: &ClusterEvent) -> Vec<usize> {
         let kind = match event {
             ClusterEvent::ResourceReset { kind, .. }
             | ClusterEvent::ResourceApplied { kind, .. }
             | ClusterEvent::ResourceDeleted { kind, .. } => kind,
-            _ => return false,
+            _ => return Vec::new(),
         };
-        event.cluster() == self.active.as_ref() && Some(kind) == self.kind.as_ref()
+        let Some(cluster) = event.cluster() else {
+            return Vec::new();
+        };
+
+        self.panes
+            .iter()
+            .enumerate()
+            .filter(|(_, pane)| pane.shows(cluster, kind))
+            .map(|(index, _)| index)
+            .collect()
     }
 
-    fn refresh_rows(&mut self) {
-        let Some((_, table)) = self.active_table() else {
-            self.rows = Arc::from([] as [Arc<ResourceRow>; 0]);
-            self.columns = Arc::from([] as [ColumnSpec; 0]);
+    fn refresh_pane(&mut self, index: usize) {
+        let Some((_, table)) = self.pane_table(index) else {
+            if let Some(pane) = self.panes.get_mut(index) {
+                pane.rows = Arc::from([] as [Arc<ResourceRow>; 0]);
+                pane.columns = Arc::from([] as [ColumnSpec; 0]);
+            }
             return;
         };
 
         let columns = Arc::clone(table.columns());
-        let namespace = self.filters.namespace.clone();
+        let filters = self.panes[index].filters.clone();
         let rows: Vec<_> = table
             .iter()
             // The namespace filter is applied by the apiserver too, but the
             // rows already held must follow it immediately rather than waiting
             // for the re-listing to arrive.
             .filter(|row| {
-                namespace
+                filters
+                    .namespace
                     .as_deref()
                     .is_none_or(|namespace| &*row.key.namespace == namespace)
             })
-            .filter(|row| self.filters.matches(row))
+            .filter(|row| filters.matches(row))
             .cloned()
             .collect();
 
-        self.columns = columns;
-        self.rows = Arc::from(rows);
+        let pane = &mut self.panes[index];
+        pane.columns = columns;
+        pane.rows = Arc::from(rows);
     }
 }
 
@@ -1005,6 +1325,214 @@ mod tests {
                 .error()
                 .is_some_and(|reason| reason.contains("waiting to start"))
         );
+    }
+
+    #[test]
+    fn splitting_opens_a_second_pane_on_another_cluster() {
+        let mut state = state_with_contexts();
+
+        assert!(!state.is_split());
+        assert!(state.split());
+        assert!(state.is_split());
+
+        // Two panes showing the same cluster is never what split means.
+        assert_eq!(state.panes()[0].cluster(), Some(&ClusterId::new("prod")));
+        assert_eq!(state.panes()[1].cluster(), Some(&ClusterId::new("staging")));
+        // Commands go to the new pane.
+        assert_eq!(state.focus(), 1);
+        assert_eq!(state.active(), Some(&ClusterId::new("staging")));
+
+        assert!(!state.split(), "splitting twice does nothing");
+        assert!(state.unsplit());
+        assert_eq!(state.focus(), 0);
+        assert_eq!(state.active(), Some(&ClusterId::new("prod")));
+    }
+
+    #[test]
+    fn each_pane_keeps_its_own_kind_and_filters() {
+        let mut state = state_with_contexts();
+        state.split();
+
+        state.focus_pane(0);
+        state.select_kind(pods());
+        state.set_namespace(Some(Arc::from("payments")));
+
+        state.focus_pane(1);
+        state.select_kind(deployments());
+
+        assert_eq!(state.panes()[0].kind(), Some(&pods()));
+        assert_eq!(
+            state.panes()[0].filters().namespace.as_deref(),
+            Some("payments")
+        );
+        assert_eq!(state.panes()[1].kind(), Some(&deployments()));
+        assert_eq!(state.panes()[1].filters().namespace, None);
+    }
+
+    #[test]
+    fn both_panes_update_from_one_batch() {
+        let mut state = state_with_contexts();
+        state.split();
+        state.focus_pane(0);
+        state.select_kind(pods());
+        state.focus_pane(1);
+        state.select_kind(pods());
+
+        let changed = state.apply_batch(
+            &[
+                reset("prod", pods(), &[row("default", "prod-a")]),
+                reset(
+                    "staging",
+                    pods(),
+                    &[row("default", "staging-a"), row("default", "staging-b")],
+                ),
+            ],
+            Instant::now(),
+        );
+
+        assert!(changed);
+        assert_eq!(state.panes()[0].rows().len(), 1);
+        assert_eq!(state.panes()[1].rows().len(), 2);
+    }
+
+    #[test]
+    fn a_cluster_no_pane_shows_still_holds_its_rows() {
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[
+                reset("prod", pods(), &[row("default", "prod-a")]),
+                reset("staging", pods(), &[row("default", "staging-a")]),
+            ],
+            Instant::now(),
+        );
+
+        // Switching away and back must not re-fetch: that is what "warm" means.
+        state.select_cluster(ClusterId::new("staging"));
+        assert_eq!(state.rows().len(), 1);
+        state.select_cluster(ClusterId::new("prod"));
+        assert_eq!(state.rows().len(), 1);
+        assert_eq!(state.total_rows(), 2);
+    }
+
+    #[test]
+    fn a_cluster_out_of_view_goes_idle_and_is_released() {
+        let mut state = state_with_contexts();
+        let now = Instant::now();
+        state.apply_batch(
+            &[
+                reset("prod", pods(), &[row("default", "prod-a")]),
+                reset("staging", pods(), &[row("default", "staging-a")]),
+            ],
+            now,
+        );
+        state.touch_cluster(&ClusterId::new("staging"), now);
+
+        let timeout = std::time::Duration::from_secs(300);
+        // Nothing is idle while it is still being looked at.
+        assert!(state.idle_clusters(now, timeout).is_empty());
+
+        let later = now + std::time::Duration::from_secs(301);
+        let idle = state.idle_clusters(later, timeout);
+        assert_eq!(idle, vec![ClusterId::new("staging")]);
+        // The cluster in a pane is never idle, however long it has been open.
+        assert!(!idle.contains(&ClusterId::new("prod")));
+
+        state.release(&ClusterId::new("staging"));
+        assert_eq!(state.cluster_rows(&ClusterId::new("staging")), 0);
+        assert_eq!(state.cluster_rows(&ClusterId::new("prod")), 1);
+    }
+
+    #[test]
+    fn releasing_a_cluster_a_pane_shows_empties_that_pane() {
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset("prod", pods(), &[row("default", "api")])],
+            Instant::now(),
+        );
+        assert_eq!(state.rows().len(), 1);
+
+        state.release(&ClusterId::new("prod"));
+        assert!(state.rows().is_empty());
+    }
+
+    #[test]
+    fn a_cluster_over_budget_releases_the_tables_no_pane_is_showing() {
+        let mut state = state_with_contexts();
+        state.set_budget(10);
+
+        let many: Vec<_> = (0..8)
+            .map(|index| row("default", &format!("dep-{index}")))
+            .collect();
+        state.apply_batch(&[reset("prod", deployments(), &many)], Instant::now());
+        assert_eq!(state.cluster_rows(&ClusterId::new("prod")), 8);
+
+        // Pods are what the pane shows, so pods survive and the deployments
+        // table is what gets released.
+        let pods_rows: Vec<_> = (0..6)
+            .map(|index| row("default", &format!("pod-{index}")))
+            .collect();
+        state.apply_batch(&[reset("prod", pods(), &pods_rows)], Instant::now());
+
+        assert_eq!(state.row_count(&pods()), 6);
+        assert_eq!(state.row_count(&deployments()), 0);
+        assert!(state.cluster_rows(&ClusterId::new("prod")) <= state.budget());
+    }
+
+    #[test]
+    fn one_cluster_over_budget_does_not_touch_another() {
+        let mut state = state_with_contexts();
+        state.set_budget(5);
+
+        state.apply_batch(
+            &[reset("staging", pods(), &[row("default", "keep-me")])],
+            Instant::now(),
+        );
+
+        let many: Vec<_> = (0..20)
+            .map(|index| row("default", &format!("dep-{index}")))
+            .collect();
+        state.apply_batch(&[reset("prod", deployments(), &many)], Instant::now());
+
+        // The budget is per cluster: staging's row is untouched.
+        assert_eq!(state.cluster_rows(&ClusterId::new("staging")), 1);
+    }
+
+    #[test]
+    fn cross_cluster_search_sees_every_cluster_held() {
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[
+                reset("prod", pods(), &[row("default", "api-0")]),
+                reset("staging", deployments(), &[row("default", "api")]),
+            ],
+            Instant::now(),
+        );
+
+        let found: Vec<_> = state
+            .all_rows()
+            .map(|(cluster, kind, row)| format!("{cluster}/{}/{}", kind.label(), row.key.name))
+            .collect();
+
+        assert!(found.contains(&"prod/pods/api-0".to_owned()), "{found:?}");
+        assert!(
+            found.contains(&"staging/deployments.apps/api".to_owned()),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn watch_targets_cover_every_pane() {
+        let mut state = state_with_contexts();
+        state.select_kind(pods());
+        state.split();
+        state.select_kind(deployments());
+
+        let targets = state.watch_targets();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].0, ClusterId::new("prod"));
+        assert_eq!(targets[0].1, pods());
+        assert_eq!(targets[1].0, ClusterId::new("staging"));
+        assert_eq!(targets[1].1, deployments());
     }
 
     #[test]

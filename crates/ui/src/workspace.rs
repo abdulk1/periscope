@@ -18,6 +18,7 @@ use gpui::{
 };
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use periscope_bridge::{
     ClusterCommand, ClusterEvent, ClusterId, CommandError, CommandSender, ConnectionState,
@@ -47,6 +48,8 @@ actions!(
         ToggleLogs,
         /// Stick the log view to the newest line, or let it stay put.
         ToggleFollow,
+        /// Show two clusters side by side, or go back to one.
+        ToggleSplit,
     ]
 );
 
@@ -65,17 +68,22 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-l", ToggleLogs, None),
         KeyBinding::new("ctrl-l", ToggleLogs, None),
         KeyBinding::new("cmd-shift-f", ToggleFollow, None),
+        KeyBinding::new("cmd-\\", ToggleSplit, None),
+        KeyBinding::new("ctrl-\\", ToggleSplit, None),
     ]);
 }
 
 /// How often the view repaints with no events, so the age column keeps moving.
 const TICK: Duration = Duration::from_secs(1);
 
-/// Everything that decides which watch should be running.
+/// The server-side filters a watch was started with.
 ///
-/// Compared as a whole: any change to it means the current stream is watching
+/// Compared as a whole: a change to either means the running stream is watching
 /// the wrong thing and has to be replaced.
-type WatchTarget = (ClusterId, KindId, Option<Arc<str>>, Option<Arc<str>>);
+type WatchFilters = (Option<Arc<str>>, Option<Arc<str>>);
+
+/// How often idle clusters are swept.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Running totals from the event pump, shown in the footer and logged by `--perf`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -111,8 +119,13 @@ pub struct Workspace {
     /// Clusters this session has already tried to connect to, so a repainting
     /// UI cannot spam the runtime with connect commands.
     attempted: HashSet<ClusterId>,
-    /// The watch currently running, so the same one is not started twice.
-    watching: Option<WatchTarget>,
+    /// The watches currently running, so the same one is not started twice and
+    /// a cluster nobody is looking at can be found and stopped.
+    watching: std::collections::HashMap<(ClusterId, KindId), WatchFilters>,
+    /// How long a cluster stays warm after its last pane closes.
+    idle_timeout: Duration,
+    /// When idle clusters were last swept.
+    last_sweep: Instant,
     /// The most recent thing that went wrong locally, shown verbatim.
     last_error: Option<SharedString>,
 
@@ -280,7 +293,9 @@ impl Workspace {
             started,
             cold_start: None,
             attempted: HashSet::new(),
-            watching: None,
+            watching: std::collections::HashMap::new(),
+            idle_timeout: periscope_store::app::DEFAULT_IDLE_TIMEOUT,
+            last_sweep: started,
             last_error: None,
             namespace_input,
             selector_input,
@@ -322,9 +337,10 @@ impl Workspace {
         self.state.apply_batch(events.iter(), Instant::now());
 
         // Reading kubeconfig picks a cluster; opening it is what the user
-        // actually asked for by starting the app.
-        if let Some(active) = self.state.active().cloned() {
-            self.connect_once(active);
+        // actually asked for by starting the app. Every pane's cluster is
+        // connected, not just the focused one.
+        for cluster in self.state.clusters_in_view() {
+            self.connect_once(cluster);
         }
 
         // A tail asked for on the command line waits for the connection, not
@@ -343,13 +359,21 @@ impl Workspace {
         }
 
         // Discovery decides which kind can be opened, so the first watch can
-        // only start once the kinds have arrived.
-        if self.state.kind().is_none()
-            && let Some(default) = self.default_kind()
-        {
-            self.state.select_kind(default);
+        // only start once the kinds have arrived. Each pane picks its own,
+        // because two clusters need not serve the same kinds.
+        for index in 0..self.state.panes().len() {
+            if self.state.panes()[index].kind().is_none() {
+                let cluster = self.state.panes()[index].cluster().cloned();
+                if let Some(kind) = self.default_kind_of(cluster.as_ref()) {
+                    let focus = self.state.focus();
+                    self.state.focus_pane(index);
+                    self.state.select_kind(kind);
+                    self.state.focus_pane(focus);
+                }
+            }
         }
-        self.ensure_watch();
+        self.ensure_watches();
+        self.sweep_idle_clusters(Instant::now(), cx);
 
         cx.notify();
     }
@@ -357,6 +381,24 @@ impl Workspace {
     /// Running bridge counters.
     pub fn stats(&self) -> BridgeStats {
         self.stats
+    }
+
+    /// How many clusters are connected right now.
+    fn connected_clusters(&self) -> usize {
+        self.state
+            .contexts()
+            .iter()
+            .filter(|context| {
+                self.state
+                    .connection(&ClusterId::new(&*context.name))
+                    .is_some_and(|connection| {
+                        matches!(
+                            connection.state,
+                            ConnectionState::Connected | ConnectionState::Degraded { .. }
+                        )
+                    })
+            })
+            .count()
     }
 
     /// The state being rendered.
@@ -369,9 +411,15 @@ impl Workspace {
         self.palette_open
     }
 
-    /// Pods if the cluster serves them, otherwise the first watchable kind.
+    /// Pods if the focused pane's cluster serves them, otherwise the first
+    /// watchable kind.
     fn default_kind(&self) -> Option<KindId> {
-        let kinds = self.state.kinds();
+        self.default_kind_of(self.state.active())
+    }
+
+    /// The same, for any cluster.
+    fn default_kind_of(&self, cluster: Option<&ClusterId>) -> Option<KindId> {
+        let kinds = self.state.kinds_of(cluster);
         kinds
             .iter()
             .find(|info| info.id.is_core() && &*info.id.kind == "Pod")
@@ -379,44 +427,63 @@ impl Workspace {
             .map(|info| info.id.clone())
     }
 
-    /// Starts the watch the current view needs, if it is not already running.
-    fn ensure_watch(&mut self) {
-        let (Some(cluster), Some(kind)) =
-            (self.state.active().cloned(), self.state.kind().cloned())
-        else {
-            return;
-        };
+    /// Starts whatever watches the panes need, and stops none of them.
+    ///
+    /// A cluster that scrolls out of view keeps streaming: that is what makes
+    /// switching back instant. Letting go is the idle sweep's job.
+    fn ensure_watches(&mut self) {
+        for (cluster, kind, filters) in self.state.watch_targets() {
+            let wanted = (filters.namespace.clone(), filters.selector.clone());
+            let key = (cluster.clone(), kind.clone());
 
-        let namespace = self.state.filters().namespace.clone();
-        let selector = self.state.filters().selector.clone();
-        let wanted = (
-            cluster.clone(),
-            kind.clone(),
-            namespace.clone(),
-            selector.clone(),
-        );
-        if self.watching.as_ref() == Some(&wanted) {
-            return;
-        }
+            if self.watching.get(&key) == Some(&wanted) {
+                continue;
+            }
 
-        // One watch at a time: leaving the previous kind streaming would keep
-        // paying for data nothing is rendering.
-        if let Some((previous_cluster, previous_kind, ..)) = self.watching.take()
-            && (previous_cluster != cluster || previous_kind != kind)
-        {
-            self.send(ClusterCommand::StopWatch {
-                cluster: previous_cluster,
-                kind: previous_kind,
+            self.send(ClusterCommand::Watch {
+                cluster,
+                kind,
+                namespace: wanted.0.clone(),
+                selector: wanted.1.clone(),
             });
+            self.watching.insert(key, wanted);
         }
+    }
 
-        self.send(ClusterCommand::Watch {
-            cluster,
-            kind,
-            namespace,
-            selector,
-        });
-        self.watching = Some(wanted);
+    /// Stops watching clusters nobody has looked at for a while, and drops
+    /// their rows.
+    ///
+    /// Without this, opening ten clusters over a working day would leave ten
+    /// sets of watches running and ten tables in memory for the rest of the
+    /// session. The connection itself is kept: re-opening a cluster should not
+    /// mean re-running an exec plugin.
+    fn sweep_idle_clusters(&mut self, now: Instant, cx: &mut Context<Self>) {
+        if now.saturating_duration_since(self.last_sweep) < SWEEP_INTERVAL {
+            return;
+        }
+        self.last_sweep = now;
+
+        for cluster in self.state.idle_clusters(now, self.idle_timeout) {
+            let kinds: Vec<KindId> = self
+                .watching
+                .keys()
+                .filter(|(watched, _)| watched == &cluster)
+                .map(|(_, kind)| kind.clone())
+                .collect();
+
+            for kind in kinds {
+                tracing::info!(%cluster, %kind, "releasing an idle cluster");
+                self.send(ClusterCommand::StopWatch {
+                    cluster: cluster.clone(),
+                    kind: kind.clone(),
+                });
+                self.watching.remove(&(cluster.clone(), kind));
+            }
+
+            self.state.release(&cluster);
+            self.attempted.remove(&cluster);
+            cx.notify();
+        }
     }
 
     /// Reads the namespace and selector inputs and re-lists with them.
@@ -427,13 +494,15 @@ impl Workspace {
         self.state
             .set_namespace(Some(Arc::from(namespace.as_str())));
         self.state.set_selector(Some(Arc::from(selector.as_str())));
-        self.ensure_watch();
+        self.ensure_watches();
         cx.notify();
     }
 
-    /// Switches to a cluster, connecting to it if this session has not yet.
+    /// Points the focused pane at a cluster, connecting if this session has not
+    /// yet.
     fn select_cluster(&mut self, cluster: ClusterId, cx: &mut Context<Self>) {
         self.state.select_cluster(cluster.clone());
+        self.state.touch_cluster(&cluster, Instant::now());
         self.connect_once(cluster.clone());
 
         // The new cluster's kinds may not have arrived; the watch starts when
@@ -441,14 +510,14 @@ impl Workspace {
         if let Some(kind) = self.default_kind() {
             self.state.select_kind(kind);
         }
-        self.ensure_watch();
+        self.ensure_watches();
         cx.notify();
     }
 
     /// Switches which kind the table shows.
     fn select_kind(&mut self, kind: KindId, cx: &mut Context<Self>) {
         self.state.select_kind(kind);
-        self.ensure_watch();
+        self.ensure_watches();
         cx.notify();
     }
 
@@ -495,7 +564,7 @@ impl Workspace {
     /// owner reference or a palette hit does.
     fn open_elsewhere(&mut self, kind: KindId, key: ResourceKey, cx: &mut Context<Self>) {
         self.state.select_kind(kind.clone());
-        self.ensure_watch();
+        self.ensure_watches();
 
         if let Some(cluster) = self.state.active().cloned() {
             self.state.open_detail(kind.clone(), key.clone());
@@ -753,11 +822,38 @@ impl Workspace {
         }
     }
 
-    /// Retries the active cluster after a failure.
+    /// Shows two clusters side by side, or goes back to one.
+    fn toggle_split(&mut self, _: &ToggleSplit, _window: &mut Window, cx: &mut Context<Self>) {
+        let changed = if self.state.is_split() {
+            self.state.unsplit()
+        } else {
+            self.state.split()
+        };
+
+        if changed {
+            // The new pane's cluster may never have been opened.
+            if let Some(cluster) = self.state.active().cloned() {
+                self.connect_once(cluster);
+            }
+            if let Some(kind) = self.default_kind() {
+                self.state.select_kind(kind);
+            }
+            self.ensure_watches();
+            cx.notify();
+        }
+    }
+
+    /// Points commands at a pane.
+    pub fn focus_pane(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.state.focus_pane(index);
+        cx.notify();
+    }
+
+    /// Retries the focused pane's cluster after a failure.
     fn reconnect(&mut self, cx: &mut Context<Self>) {
         if let Some(cluster) = self.state.active().cloned() {
             self.attempted.insert(cluster.clone());
-            self.watching = None;
+            self.watching.retain(|(watched, _), _| watched != &cluster);
             self.send(ClusterCommand::Connect { cluster });
         }
         cx.notify();
@@ -805,8 +901,8 @@ impl Workspace {
         self.palette.rebuild(
             &clusters,
             self.state.kinds(),
-            self.state.kind(),
-            self.state.rows(),
+            self.state.all_rows(),
+            self.state.active(),
         );
         self.palette_matches = self.palette.search("");
         self.palette_index = 0;
@@ -868,7 +964,12 @@ impl Workspace {
         match found.candidate.target {
             Target::Cluster(name) => self.select_cluster(ClusterId::new(&*name), cx),
             Target::Kind(kind) => self.select_kind(kind, cx),
-            Target::Object { kind, key } => {
+            Target::Object { cluster, kind, key } => {
+                // A hit on another cluster moves the focused pane there first;
+                // otherwise the object would open against the wrong client.
+                if self.state.active() != Some(&cluster) {
+                    self.select_cluster(cluster, cx);
+                }
                 if self.state.kind() == Some(&kind) {
                     self.open_object(key, window, cx);
                 } else {
@@ -925,6 +1026,19 @@ impl Workspace {
                             })),
                     )
                     .child(
+                        Button::new("split")
+                            .outline()
+                            .small()
+                            .label(if self.state.is_split() {
+                                "Single  ⌘\\"
+                            } else {
+                                "Split  ⌘\\"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_split(&ToggleSplit, window, cx)
+                            })),
+                    )
+                    .child(
                         Button::new("reload")
                             .outline()
                             .small()
@@ -954,6 +1068,9 @@ impl Workspace {
             .map(|context| {
                 let id = ClusterId::new(&*context.name);
                 let selected = active.as_ref() == Some(&id);
+                let in_other_pane = self.state.panes().iter().enumerate().any(|(index, pane)| {
+                    index != self.state.focus() && pane.cluster() == Some(&id)
+                });
                 let connection = self.state.connection(&id);
                 let state = connection
                     .map(|connection| &connection.state)
@@ -983,7 +1100,16 @@ impl Workspace {
                                     .truncate()
                                     .text_color(cx.theme().foreground)
                                     .child(context.name.to_string()),
-                            ),
+                            )
+                            // A cluster open in the other pane is still open;
+                            // showing only the focused one would read as if it
+                            // had been closed.
+                            .children(in_other_pane.then(|| {
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("◫")
+                            })),
                     )
             })
             .collect();
@@ -1174,6 +1300,13 @@ impl Workspace {
                 h_flex()
                     .gap_2()
                     .child(format!("{} kinds · {state}", self.state.kinds().len()))
+                    // What every warm cluster is costing, in the units the
+                    // budget is written in.
+                    .child(format!(
+                        "· {} connected · {} rows held",
+                        self.connected_clusters(),
+                        self.state.total_rows()
+                    ))
                     .children(stale),
             )
             .child(
@@ -1187,18 +1320,25 @@ impl Workspace {
             )
     }
 
-    /// The table, or an explanation of why there is no table.
-    fn content(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.state.rows_shared();
-        let columns: Arc<[periscope_bridge::ColumnSpec]> = Arc::from(self.state.columns().to_vec());
-        let namespaced = self
-            .state
+    /// One pane: its cluster, its table, and whether it has focus.
+    fn pane_view(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let pane = &self.state.panes()[index];
+        let focused = self.state.focus() == index;
+        let split = self.state.is_split();
+
+        let rows = pane.rows_shared();
+        let columns: Arc<[periscope_bridge::ColumnSpec]> = Arc::from(pane.columns().to_vec());
+        let namespaced = pane
             .kind()
             .and_then(|kind| self.state.kind_info(kind))
             .is_none_or(|info| info.namespaced);
 
+        let connection = pane
+            .cluster()
+            .and_then(|cluster| self.state.connection(cluster));
+
         let body = if rows.is_empty() {
-            let message = match self.state.active_connection().map(|c| &c.state) {
+            let message = match connection.map(|connection| &connection.state) {
                 None => "Select a context to connect.".to_owned(),
                 Some(ConnectionState::Connecting) => "Connecting…".to_owned(),
                 Some(ConnectionState::Idle) => "Not connected.".to_owned(),
@@ -1207,10 +1347,7 @@ impl Workspace {
                 Some(state) if state.is_problem() => {
                     format!("No rows to show — the cluster is {}.", state.label())
                 }
-                Some(_) if self.state.counts().0 > 0 => {
-                    "Nothing matches the current filter.".to_owned()
-                }
-                Some(_) => match self.state.kind() {
+                Some(_) => match pane.kind() {
                     Some(kind) => format!("No {kind} here."),
                     None => "No kind selected.".to_owned(),
                 },
@@ -1219,6 +1356,7 @@ impl Workspace {
         } else {
             table::body(
                 cx.entity(),
+                index,
                 rows,
                 columns.clone(),
                 namespaced,
@@ -1228,13 +1366,75 @@ impl Workspace {
             .into_any_element()
         };
 
+        // Only a split needs a per-pane header: with one pane the window's own
+        // header already says which cluster this is.
+        let header = split.then(|| {
+            let cluster = pane
+                .cluster()
+                .map(ClusterId::to_string)
+                .unwrap_or_else(|| "no cluster".to_owned());
+            let kind = pane
+                .kind()
+                .map(KindId::label)
+                .unwrap_or_else(|| "no kind".to_owned());
+            let state = connection
+                .map(|connection| &connection.state)
+                .unwrap_or(&ConnectionState::Idle);
+
+            h_flex()
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .bg(if focused {
+                    cx.theme().accent
+                } else {
+                    cx.theme().secondary
+                })
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(div().size(px(8.)).rounded_full().bg(state_color(state, cx)))
+                .child(
+                    div()
+                        .text_xs()
+                        .truncate()
+                        .text_color(cx.theme().foreground)
+                        .child(format!("{cluster} · {kind}")),
+                )
+        });
+
         v_flex()
+            .id(SharedString::from(format!("pane-{index}")))
             .flex_1()
             .h_full()
             .overflow_hidden()
-            .child(self.toolbar(cx))
+            .when(split && focused, |pane| {
+                pane.border_l_2().border_color(cx.theme().accent)
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.focus_pane(index, cx)))
+            .children(header)
+            .children((index == self.state.focus()).then(|| self.toolbar(cx)))
             .child(table::header(&columns, namespaced, cx))
             .child(body)
+    }
+
+    /// The table area: one pane, or two side by side.
+    fn content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.state.is_split() {
+            return v_flex()
+                .flex_1()
+                .h_full()
+                .overflow_hidden()
+                .child(self.pane_view(0, cx))
+                .into_any_element();
+        }
+
+        h_resizable("panes")
+            .child(resizable_panel().child(self.pane_view(0, cx)))
+            .child(resizable_panel().child(self.pane_view(1, cx)))
+            .into_any_element()
     }
 
     /// The log view: toolbar, source legend, and the lines themselves.
@@ -1781,6 +1981,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::toggle_logs))
             .on_action(cx.listener(Self::toggle_follow))
+            .on_action(cx.listener(Self::toggle_split))
             .child(
                 v_flex()
                     .size_full()
@@ -2070,7 +2271,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn switching_kinds_stops_the_previous_watch(cx: &mut TestAppContext) {
+    fn switching_kinds_leaves_the_previous_watch_running(cx: &mut TestAppContext) {
         let (harness, rx) = workspace(cx);
         apply(
             &harness,
@@ -2083,23 +2284,212 @@ mod tests {
             workspace.select_kind(deployments(), cx);
         });
 
-        // Leaving the old watch running would keep paying for data nothing
-        // renders.
+        // Phase 4 keeps what you have looked at warm: switching back must not
+        // re-list. Letting go is the idle sweep's job, not the switch's.
         assert_eq!(
             drain(&rx),
-            vec![
-                ClusterCommand::StopWatch {
-                    cluster: ClusterId::new("prod"),
-                    kind: pods(),
-                },
-                ClusterCommand::Watch {
-                    cluster: ClusterId::new("prod"),
-                    kind: deployments(),
-                    namespace: None,
-                    selector: None,
-                },
-            ]
+            vec![ClusterCommand::Watch {
+                cluster: ClusterId::new("prod"),
+                kind: deployments(),
+                namespace: None,
+                selector: None,
+            }]
         );
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.select_kind(pods(), cx);
+        });
+        assert!(
+            drain(&rx).is_empty(),
+            "going back to a warm kind should re-request nothing"
+        );
+    }
+
+    #[gpui::test]
+    fn a_cluster_nobody_is_looking_at_is_let_go_after_the_idle_timeout(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod", "staging"], "prod"), kinds_event("prod")],
+        );
+        apply(&harness, cx, vec![reset("prod", pods(), &["api-0"])]);
+        drain(&rx);
+
+        // Move both the pane and the clock along.
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.select_cluster(ClusterId::new("staging"), cx);
+        });
+        drain(&rx);
+
+        let later = Instant::now() + Duration::from_secs(3_600);
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.sweep_idle_clusters(later, cx);
+        });
+
+        assert_eq!(
+            drain(&rx),
+            vec![ClusterCommand::StopWatch {
+                cluster: ClusterId::new("prod"),
+                kind: pods(),
+            }]
+        );
+        harness.read(cx, |workspace| {
+            // Its rows go with it: warm is a memory cost, and this is where it
+            // is given back.
+            assert_eq!(workspace.state().cluster_rows(&ClusterId::new("prod")), 0);
+        });
+    }
+
+    #[gpui::test]
+    fn splitting_opens_a_second_cluster_and_watches_it(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![
+                contexts(&["prod", "staging"], "prod"),
+                kinds_event("prod"),
+                kinds_event("staging"),
+            ],
+        );
+        drain(&rx);
+
+        harness.keys(cx, "cmd-\\");
+
+        let sent = drain(&rx);
+        assert!(
+            sent.contains(&ClusterCommand::Connect {
+                cluster: ClusterId::new("staging")
+            }),
+            "the second pane's cluster should be connected: {sent:?}"
+        );
+        assert!(
+            sent.contains(&ClusterCommand::Watch {
+                cluster: ClusterId::new("staging"),
+                kind: pods(),
+                namespace: None,
+                selector: None,
+            }),
+            "the second pane should be watching: {sent:?}"
+        );
+
+        harness.read(cx, |workspace| {
+            assert!(workspace.state().is_split());
+            assert_eq!(workspace.state().panes().len(), 2);
+            assert_eq!(
+                workspace.state().panes()[0].cluster(),
+                Some(&ClusterId::new("prod"))
+            );
+            assert_eq!(
+                workspace.state().panes()[1].cluster(),
+                Some(&ClusterId::new("staging"))
+            );
+        });
+
+        harness.keys(cx, "cmd-\\");
+        assert!(!harness.read(cx, |workspace| workspace.state().is_split()));
+    }
+
+    #[gpui::test]
+    fn both_panes_render_their_own_cluster(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![
+                contexts(&["prod", "staging"], "prod"),
+                kinds_event("prod"),
+                kinds_event("staging"),
+            ],
+        );
+        harness.keys(cx, "cmd-\\");
+        drain(&rx);
+
+        apply(
+            &harness,
+            cx,
+            vec![
+                reset("prod", pods(), &["prod-a", "prod-b"]),
+                reset("staging", pods(), &["staging-a"]),
+            ],
+        );
+
+        harness.read(cx, |workspace| {
+            let panes = workspace.state().panes();
+            assert_eq!(panes[0].rows().len(), 2);
+            assert_eq!(panes[1].rows().len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn one_broken_cluster_does_not_disturb_the_other_pane(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![
+                contexts(&["prod", "staging"], "prod"),
+                kinds_event("prod"),
+                kinds_event("staging"),
+            ],
+        );
+        harness.keys(cx, "cmd-\\");
+        drain(&rx);
+
+        apply(
+            &harness,
+            cx,
+            vec![
+                reset("prod", pods(), &["prod-a"]),
+                ClusterEvent::Status {
+                    cluster: "staging".into(),
+                    state: ConnectionState::AuthFailed {
+                        reason: "token expired".into(),
+                    },
+                },
+            ],
+        );
+
+        harness.read(cx, |workspace| {
+            // The healthy pane still has its rows, and the broken one still
+            // says exactly what went wrong.
+            assert_eq!(workspace.state().panes()[0].rows().len(), 1);
+            let staging = workspace
+                .state()
+                .connection(&ClusterId::new("staging"))
+                .expect("tracked");
+            assert_eq!(staging.state.detail(), Some("token expired"));
+            let prod = workspace
+                .state()
+                .connection(&ClusterId::new("prod"))
+                .expect("tracked");
+            assert!(!prod.state.is_problem());
+        });
+    }
+
+    #[gpui::test]
+    fn the_palette_finds_objects_on_a_cluster_that_is_not_on_screen(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod", "staging"], "prod"), kinds_event("prod")],
+        );
+        // Rows for a cluster no pane is showing.
+        apply(&harness, cx, vec![reset("staging", pods(), &["needle-0"])]);
+        drain(&rx);
+
+        harness.keys(cx, "cmd-k");
+        harness.keys(cx, "n e e d l e");
+        harness.keys(cx, "enter");
+
+        harness.read(cx, |workspace| {
+            // Jumping moved the pane to the cluster the object is on.
+            assert_eq!(workspace.state().active(), Some(&ClusterId::new("staging")));
+            let detail = workspace.state().detail().expect("the object opened");
+            assert_eq!(&*detail.key().name, "needle-0");
+        });
     }
 
     #[gpui::test]

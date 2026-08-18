@@ -5,13 +5,13 @@ affordances: live resource streams, multi-cluster, and log tailing across pods.
 
 **Binary:** `scope` · **Language:** Rust · **UI:** GPUI
 
-> **Status: Phase 3 (logs).** Connects to a kubeconfig context, discovers every
-> kind the cluster serves — CRDs included — streams any of them into a
-> virtualised table, and tails logs from one pod or from every pod matching a
-> label selector, merged into one stream that re-attaches by itself when a pod
-> is replaced. Fuzzy jump palette (⌘K), filters everywhere, and a detail pane
-> with YAML, events and owner-reference navigation. Read-only. Multi-cluster is
-> Phase 4. See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap and
+> **Status: Phase 4 (multi-cluster).** Connects to kubeconfig contexts on
+> demand, discovers every kind each serves — CRDs included — streams any of them
+> into a virtualised table, tails logs from one pod or from every pod matching a
+> label selector, and shows two clusters side by side. Clusters you have visited
+> stay warm, so switching back is instant. Fuzzy jump palette (⌘K) searches
+> every warm cluster at once. Read-only until Phase 5. See
+> [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap and
 > [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not work.
 
 ## Build and run
@@ -38,6 +38,7 @@ cold-start budget by a wide margin (`docs/LIMITATIONS.md`).
 | `enter` in the namespace or selector field | Re-list with that filter |
 | `⌘L` / `ctrl-L` | Tail the open pod, or every pod matching the current namespace + selector |
 | `⌘⇧F` | Follow the newest line, or pause where you are |
+| `⌘\` | Show two clusters side by side, or go back to one |
 
 Logs are written to a daily-rotating file under the platform's application data
 directory; the path is printed in the log's first line and shown by `--verbose`.
@@ -78,6 +79,18 @@ cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fi
 
 Architecture decisions are recorded in [`docs/DECISIONS.md`](docs/DECISIONS.md) —
 append, never rewrite.
+
+## Several clusters
+
+Clusters connect when you first look at one, not at startup, and keep streaming
+after you move away — switching back shows what is already held rather than
+re-listing. `⌘\` splits the window so two clusters sit side by side; clicking a
+pane points the sidebar, the filters and the palette at it. A cluster nobody has
+looked at for five minutes is let go: its watches stop and its rows are freed,
+while its connection is kept so returning does not mean authenticating again.
+
+The palette searches every warm cluster, not just the one on screen, and says
+which cluster a hit is on when it is not the one you are looking at.
 
 ## Logs
 

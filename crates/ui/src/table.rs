@@ -145,6 +145,7 @@ fn row(
 /// pane, which is why the workspace entity comes along.
 pub fn body(
     workspace: Entity<Workspace>,
+    pane: usize,
     rows: Arc<[Arc<ResourceRow>]>,
     columns: Arc<[ColumnSpec]>,
     namespaced: bool,
@@ -154,7 +155,7 @@ pub fn body(
     let count = rows.len();
 
     uniform_list(
-        "resources",
+        SharedString::from(format!("resources-{pane}")),
         count,
         move |range, _window: &mut Window, cx: &mut App| {
             range
@@ -175,6 +176,9 @@ pub fn body(
                     .hover(|row| row.bg(cx.theme().accent.opacity(0.5)))
                     .on_click(move |_, window, cx| {
                         workspace.update(cx, |workspace, cx| {
+                            // Clicking a row is also how a pane is focused:
+                            // the object opens in the pane it was clicked in.
+                            workspace.focus_pane(pane, cx);
                             workspace.open_object(key.clone(), window, cx);
                         });
                     })

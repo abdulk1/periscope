@@ -42,6 +42,25 @@ therefore tracked against `--release`. Some of the debug cost is the runtime
 shader compilation from ADR-0008; the rest is unoptimised GPUI layout code that
 the `[profile.dev.package]` overrides only partly cover.
 
+## Phase 4 scope
+
+Several clusters at once: lazy connect when a pane first points at one, warm
+watches so switching back is instant, a split view showing two clusters side by
+side, cross-cluster search in the palette, and a per-cluster row budget.
+
+What is **not** there:
+
+- **More than two panes**, tear-off tabs or saved layouts. Two resizable panes,
+  not the docking framework (ADR-0027).
+- **Per-pane logs.** A tail belongs to the focused pane's cluster and closes
+  when that pane changes cluster; two tails at once is not supported.
+- **Configurable timeouts.** The five-minute idle timeout and 200,000-row budget
+  are constants. The config file is Phase 6, and that is where they belong.
+- **A cross-cluster table.** Search finds objects on any warm cluster and jumps
+  to them, but there is no view that lists two clusters' pods in one table.
+- **Cluster groups or profiles.** Contexts come from kubeconfig, in kubeconfig
+  order, with no grouping, pinning or renaming.
+
 ## Phase 3 scope
 
 Logs work: one pod or every pod matching a label selector, merged into one
@@ -101,6 +120,9 @@ kinds and seeded with 10,009 pods, release build:
 | Ingest 10,000 lines/second without unbounded memory | 40,000–53,000 lines/second ingested from an unthrottled fixture; resident memory flat at ~104MB with a full 100,000-line buffer |
 | Filter a 500k-line buffer in under 100ms | Well inside, for substring and regex alike (release builds; a debug build is several times slower and the test says so) |
 | Pod restart during a tail reconnects within 2s | 355ms from deleting a pod to lines arriving from its replacement |
+| 5 clusters connected simultaneously stay under 800MB | Five clusters holding 50,110 rows: **29MB** resident, flat over a 45s soak. See the caveat below |
+| Switching between clusters is instant | Under a millisecond for a warm cluster; the rows are already held, so switching is a selection and a filter pass |
+| One unreachable cluster degrades only its own pane | Verified: a context pointing at a closed port reports its own failure with the real reason while its neighbours connect and stream normally |
 
 The load fixture is `cargo run --release -p periscope-e2e --bin seed-pods`.
 
@@ -141,6 +163,26 @@ The `kind`-based suite lives in `tests/e2e` and is `#[ignore]`d, because it need
 a real cluster. It is not run by `cargo test` and has never run in CI; every
 end-to-end result quoted here was produced locally with
 `cargo test -p periscope-e2e -- --ignored --test-threads 1`.
+
+## The five-cluster measurement is five contexts, one apiserver
+
+The multi-cluster budget was measured with five kubeconfig contexts all pointing
+at the same `kind` apiserver, plus one pointing at a closed port. That is five
+independent clients, five sets of watches, five sets of tables and five
+connection state machines inside Periscope — which is what the budget is about —
+but it is **not** five real clusters. Not measured this way:
+
+- Per-cluster variation in object counts, CRDs or API versions.
+- The apiserver-side cost of five genuinely separate control planes.
+- Network latency differences between clusters, which is exactly what makes one
+  slow cluster interesting.
+
+Separately, the **application** has not been run with five clusters connected at
+once: it connects lazily, a pane per cluster, and only two panes exist — so
+reaching five would need clicks the sandbox cannot send. The app's own footprint
+was measured at 87–105MB with one cluster and 10,000 pods; the five-cluster data
+cost measured above is 29MB on top of that, which is how the 800MB budget is
+argued rather than directly observed.
 
 ## Authentication coverage
 
