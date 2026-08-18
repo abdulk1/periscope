@@ -21,10 +21,29 @@ for the same one-node cluster.
 |---|---|
 | `tests/kind.rs` | Listing pods, live create/delete latency, disconnect, and the 10k-pod list budget |
 | `tests/auth.rs` | A credential the apiserver rejects, a missing kubeconfig, and a context that does not exist |
+| `tests/exec_auth.rs` | Exec credential plugins shaped like EKS's and GKE's, including the real `aws` CLI |
+| `tests/discovery.rs` | Discovery with CRDs, generic tables, filters, secret masking, and the detail fetch |
+| `tests/logs.rs` | Tailing one pod and fifty, merging, re-attach after a restart, and the ingest-rate budget |
 
 The auth tests write a throwaway kubeconfig into the temp directory and point the
 app at it with `--kubeconfig`'s programmatic equivalent, so the developer's own
 kubeconfig is never touched.
+
+## Workload fixtures
+
+Two of the suites need workloads that produce something to read:
+
+```sh
+kubectl apply -f tests/e2e/fixtures/chatty.yaml     # three pods, five lines a second each
+kubectl apply -f tests/e2e/fixtures/firehose.yaml   # four pods writing as fast as they can
+kubectl delete -f tests/e2e/fixtures/firehose.yaml  # it burns CPU; delete it when done
+```
+
+`chatty` scales up for the "tail fifty pods" measurement:
+`kubectl scale deployment chatty --replicas=50`.
+
+The CRD-heavy discovery test needs cert-manager and Argo CD installed; the test
+says so when they are missing.
 
 ## Load fixture
 

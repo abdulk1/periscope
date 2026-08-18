@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod errors;
 pub mod handler;
 pub mod kubeconfig;
+pub mod logs;
 pub mod pods;
 pub mod watch;
 

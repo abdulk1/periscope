@@ -21,14 +21,14 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use periscope_bridge::{
     ClusterCommand, ClusterEvent, ClusterId, CommandError, CommandSender, ConnectionState,
-    FlushStats, KindId, ResourceKey,
+    FlushStats, KindId, LogTarget, ResourceKey,
 };
 use periscope_config::ThemeChoice;
-use periscope_store::{AppState, Detail};
+use periscope_store::{AppState, Detail, FilterSpec};
 
 use crate::palette::{Palette, Target};
 use crate::perf::FrameMeter;
-use crate::{table, theme};
+use crate::{logview, table, theme};
 
 actions!(
     periscope,
@@ -43,6 +43,10 @@ actions!(
         SelectPrevious,
         /// Jump to the highlighted palette result.
         Confirm,
+        /// Tail the logs of whatever is selected.
+        ToggleLogs,
+        /// Stick the log view to the newest line, or let it stay put.
+        ToggleFollow,
     ]
 );
 
@@ -58,6 +62,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("down", SelectNext, Some("Palette")),
         KeyBinding::new("up", SelectPrevious, Some("Palette")),
         KeyBinding::new("enter", Confirm, Some("Palette")),
+        KeyBinding::new("cmd-l", ToggleLogs, None),
+        KeyBinding::new("ctrl-l", ToggleLogs, None),
+        KeyBinding::new("cmd-shift-f", ToggleFollow, None),
     ]);
 }
 
@@ -117,6 +124,16 @@ pub struct Workspace {
     /// Which object's YAML the editor currently holds.
     yaml_showing: Option<ResourceKey>,
 
+    log_filter_input: Entity<InputState>,
+    log_selector_input: Entity<InputState>,
+    log_container_input: Entity<InputState>,
+    log_scroll: gpui::UniformListScrollHandle,
+    /// How many lines were visible last frame, so following only scrolls when
+    /// there is something new to scroll to.
+    log_visible: usize,
+    /// What the log view last told the user about an export.
+    log_notice: Option<SharedString>,
+
     palette: Palette,
     palette_open: bool,
     palette_input: Entity<InputState>,
@@ -124,6 +141,12 @@ pub struct Workspace {
     palette_index: usize,
     palette_focus: FocusHandle,
 
+    /// A tail asked for on the command line, opened once the cluster connects.
+    pending_tail: Option<Arc<LogTarget>>,
+    /// How many lines a session keeps before dropping the oldest.
+    log_capacity: usize,
+    /// Counts exports, so two in one session do not overwrite each other.
+    exports: u32,
     /// Frame timing, collected only under `--perf`.
     frames: FrameMeter,
     _subscriptions: Vec<Subscription>,
@@ -155,6 +178,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_tail(commands, started, perf, None, window, cx)
+    }
+
+    /// Builds the root view and opens a tail as soon as the cluster connects.
+    ///
+    /// This is what `--tail` uses: it is also the only way to measure the log
+    /// view under load in an environment where nothing can click a button.
+    pub fn with_tail(
+        commands: CommandSender,
+        started: Instant,
+        perf: bool,
+        tail: Option<LogTarget>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(TICK).await;
@@ -170,6 +208,10 @@ impl Workspace {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("filter rows"));
         let palette_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("jump to a kind or object"));
+        let log_filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("filter lines"));
+        let log_selector_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("label selector (all pods)"));
+        let log_container_input = cx.new(|cx| InputState::new(window, cx).placeholder("container"));
         let yaml_view = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -195,6 +237,24 @@ impl Workspace {
             cx.subscribe(&selector_input, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.apply_server_filters(cx);
+                }
+            }),
+            // Filtering never restarts the stream, so it applies as it is typed.
+            cx.subscribe(&log_filter_input, |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let pattern = input.read(cx).value().to_string();
+                    this.apply_log_filter(pattern, cx);
+                }
+            }),
+            // Re-targeting does restart it, so those apply on Enter.
+            cx.subscribe(&log_selector_input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.retarget_logs(cx);
+                }
+            }),
+            cx.subscribe(&log_container_input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.retarget_logs(cx);
                 }
             }),
             cx.subscribe(&palette_input, |this, input, event: &InputEvent, cx| {
@@ -225,6 +285,12 @@ impl Workspace {
             namespace_input,
             selector_input,
             search_input,
+            log_filter_input,
+            log_selector_input,
+            log_container_input,
+            log_scroll: gpui::UniformListScrollHandle::new(),
+            log_visible: 0,
+            log_notice: None,
             yaml_view,
             yaml_showing: None,
             palette: Palette::new(),
@@ -233,6 +299,9 @@ impl Workspace {
             palette_matches: Vec::new(),
             palette_index: 0,
             palette_focus: root_focus,
+            pending_tail: tail.map(Arc::new),
+            log_capacity: periscope_store::logs::DEFAULT_CAPACITY,
+            exports: 0,
             frames: FrameMeter::new(perf),
             _subscriptions: subscriptions,
             _ticker: ticker,
@@ -256,6 +325,21 @@ impl Workspace {
         // actually asked for by starting the app.
         if let Some(active) = self.state.active().cloned() {
             self.connect_once(active);
+        }
+
+        // A tail asked for on the command line waits for the connection, not
+        // for discovery: logs need no kind.
+        if let (Some(target), Some(cluster)) =
+            (self.pending_tail.clone(), self.state.active().cloned())
+            && self
+                .state
+                .connection(&cluster)
+                .is_some_and(|connection| connection.state == ConnectionState::Connected)
+        {
+            self.pending_tail = None;
+            self.state
+                .open_logs(cluster.clone(), Arc::clone(&target), self.log_capacity);
+            self.send(ClusterCommand::StartLogs { cluster, target });
         }
 
         // Discovery decides which kind can be opened, so the first watch can
@@ -425,6 +509,243 @@ impl Workspace {
         cx.notify();
     }
 
+    // --- logs ---------------------------------------------------------------
+
+    /// Tails whatever is selected, or closes the tail if one is open.
+    fn toggle_logs(&mut self, _: &ToggleLogs, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.logs().is_some() {
+            self.close_logs(cx);
+            return;
+        }
+        self.open_logs(window, cx);
+    }
+
+    /// Opens a tail for the object in the detail pane, or for the pods the
+    /// table's filters describe.
+    fn open_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cluster) = self.state.active().cloned() else {
+            return;
+        };
+
+        let target = match self.log_target() {
+            Ok(target) => target,
+            Err(reason) => {
+                self.log_notice = Some(SharedString::from(reason));
+                cx.notify();
+                return;
+            }
+        };
+
+        self.log_notice = None;
+        self.log_selector_input.update(cx, |input, cx| {
+            let value = match &target.selector {
+                periscope_bridge::LogSelector::Labels(selector) => selector.to_string(),
+                periscope_bridge::LogSelector::Pod(_) => String::new(),
+            };
+            input.set_value(value, window, cx);
+        });
+
+        let target = Arc::new(target);
+        self.state
+            .open_logs(cluster.clone(), Arc::clone(&target), self.log_capacity);
+        self.send(ClusterCommand::StartLogs { cluster, target });
+        cx.notify();
+    }
+
+    /// Works out what to tail, or why nothing can be.
+    ///
+    /// A pod in the detail pane is the obvious case. Otherwise the table's own
+    /// filters say it: a label selector picks the pods, and a namespace is
+    /// required because logs are a pod subresource — there is no cluster-wide
+    /// log endpoint to fall back on.
+    fn log_target(&self) -> Result<LogTarget, String> {
+        let container = self
+            .state
+            .logs()
+            .and_then(|session| session.target.container.as_ref().map(Arc::clone));
+
+        if let Some(detail) = self.state.detail()
+            && detail.kind().is_core()
+            && &*detail.kind().kind == "Pod"
+        {
+            return Ok(
+                LogTarget::pod(&*detail.key().namespace, &*detail.key().name).container(container),
+            );
+        }
+
+        let filters = self.state.filters();
+        let Some(namespace) = filters.namespace.clone() else {
+            return Err(
+                "Open a pod, or set a namespace filter, before tailing logs: log streams are \
+                 per-namespace."
+                    .to_owned(),
+            );
+        };
+
+        match filters.selector.clone() {
+            Some(selector) => Ok(LogTarget::labels(&*namespace, &*selector).container(container)),
+            None => Err(format!(
+                "Set a label selector to tail every pod in {namespace}, or open one pod."
+            )),
+        }
+    }
+
+    /// Restarts the session with whatever the selector and container fields say.
+    fn retarget_logs(&mut self, cx: &mut Context<Self>) {
+        let (Some(cluster), Some(session)) = (self.state.active().cloned(), self.state.logs())
+        else {
+            return;
+        };
+
+        let namespace = Arc::clone(&session.target.namespace);
+        let previous = session.target.previous;
+        let selector = self.log_selector_input.read(cx).value().to_string();
+        let container = self.log_container_input.read(cx).value().to_string();
+        let container = (!container.is_empty()).then(|| Arc::from(container.as_str()));
+
+        let target = if selector.is_empty() {
+            match &session.target.selector {
+                periscope_bridge::LogSelector::Pod(pod) => LogTarget::pod(&*namespace, &**pod),
+                periscope_bridge::LogSelector::Labels(_) => {
+                    self.log_notice = Some(SharedString::from(
+                        "A selector is needed to tail several pods.",
+                    ));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            LogTarget::labels(&*namespace, selector.as_str())
+        };
+
+        let target = Arc::new(target.container(container).previous(previous));
+        self.state
+            .open_logs(cluster.clone(), Arc::clone(&target), self.log_capacity);
+        self.send(ClusterCommand::StartLogs { cluster, target });
+        cx.notify();
+    }
+
+    /// Switches between the running container's logs and the previous one's.
+    fn toggle_previous(&mut self, cx: &mut Context<Self>) {
+        let (Some(cluster), Some(session)) = (self.state.active().cloned(), self.state.logs())
+        else {
+            return;
+        };
+
+        let target = Arc::new(LogTarget {
+            previous: !session.target.previous,
+            ..(*session.target).clone()
+        });
+        self.state
+            .open_logs(cluster.clone(), Arc::clone(&target), self.log_capacity);
+        self.send(ClusterCommand::StartLogs { cluster, target });
+        cx.notify();
+    }
+
+    fn close_logs(&mut self, cx: &mut Context<Self>) {
+        if let Some(cluster) = self.state.active().cloned() {
+            self.send(ClusterCommand::StopLogs { cluster });
+        }
+        self.state.close_logs();
+        self.log_notice = None;
+        cx.notify();
+    }
+
+    /// Applies the filter box to the open session.
+    fn apply_log_filter(&mut self, pattern: String, cx: &mut Context<Self>) {
+        let Some(session) = self.state.logs() else {
+            return;
+        };
+        let spec = FilterSpec {
+            pattern,
+            regex: session.buffer.filter().regex,
+            case_sensitive: session.buffer.filter().case_sensitive,
+        };
+        if self.state.set_log_filter(spec) {
+            cx.notify();
+        }
+    }
+
+    /// Flips one of the filter's modes without touching the pattern.
+    fn toggle_filter_mode(&mut self, regex: bool, cx: &mut Context<Self>) {
+        let Some(session) = self.state.logs() else {
+            return;
+        };
+        let current = session.buffer.filter().clone();
+        let spec = if regex {
+            FilterSpec {
+                regex: !current.regex,
+                ..current
+            }
+        } else {
+            FilterSpec {
+                case_sensitive: !current.case_sensitive,
+                ..current
+            }
+        };
+        if self.state.set_log_filter(spec) {
+            cx.notify();
+        }
+    }
+
+    fn toggle_follow(&mut self, _: &ToggleFollow, _window: &mut Window, cx: &mut Context<Self>) {
+        let following = self
+            .state
+            .logs()
+            .map(|session| !session.following)
+            .unwrap_or(true);
+        self.state.set_following(following);
+        cx.notify();
+    }
+
+    /// Copies the visible lines to the clipboard.
+    fn copy_logs(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.state.logs() else {
+            return;
+        };
+        let text = session.buffer.to_text();
+        let lines = session.buffer.visible_len();
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.log_notice = Some(SharedString::from(format!("Copied {lines} lines")));
+        cx.notify();
+    }
+
+    /// Writes the visible lines to a file and says where it went.
+    fn export_logs(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.state.logs() else {
+            return;
+        };
+
+        let name = format!(
+            "periscope-{}-{}.log",
+            session
+                .target
+                .label()
+                .replace(['/', ' ', '[', ']', '(', ')'], "-"),
+            self.exports
+        );
+        self.exports += 1;
+
+        let path = periscope_config::paths::export_dir()
+            .map(|dir| dir.join(&name))
+            .and_then(|path| {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, session.buffer.to_text())?;
+                Ok(path)
+            });
+
+        self.log_notice = Some(SharedString::from(match path {
+            Ok(path) => format!("Exported to {}", path.display()),
+            // Failing to write a file is not a reason to lose the logs; say
+            // what happened and leave them on screen.
+            Err(error) => format!("Could not export: {error}"),
+        }));
+        cx.notify();
+    }
+
     /// Connects to a cluster once per session. Reconnecting is explicit.
     fn connect_once(&mut self, cluster: ClusterId) {
         if self.attempted.insert(cluster.clone()) {
@@ -507,6 +828,8 @@ impl Workspace {
     fn dismiss(&mut self, _: &Dismiss, _window: &mut Window, cx: &mut Context<Self>) {
         if self.palette_open {
             self.close_palette(cx);
+        } else if self.state.logs().is_some() {
+            self.close_logs(cx);
         } else if self.state.detail().is_some() {
             self.state.close_detail();
             self.yaml_showing = None;
@@ -914,6 +1237,194 @@ impl Workspace {
             .child(body)
     }
 
+    /// The log view: toolbar, source legend, and the lines themselves.
+    fn log_pane(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let session = self.state.logs()?;
+        let buffer = &session.buffer;
+        let spec = buffer.filter();
+        let show_source = buffer.sources().len() > 1
+            || matches!(
+                session.target.selector,
+                periscope_bridge::LogSelector::Labels(_)
+            );
+
+        let counts = if buffer.visible_len() == buffer.len() {
+            format!("{} lines", buffer.len())
+        } else {
+            format!("{} of {} lines", buffer.visible_len(), buffer.len())
+        };
+        let dropped = (buffer.dropped() > 0).then(|| format!("· {} dropped", buffer.dropped()));
+        let streaming = format!("· {} streaming", buffer.streaming());
+
+        let toolbar = h_flex()
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                Button::new("follow")
+                    .outline()
+                    .small()
+                    .label(if session.following {
+                        "Following"
+                    } else {
+                        "Paused"
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_follow(&ToggleFollow, window, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .w(px(200.))
+                    .child(Input::new(&self.log_filter_input).small()),
+            )
+            .child(
+                Button::new("regex")
+                    .outline()
+                    .small()
+                    .label(if spec.regex { ".* on" } else { ".* off" })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_mode(true, cx))),
+            )
+            .child(
+                Button::new("case")
+                    .outline()
+                    .small()
+                    .label(if spec.case_sensitive { "Aa" } else { "aa" })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_mode(false, cx))),
+            )
+            .child(
+                div()
+                    .w(px(180.))
+                    .child(Input::new(&self.log_selector_input).small()),
+            )
+            .child(
+                div()
+                    .w(px(130.))
+                    .child(Input::new(&self.log_container_input).small()),
+            )
+            .child(
+                Button::new("previous")
+                    .outline()
+                    .small()
+                    .label(if session.target.previous {
+                        "Previous"
+                    } else {
+                        "Current"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_previous(cx))),
+            )
+            .child(
+                Button::new("copy-logs")
+                    .outline()
+                    .small()
+                    .label("Copy")
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_logs(cx))),
+            )
+            .child(
+                Button::new("export-logs")
+                    .outline()
+                    .small()
+                    .label("Export")
+                    .on_click(cx.listener(|this, _, _, cx| this.export_logs(cx))),
+            )
+            .child(
+                Button::new("close-logs")
+                    .outline()
+                    .small()
+                    .label("Close")
+                    .on_click(cx.listener(|this, _, _, cx| this.close_logs(cx))),
+            );
+
+        // Anything the session wants to say — a failure, a bad pattern, where
+        // an export went — goes on one line rather than into a dialog.
+        let notice = buffer
+            .error()
+            .map(|reason| (reason.to_owned(), true))
+            .or_else(|| {
+                buffer
+                    .filter_error()
+                    .map(|reason| (format!("filter: {reason}"), true))
+            })
+            .or_else(|| {
+                self.log_notice
+                    .as_ref()
+                    .map(|notice| (notice.to_string(), false))
+            });
+
+        let lines = Arc::<[Arc<periscope_bridge::LogLine>]>::from(buffer.visible_lines());
+        let body = if lines.is_empty() {
+            let message = if !buffer.is_empty() {
+                "Nothing matches the current filter.".to_owned()
+            } else if buffer.streaming() > 0 {
+                "Attached — waiting for output.".to_owned()
+            } else {
+                "Attaching…".to_owned()
+            };
+            logview::placeholder(message, cx).into_any_element()
+        } else {
+            logview::body(lines, show_source, self.log_scroll.clone()).into_any_element()
+        };
+
+        Some(
+            v_flex()
+                .flex_1()
+                .h_full()
+                .overflow_hidden()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .items_center()
+                        .justify_between()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .truncate()
+                                .text_color(cx.theme().foreground)
+                                .child(format!("logs · {}", session.target.label())),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .flex_none()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "{counts} {streaming} {}",
+                                    dropped.unwrap_or_default()
+                                )),
+                        ),
+                )
+                .child(toolbar)
+                .children(notice.map(|(text, bad)| {
+                    div()
+                        .w_full()
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .text_color(if bad {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(text)
+                }))
+                .children(
+                    (!buffer.sources().is_empty()).then(|| logview::sources(buffer.sources(), cx)),
+                )
+                .child(body),
+        )
+    }
+
     /// The detail pane: YAML, events and owners for one object.
     fn detail_pane(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let detail = self.state.detail()?;
@@ -930,6 +1441,7 @@ impl Workspace {
             _ => None,
         };
 
+        let is_pod = detail.kind().is_core() && &*detail.kind().kind == "Pod";
         let masked_note = match detail {
             Detail::Ready { object, .. } if object.maskable && !object.revealed => {
                 Some("values hidden")
@@ -1094,6 +1606,15 @@ impl Workspace {
                                         .child(note)
                                 })),
                         )
+                        .children(is_pod.then(|| {
+                            Button::new("tail-logs")
+                                .outline()
+                                .small()
+                                .label("Logs")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.open_logs(window, cx)),
+                                )
+                        }))
                         .children(reveal_label.map(|label| {
                             Button::new("reveal")
                                 .outline()
@@ -1216,12 +1737,31 @@ impl Render for Workspace {
             self.yaml_showing = None;
         }
 
+        // Following means the newest line stays on screen. Scrolling only when
+        // the count changed keeps a paused view exactly where the user left it.
+        if let Some(session) = self.state.logs() {
+            let visible = session.buffer.visible_len();
+            if session.following && visible > 0 && visible != self.log_visible {
+                self.log_scroll
+                    .scroll_to_item(visible - 1, gpui::ScrollStrategy::Top);
+            }
+            self.log_visible = visible;
+        } else if self.log_visible != 0 {
+            self.log_visible = 0;
+        }
+
         let frame = self.frames.start(Instant::now());
         if frame.is_some() {
             // Keep frames coming, so there is a continuous series to measure.
             // Nothing else in the app redraws when nothing has changed.
             window.request_animation_frame();
         }
+
+        let logs = self.log_pane(cx).map(gpui::IntoElement::into_any_element);
+        let main = match logs {
+            Some(logs) => logs,
+            None => self.content(cx).into_any_element(),
+        };
 
         let rendered = div()
             .relative()
@@ -1239,6 +1779,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::toggle_logs))
+            .on_action(cx.listener(Self::toggle_follow))
             .child(
                 v_flex()
                     .size_full()
@@ -1252,7 +1794,9 @@ impl Render for Workspace {
                             .w_full()
                             .overflow_hidden()
                             .child(self.sidebar(cx))
-                            .child(self.content(cx))
+                            // A tail takes the main pane: reading logs is not a
+                            // thing anyone does while watching a table.
+                            .child(main)
                             .children(self.detail_pane(cx)),
                     )
                     .child(self.footer(cx)),
@@ -1270,6 +1814,11 @@ impl Render for Workspace {
                 over_budget = stats.over_budget,
                 hitches = stats.hitches,
                 rows = self.state.rows().len(),
+                log_lines = self
+                    .state
+                    .logs()
+                    .map(|session| session.buffer.visible_len())
+                    .unwrap_or(0),
                 "frames"
             );
         }
@@ -1714,6 +2263,199 @@ mod tests {
             workspace.dismiss(&Dismiss, window, cx);
             assert!(workspace.state().detail().is_none());
         });
+    }
+
+    fn open_pod_detail(harness: &Harness, cx: &mut TestAppContext, name: &str) {
+        harness.update(cx, |workspace, window, cx| {
+            workspace.open_object(ResourceKey::new("default", name), window, cx);
+        });
+    }
+
+    #[gpui::test]
+    fn tailing_a_pod_starts_a_session_for_that_pod(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        drain(&rx);
+
+        harness.keys(cx, "cmd-l");
+
+        let sent = drain(&rx);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        match &sent[0] {
+            ClusterCommand::StartLogs { cluster, target } => {
+                assert_eq!(cluster, &ClusterId::new("prod"));
+                assert_eq!(target.label(), "default/api-0");
+            }
+            other => panic!("expected a log session, got {other:?}"),
+        }
+        assert!(harness.read(cx, |workspace| workspace.state().logs().is_some()));
+    }
+
+    #[gpui::test]
+    fn tailing_without_a_pod_or_a_selector_explains_what_is_missing(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        drain(&rx);
+
+        harness.keys(cx, "cmd-l");
+
+        // Nothing was sent, and the reason is on screen rather than nowhere.
+        assert!(drain(&rx).is_empty());
+        harness.read(cx, |workspace| {
+            assert!(workspace.state().logs().is_none());
+            let notice = workspace.log_notice.as_ref().expect("a reason is shown");
+            assert!(notice.contains("namespace"), "{notice}");
+        });
+    }
+
+    #[gpui::test]
+    fn a_namespace_and_selector_tail_every_matching_pod(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.state.set_namespace(Some(Arc::from("payments")));
+            workspace.state.set_selector(Some(Arc::from("app=api")));
+            let _ = cx;
+        });
+        drain(&rx);
+
+        harness.keys(cx, "cmd-l");
+
+        match drain(&rx).first() {
+            Some(ClusterCommand::StartLogs { target, .. }) => {
+                assert_eq!(target.label(), "payments/app=api");
+            }
+            other => panic!("expected a selector-based session, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    fn log_lines_reach_the_buffer_and_the_filter_applies_without_restarting(
+        cx: &mut TestAppContext,
+    ) {
+        use periscope_bridge::{LogLine, LogSource};
+
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        harness.keys(cx, "cmd-l");
+        drain(&rx);
+
+        let lines = |texts: &[&str]| ClusterEvent::LogBatch {
+            cluster: "prod".into(),
+            lines: texts
+                .iter()
+                .map(|text| LogLine {
+                    source: LogSource::new("api-0", "api"),
+                    timestamp: None,
+                    text: Arc::from(*text),
+                })
+                .collect(),
+        };
+
+        apply(&harness, cx, vec![lines(&["starting", "an error", "done"])]);
+        assert_eq!(
+            harness.read(cx, |workspace| workspace
+                .state()
+                .logs()
+                .unwrap()
+                .buffer
+                .visible_len()),
+            3
+        );
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.apply_log_filter("error".to_owned(), cx);
+        });
+
+        harness.read(cx, |workspace| {
+            let buffer = &workspace.state().logs().unwrap().buffer;
+            assert_eq!(buffer.visible_len(), 1);
+            assert_eq!(buffer.len(), 3);
+        });
+        // Filtering is local: nothing was re-requested from the cluster.
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[gpui::test]
+    fn following_can_be_paused(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        harness.keys(cx, "cmd-l");
+        drain(&rx);
+
+        assert!(harness.read(cx, |workspace| workspace.state().logs().unwrap().following));
+
+        harness.keys(cx, "cmd-shift-f");
+        assert!(!harness.read(cx, |workspace| workspace.state().logs().unwrap().following));
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_tail_and_stops_the_session(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        harness.keys(cx, "cmd-l");
+        drain(&rx);
+
+        harness.keys(cx, "escape");
+
+        assert!(harness.read(cx, |workspace| workspace.state().logs().is_none()));
+        assert_eq!(
+            drain(&rx),
+            vec![ClusterCommand::StopLogs {
+                cluster: ClusterId::new("prod")
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn switching_to_previous_logs_restarts_the_session(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        harness.keys(cx, "cmd-l");
+        drain(&rx);
+
+        harness.update(cx, |workspace, _window, cx| workspace.toggle_previous(cx));
+
+        match drain(&rx).first() {
+            Some(ClusterCommand::StartLogs { target, .. }) => {
+                assert!(target.previous);
+                assert_eq!(target.label(), "default/api-0 (previous)");
+            }
+            other => panic!("expected a restarted session, got {other:?}"),
+        }
     }
 
     #[gpui::test]

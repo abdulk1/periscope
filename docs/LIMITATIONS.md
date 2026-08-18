@@ -42,37 +42,45 @@ therefore tracked against `--release`. Some of the debug cost is the runtime
 shader compilation from ADR-0008; the rest is unoptimised GPUI layout code that
 the `[profile.dev.package]` overrides only partly cover.
 
+## Phase 3 scope
+
+Logs work: one pod or every pod matching a label selector, merged into one
+stream with per-pod colours, re-attaching by itself when a pod is replaced.
+Filtering (substring or regex, case toggle) applies without restarting the
+stream. Follow/pause, copy, export, previous-container and init/sidecar
+container selection are all there.
+
+What is **not** there:
+
+- **Multi-cluster.** One cluster is watched at a time, and a tail belongs to the
+  cluster it was opened on (Phase 4).
+- **Mutations.** Still read-only until Phase 5: no delete, scale, edit, exec or
+  port-forward.
+- **Jump to timestamp.** `LogBuffer::seek` finds the first line at or after a
+  time and is tested, but nothing in the UI calls it yet — there is no
+  time-input control. Follow/pause and scrolling are wired; jumping is not.
+- **Selecting text with the mouse.** "Copy" copies the visible (filtered)
+  buffer; there is no drag-select over lines. GPUI gives no text selection over
+  a virtualised list, and building one was out of proportion to the phase.
+- **Wrapping.** Long lines are clipped, not wrapped. A wrapped line would break
+  the fixed row height virtualisation depends on.
+- **Sorting by timestamp.** Lines appear in the order they were read. With
+  history (`--tail`-style backlog) each pod's backlog arrives as a block before
+  the live streams interleave, exactly as `kubectl logs` behaves.
+- **A log search across pods that are not running.** Only live pods are
+  attached; `previous` reads one container's last run, not the whole history.
+
 ## Phase 2 scope
 
-The build connects to a cluster, discovers every kind it serves — CRDs included —
-and streams any one of them into a table. What it does **not** do yet:
+Everything the resource browser does is unchanged: discovery of every kind
+including CRDs, generic tables driven by columns that travel with the data,
+namespace and label-selector filters, the ⌘K palette, and a detail pane with
+YAML, events and owner-reference navigation. Its gaps are still:
 
-- **Logs.** No log tailing at all; that is Phase 3, and it is the differentiator.
-- **Multi-cluster.** One cluster is watched at a time. The store holds rows for
-  clusters you have visited, and switching back is instant, but nothing streams
-  in the background and there are no side-by-side panes (Phase 4).
-- **Mutations.** Still strictly read-only until Phase 5: no delete, scale,
-  edit, exec or port-forward.
-- **Sorting and column choice.** Rows are ordered by namespace then name, always.
-  Columns per kind are what `columns.rs` says; they are not user-configurable.
-- **A describe view.** The detail pane shows YAML, events and owner references.
-  `kubectl describe`'s prose summary is not reimplemented.
-- **CRD printer columns.** A custom resource renders with the generic
-  `STATUS`/`READY` fallback rather than the `additionalPrinterColumns` its CRD
-  declares. Reading those is a natural next step and is not done.
-- **Reveal is per-open.** A Secret opens masked and the reveal button re-fetches
-  it with values shown; closing and reopening masks it again. There is no
-  session-wide "show secrets", deliberately.
-- **Namespace autocomplete.** The namespace filter is a text field. The
-  namespaces seen in the current table are counted in the toolbar, but there is
-  no picker.
-
-Two behaviours worth knowing because they are deliberate:
-
-- Switching kinds **stops** the previous watch (ADR-0019). Rows stay in the
-  store; updates do not.
-- The detail pane fetches the object when you open it (ADR-0018), so its YAML is
-  current rather than a replay of the last watch event.
+- No CRD printer columns (custom resources use the generic `STATUS`/`READY`
+  fallback).
+- No sorting controls, no column configuration, no describe-style prose.
+- Reveal for Secrets is per-open, deliberately.
 
 ## Measured against the budgets
 
@@ -89,6 +97,10 @@ kinds and seeded with 10,009 pods, release build:
 | Command palette < 50ms on a 10k-object cluster | 10,009 candidates scored and ranked well inside the budget; asserted by a unit test that fails over 50ms |
 | YAML of a large ConfigMap opens without a frame drop | 939 KiB fetched, cleaned and rendered to YAML in 17ms — a fifth of a 60Hz frame, and most of it network |
 | A CRD-heavy cluster lists every custom resource | 77 kinds with cert-manager and Argo CD installed; all nine of their CRDs listed, none special-cased |
+| Tail 50 pods while staying above 60fps | 50 pods tailed: 60.0fps sustained, 0 dropped frames, ~630µs to rebuild the view |
+| Ingest 10,000 lines/second without unbounded memory | 40,000–53,000 lines/second ingested from an unthrottled fixture; resident memory flat at ~104MB with a full 100,000-line buffer |
+| Filter a 500k-line buffer in under 100ms | Well inside, for substring and regex alike (release builds; a debug build is several times slower and the test says so) |
+| Pod restart during a tail reconnects within 2s | 355ms from deleting a pod to lines arriving from its replacement |
 
 The load fixture is `cargo run --release -p periscope-e2e --bin seed-pods`.
 
@@ -170,6 +182,12 @@ Doing better needs an EKS or GKE cluster, which costs money to run — see
   real cluster (YAML, events, owner references, secret masking), but the
   rendered pane — the syntax-highlighted editor in particular — has not been
   seen, because opening it needs a click the sandbox cannot send.
+- **The log view's appearance, in full.** `--tail` puts the app straight into
+  it, and the rendered lines have been seen — timestamp, colour-coded source,
+  text — but only as the strip of the window that was not covered by another
+  application. The window could not be raised reliably in this environment, so
+  the toolbar, the source legend and the filter box have not been looked at,
+  only tested.
 - **A visible frame drop when opening a large object.** The 17ms figure above is
   fetch-to-YAML, not frame timing: the frame the YAML lands in was not measured.
 - **Light theme.** The theme toggle is wired and unit-covered; only the dark

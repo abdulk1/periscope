@@ -124,7 +124,10 @@ impl ConnectionRegistry {
             | ClusterEvent::ResourceApplied { .. }
             | ClusterEvent::ResourceDeleted { .. }
             | ClusterEvent::Object { .. }
-            | ClusterEvent::ObjectFailed { .. } => false,
+            | ClusterEvent::ObjectFailed { .. }
+            | ClusterEvent::LogBatch { .. }
+            | ClusterEvent::LogSourceChanged { .. }
+            | ClusterEvent::LogsFailed { .. } => false,
         }
     }
 

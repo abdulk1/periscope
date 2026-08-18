@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 periscope-bridge.workspace = true
+regex.workspace = true
 tracing.workspace = true
 
 [lints]

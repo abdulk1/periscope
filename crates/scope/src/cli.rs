@@ -15,6 +15,16 @@ pub struct Cli {
     #[arg(short, long)]
     pub verbose: bool,
 
+    /// Start in the log view, tailing the pods matching this label selector.
+    ///
+    /// Needs --namespace, because log streams are per-namespace.
+    #[arg(long, value_name = "SELECTOR", requires = "namespace")]
+    pub tail: Option<String>,
+
+    /// Namespace for --tail.
+    #[arg(long, short = 'n', value_name = "NAMESPACE")]
+    pub namespace: Option<String>,
+
     /// Log warnings and errors only.
     #[arg(short, long, conflicts_with = "verbose")]
     pub quiet: bool,
@@ -56,6 +66,16 @@ mod tests {
     #[test]
     fn verbose_and_quiet_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["scope", "--verbose", "--quiet"]).is_err());
+    }
+
+    #[test]
+    fn tailing_at_startup_needs_a_namespace() {
+        // Without one there is no URL to open: logs are a pod subresource.
+        assert!(Cli::try_parse_from(["scope", "--tail", "app=web"]).is_err());
+
+        let cli = Cli::try_parse_from(["scope", "--tail", "app=web", "-n", "prod"]).unwrap();
+        assert_eq!(cli.tail.as_deref(), Some("app=web"));
+        assert_eq!(cli.namespace.as_deref(), Some("prod"));
     }
 
     #[test]

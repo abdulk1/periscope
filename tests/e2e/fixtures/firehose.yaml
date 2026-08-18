@@ -1,0 +1,19 @@
+# A deliberately unthrottled log producer, for the ingest-rate budget.
+#
+# Each replica writes as fast as the container runtime will take it, which is
+# how the 10,000 lines/second figure in IMPLEMENTATION.md gets exercised.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: firehose, namespace: default, labels: { app: firehose } }
+spec:
+  replicas: 4
+  selector: { matchLabels: { app: firehose } }
+  template:
+    metadata: { labels: { app: firehose } }
+    spec:
+      containers:
+        - name: hose
+          image: busybox:1.36
+          command: ["sh", "-c", "i=0; while true; do i=$((i+1)); echo \"$HOSTNAME line $i status=200 latency=12ms path=/api/v1/things/$i\"; done"]
+          resources:
+            limits: { cpu: "500m" }

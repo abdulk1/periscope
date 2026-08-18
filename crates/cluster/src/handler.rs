@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::errors::Failure;
 use crate::watch::Filter;
-use crate::{detail, discovery, kubeconfig, watch};
+use crate::{detail, discovery, kubeconfig, logs, watch};
 
 /// Connects to clusters, discovers what they serve, and streams it.
 #[derive(Debug, Default)]
@@ -47,6 +47,8 @@ struct Sessions {
     clusters: Mutex<HashMap<ClusterId, Session>>,
     tasks: Mutex<HashMap<ClusterId, JoinHandle<()>>>,
     watches: Mutex<HashMap<(ClusterId, KindId), JoinHandle<()>>>,
+    /// One log session per cluster: one log view, one tail.
+    logs: Mutex<HashMap<ClusterId, JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for Sessions {
@@ -100,6 +102,24 @@ impl Sessions {
         }
     }
 
+    /// Starts a log session, stopping the one it replaces.
+    fn insert_logs(&self, cluster: ClusterId, task: JoinHandle<()>) {
+        if let Some(previous) = guard(&self.logs).insert(cluster, task) {
+            previous.abort();
+        }
+    }
+
+    /// Stops a cluster's log session.
+    fn stop_logs(&self, cluster: &ClusterId) -> bool {
+        match guard(&self.logs).remove(cluster) {
+            Some(task) => {
+                task.abort();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Stops one watch.
     fn stop_watch(&self, cluster: &ClusterId, kind: &KindId) -> bool {
         match guard(&self.watches).remove(&(cluster.clone(), kind.clone())) {
@@ -114,6 +134,7 @@ impl Sessions {
     /// Stops everything belonging to a cluster.
     fn disconnect(&self, cluster: &ClusterId) -> bool {
         guard(&self.clusters).remove(cluster);
+        self.stop_logs(cluster);
 
         let mut watches = guard(&self.watches);
         let keys: Vec<_> = watches
@@ -145,8 +166,11 @@ impl Sessions {
                 .is_some_and(|task| !task.is_finished())
     }
 
-    /// Stops every session and watch.
+    /// Stops every session, watch and log tail.
     fn abort_all(&self) {
+        for (_, task) in guard(&self.logs).drain() {
+            task.abort();
+        }
         for (_, task) in guard(&self.watches).drain() {
             task.abort();
         }
@@ -402,6 +426,26 @@ impl CommandHandler for KubeHandler {
                     };
                 }
 
+                ClusterCommand::StartLogs { cluster, target } => {
+                    let Some(session) = sessions.session(&cluster) else {
+                        events.send(ClusterEvent::LogsFailed {
+                            cluster,
+                            reason: "not connected to this cluster".to_owned(),
+                        });
+                        return;
+                    };
+
+                    tracing::info!(%cluster, target = %target.label(), "tailing logs");
+                    let task =
+                        tokio::spawn(logs::run(cluster.clone(), session.client, target, events));
+                    sessions.insert_logs(cluster, task);
+                }
+
+                ClusterCommand::StopLogs { cluster } => {
+                    let stopped = sessions.stop_logs(&cluster);
+                    tracing::debug!(%cluster, stopped, "log session stopped");
+                }
+
                 ClusterCommand::Disconnect { cluster } => {
                     let was_live = sessions.disconnect(&cluster);
                     tracing::info!(%cluster, was_live, "disconnect requested");
@@ -562,6 +606,40 @@ mod tests {
             }
             other => panic!("expected a failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tailing_logs_without_a_connection_says_so() {
+        let (runtime, stream) =
+            ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
+
+        runtime
+            .send(ClusterCommand::StartLogs {
+                cluster: "not-connected".into(),
+                target: Arc::new(periscope_bridge::LogTarget::pod("default", "api-0")),
+            })
+            .unwrap();
+
+        match recv_timeout(&stream, Duration::from_secs(5)) {
+            Some(ClusterEvent::LogsFailed { reason, .. }) => {
+                assert!(reason.contains("not connected"), "{reason}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stopping_a_log_session_that_is_not_running_is_harmless() {
+        let (runtime, stream) =
+            ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
+
+        runtime
+            .send(ClusterCommand::StopLogs {
+                cluster: "prod".into(),
+            })
+            .unwrap();
+
+        assert!(recv_timeout(&stream, Duration::from_millis(300)).is_none());
     }
 
     #[test]

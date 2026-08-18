@@ -4814,6 +4814,7 @@ name = "periscope-store"
 version = "0.1.0"
 dependencies = [
  "periscope-bridge",
+ "regex",
  "tracing",
 ]
 

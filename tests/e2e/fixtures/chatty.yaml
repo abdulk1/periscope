@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: chatty, namespace: default, labels: { app: chatty } }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: chatty } }
+  template:
+    metadata: { labels: { app: chatty } }
+    spec:
+      containers:
+        - name: talker
+          image: busybox:1.36
+          command: ["sh", "-c", "i=0; while true; do i=$((i+1)); echo \"line $i from $HOSTNAME status=200\"; sleep 0.2; done"]

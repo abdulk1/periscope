@@ -5,14 +5,14 @@ affordances: live resource streams, multi-cluster, and log tailing across pods.
 
 **Binary:** `scope` · **Language:** Rust · **UI:** GPUI
 
-> **Status: Phase 2 (navigate everything).** Connects to a kubeconfig context,
-> discovers every kind the cluster serves — CRDs included — and streams any of
-> them into a virtualised table with the columns `kubectl` prints. Fuzzy jump
-> palette (⌘K), namespace and label-selector filters, and a detail pane with
-> YAML, events and owner-reference navigation. Read-only. Logs are Phase 3 and
-> multi-cluster is Phase 4. See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the
-> roadmap and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not
-> work.
+> **Status: Phase 3 (logs).** Connects to a kubeconfig context, discovers every
+> kind the cluster serves — CRDs included — streams any of them into a
+> virtualised table, and tails logs from one pod or from every pod matching a
+> label selector, merged into one stream that re-attaches by itself when a pod
+> is replaced. Fuzzy jump palette (⌘K), filters everywhere, and a detail pane
+> with YAML, events and owner-reference navigation. Read-only. Multi-cluster is
+> Phase 4. See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap and
+> [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not work.
 
 ## Build and run
 
@@ -23,6 +23,7 @@ cargo run --release --bin scope                        # open the window
 cargo run --release --bin scope -- --kubeconfig ./kc   # use one specific file
 cargo run --release --bin scope -- --verbose           # mirror the log to stderr
 cargo run --release --bin scope -- --perf              # log watch throughput and flush timings
+cargo run --release --bin scope -- --tail app=web -n prod  # open straight into the log view
 ```
 
 It connects to the `current-context` on start; the sidebar lists every context
@@ -35,6 +36,8 @@ cold-start budget by a wide margin (`docs/LIMITATIONS.md`).
 | `↑` `↓` `enter` | Move through the jump results and open one |
 | `escape` | Close the palette, then the detail pane |
 | `enter` in the namespace or selector field | Re-list with that filter |
+| `⌘L` / `ctrl-L` | Tail the open pod, or every pod matching the current namespace + selector |
+| `⌘⇧F` | Follow the newest line, or pause where you are |
 
 Logs are written to a daily-rotating file under the platform's application data
 directory; the path is printed in the log's first line and shown by `--verbose`.
@@ -75,6 +78,19 @@ cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fi
 
 Architecture decisions are recorded in [`docs/DECISIONS.md`](docs/DECISIONS.md) —
 append, never rewrite.
+
+## Logs
+
+Open a pod and press **Logs**, or set a namespace and a label selector in the
+table's filters and press `⌘L` to merge every matching pod into one stream. Each
+pod keeps its own colour, new pods are attached as they appear, and a pod that
+is replaced is re-attached without asking.
+
+The buffer holds 100,000 lines and drops the oldest beyond that, saying how many
+it dropped. Filtering — substring or regular expression, case-sensitive or not —
+applies to what is already held, so it never restarts the stream. **Copy** puts
+the visible lines on the clipboard; **Export** writes them to a file and tells
+you where.
 
 ## Security posture
 

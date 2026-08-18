@@ -157,6 +157,48 @@ pub fn delete_probe_pod(name: &str) -> anyhow::Result<()> {
     })
 }
 
+/// The name of the first pod matching a label selector.
+pub fn first_pod_named(selector: &str) -> Option<String> {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::ListParams;
+
+    let selector = selector.to_owned();
+    let name = std::cell::RefCell::new(None);
+    blocking(async {
+        let api: kube::Api<Pod> = kube::Api::namespaced(client().await?, "default");
+        let pods = api.list(&ListParams::default().labels(&selector)).await?;
+        *name.borrow_mut() = pods
+            .items
+            .iter()
+            .find(|pod| {
+                pod.status
+                    .as_ref()
+                    .and_then(|status| status.phase.as_deref())
+                    == Some("Running")
+            })
+            .and_then(|pod| pod.metadata.name.clone());
+        Ok(())
+    })
+    .ok()?;
+
+    name.into_inner()
+}
+
+/// Deletes a pod, so its replacement can be watched for.
+pub fn delete_pod(namespace: &str, name: &str) -> anyhow::Result<()> {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::DeleteParams;
+
+    let namespace = namespace.to_owned();
+    let name = name.to_owned();
+    blocking(async move {
+        let api: kube::Api<Pod> = kube::Api::namespaced(client().await?, &namespace);
+        api.delete(&name, &DeleteParams::default().grace_period(0))
+            .await?;
+        Ok(())
+    })
+}
+
 /// Runs one future to completion on a throwaway runtime.
 ///
 /// The tests are synchronous — they drive the same bridge the UI does — so the

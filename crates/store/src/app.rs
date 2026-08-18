@@ -10,12 +10,26 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use periscope_bridge::{
-    ClusterEvent, ClusterId, ColumnSpec, ContextInfo, KindId, KindInfo, ObjectDetail, ResourceKey,
-    ResourceRow,
+    ClusterEvent, ClusterId, ColumnSpec, ContextInfo, KindId, KindInfo, LogTarget, ObjectDetail,
+    ResourceKey, ResourceRow,
 };
 
 use crate::connections::{Connection, ConnectionRegistry};
+use crate::logs::{FilterSpec, LogBuffer};
 use crate::table::ResourceTable;
+
+/// A live log tail.
+#[derive(Debug)]
+pub struct LogSession {
+    /// Which cluster the lines come from.
+    pub cluster: ClusterId,
+    /// What is being tailed.
+    pub target: Arc<LogTarget>,
+    /// The lines, bounded and filtered.
+    pub buffer: LogBuffer,
+    /// Whether the view sticks to the bottom as lines arrive.
+    pub following: bool,
+}
 
 /// What the detail pane is showing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,7 +110,7 @@ impl Filters {
 }
 
 /// The application's state.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct AppState {
     connections: ConnectionRegistry,
     contexts: Vec<ContextInfo>,
@@ -108,6 +122,7 @@ pub struct AppState {
     filters: Filters,
     tables: BTreeMap<(ClusterId, KindId), ResourceTable>,
     detail: Option<Detail>,
+    logs: Option<LogSession>,
     /// Materialised rows for the active view, for indexed access by the
     /// virtualised list. Rebuilt only when something it shows changes, and
     /// shared as an `Arc` so a render that captures them costs one refcount
@@ -210,6 +225,31 @@ impl AppState {
                 }
             }
 
+            ClusterEvent::LogBatch { cluster, lines } => {
+                if let Some(session) = self.logs.as_mut().filter(|s| &s.cluster == cluster) {
+                    session.buffer.extend(lines);
+                    changed = true;
+                }
+            }
+
+            ClusterEvent::LogSourceChanged {
+                cluster,
+                source,
+                state,
+            } => {
+                if let Some(session) = self.logs.as_mut().filter(|s| &s.cluster == cluster) {
+                    session.buffer.source_changed(source.clone(), state.clone());
+                    changed = true;
+                }
+            }
+
+            ClusterEvent::LogsFailed { cluster, reason } => {
+                if let Some(session) = self.logs.as_mut().filter(|s| &s.cluster == cluster) {
+                    session.buffer.fail(reason.clone());
+                    changed = true;
+                }
+            }
+
             ClusterEvent::Status { .. }
             | ClusterEvent::Pong { .. }
             | ClusterEvent::Stale { .. } => {}
@@ -245,6 +285,9 @@ impl AppState {
         }
         self.active = Some(cluster);
         self.detail = None;
+        // A tail belongs to the cluster it was opened on; carrying it across
+        // would leave lines on screen that no longer relate to anything.
+        self.logs = None;
         self.refresh_rows();
     }
 
@@ -279,6 +322,40 @@ impl AppState {
     /// The filters currently applied.
     pub fn filters(&self) -> &Filters {
         &self.filters
+    }
+
+    /// Opens a log session, replacing any that was running.
+    pub fn open_logs(&mut self, cluster: ClusterId, target: Arc<LogTarget>, capacity: usize) {
+        self.logs = Some(LogSession {
+            cluster,
+            target,
+            buffer: LogBuffer::new(capacity),
+            following: true,
+        });
+    }
+
+    /// Closes the log session.
+    pub fn close_logs(&mut self) {
+        self.logs = None;
+    }
+
+    /// The log session, if one is open.
+    pub fn logs(&self) -> Option<&LogSession> {
+        self.logs.as_ref()
+    }
+
+    /// Applies a filter to the open session, reporting whether it changed.
+    pub fn set_log_filter(&mut self, spec: FilterSpec) -> bool {
+        self.logs
+            .as_mut()
+            .is_some_and(|session| session.buffer.set_filter(spec))
+    }
+
+    /// Sticks the view to the bottom, or lets it stay put.
+    pub fn set_following(&mut self, following: bool) {
+        if let Some(session) = self.logs.as_mut() {
+            session.following = following;
+        }
     }
 
     /// Records that a detail fetch is in flight.
@@ -830,6 +907,104 @@ mod tests {
         state.open_detail(deployments(), ResourceKey::new("default", "api"));
         state.select_cluster(ClusterId::new("staging"));
         assert!(state.detail().is_none());
+    }
+
+    #[test]
+    fn log_lines_land_in_the_open_session() {
+        use periscope_bridge::{LogLine, LogSource, LogSourceState};
+
+        let mut state = state_with_contexts();
+        state.open_logs(
+            ClusterId::new("prod"),
+            Arc::new(LogTarget::pod("default", "api-0")),
+            crate::logs::DEFAULT_CAPACITY,
+        );
+
+        let batch = ClusterEvent::LogBatch {
+            cluster: "prod".into(),
+            lines: Arc::from([LogLine {
+                source: LogSource::new("api-0", "api"),
+                timestamp: None,
+                text: Arc::from("hello"),
+            }]),
+        };
+        assert!(state.apply_batch(std::slice::from_ref(&batch), Instant::now()));
+        assert_eq!(state.logs().unwrap().buffer.visible_len(), 1);
+
+        state.apply_batch(
+            &[ClusterEvent::LogSourceChanged {
+                cluster: "prod".into(),
+                source: LogSource::new("api-0", "api"),
+                state: LogSourceState::Streaming,
+            }],
+            Instant::now(),
+        );
+        assert_eq!(state.logs().unwrap().buffer.streaming(), 1);
+    }
+
+    #[test]
+    fn lines_for_another_cluster_are_ignored() {
+        let mut state = state_with_contexts();
+        state.open_logs(
+            ClusterId::new("prod"),
+            Arc::new(LogTarget::pod("default", "api-0")),
+            crate::logs::DEFAULT_CAPACITY,
+        );
+
+        let changed = state.apply_batch(
+            &[ClusterEvent::LogBatch {
+                cluster: "staging".into(),
+                lines: Arc::from([periscope_bridge::LogLine {
+                    source: periscope_bridge::LogSource::new("api-0", "api"),
+                    timestamp: None,
+                    text: Arc::from("not mine"),
+                }]),
+            }],
+            Instant::now(),
+        );
+
+        assert!(!changed);
+        assert_eq!(state.logs().unwrap().buffer.visible_len(), 0);
+    }
+
+    #[test]
+    fn switching_clusters_closes_the_tail() {
+        let mut state = state_with_contexts();
+        state.open_logs(
+            ClusterId::new("prod"),
+            Arc::new(LogTarget::pod("default", "api-0")),
+            crate::logs::DEFAULT_CAPACITY,
+        );
+
+        state.select_cluster(ClusterId::new("staging"));
+        assert!(state.logs().is_none());
+    }
+
+    #[test]
+    fn a_failed_session_says_why() {
+        let mut state = state_with_contexts();
+        state.open_logs(
+            ClusterId::new("prod"),
+            Arc::new(LogTarget::pod("default", "api-0")),
+            crate::logs::DEFAULT_CAPACITY,
+        );
+
+        state.apply_batch(
+            &[ClusterEvent::LogsFailed {
+                cluster: "prod".into(),
+                reason: "container \"api\" in pod \"api-0\" is waiting to start".into(),
+            }],
+            Instant::now(),
+        );
+
+        assert!(
+            state
+                .logs()
+                .unwrap()
+                .buffer
+                .error()
+                .is_some_and(|reason| reason.contains("waiting to start"))
+        );
     }
 
     #[test]

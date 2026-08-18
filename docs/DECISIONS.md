@@ -517,3 +517,76 @@ reader has to scroll past.
 
 If a case turns up that this cannot render, the fallback is a maintained crate
 plus a post-processing pass — but that is a worse trade than it looks.
+
+---
+
+## ADR-0021 — Log lines are merged and batched before they cross the bridge
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+A single busy container produces more events per second than every watch in the
+app put together. One `ClusterEvent` per line would fill the bounded event
+channel — which is sized for watch events — and start dropping text, which is
+the one thing a log view may never do.
+
+So the cluster layer does two things before the bridge sees anything:
+
+1. **Merges.** Every reader in a session writes into one channel, so a
+   fifty-pod tail arrives already interleaved. The UI never sorts, and the
+   ordering is the one `kubectl logs -f` would have produced.
+2. **Batches.** Lines accumulate for 50ms or 512 lines, whichever comes first,
+   and cross as one `LogBatch`. Measured against a deliberately unthrottled
+   fixture: 40,000–53,000 lines/second ingested, in roughly 100 events/second
+   rather than 50,000.
+
+`LogBatch` is the one event with **no coalescing key**. Everything else in the
+protocol collapses when superseded; a dropped batch is text nobody can get back,
+so batches are never collapsed into one another. Backpressure is applied to the
+reader instead — a slow UI slows one container's stream rather than losing it.
+
+---
+
+## ADR-0022 — The log buffer is a ring, and filtering never touches the stream
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+`LogBuffer` holds at most 100,000 lines (configurable) and evicts the oldest
+when it is full, counting what it dropped and showing that count. A tail left
+running all afternoon therefore has a memory ceiling: measured under a 53k
+lines/second firehose, resident memory settled at ~104MB and stayed flat for as
+long as it was watched.
+
+Filtering is applied over what is already held, never by re-requesting:
+
+- The visible set is a list of sequence numbers, so eviction and filtering stay
+  independent — a line that falls out of the ring falls out of the view with it.
+- New lines are matched as they arrive; a full rescan happens only when the
+  pattern itself changes. A 500,000-line rescan measures well inside the 100ms
+  budget in release builds, for substring and regular expressions alike.
+- Case-insensitive substring search has a non-allocating ASCII path, because
+  lowercasing half a million lines per keystroke is exactly the kind of thing
+  that makes a filter box feel broken.
+- An invalid regular expression shows its error and matches nothing, rather
+  than silently emptying the view.
+
+---
+
+## ADR-0023 — `--tail` exists so the log view can be measured
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+`scope --tail app=web -n prod` opens the log view on those pods as soon as the
+cluster connects. It is genuinely useful — it is what `stern app=web` is for —
+but the reason it exists now is narrower: the environment Periscope is being
+built in denies the shell accessibility permission, so nothing can click the
+Logs button in a running window. Without a way to start a tail from the command
+line, "tails 50 pods while staying above 60fps" could not have been measured at
+all, only asserted.
+
+It requires `--namespace`, because logs are a pod subresource: there is no
+cluster-wide log endpoint to fall back on when no namespace is given. The same
+constraint shapes the in-app path — tailing by label selector needs the
+namespace filter set first, and says so rather than failing at the API.

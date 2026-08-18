@@ -27,6 +27,15 @@ pub fn log_dir() -> Result<PathBuf> {
     Ok(dirs.data_local_dir().join("logs"))
 }
 
+/// Directory exported log buffers are written to.
+///
+/// Under the app's own data directory rather than anywhere shared: an export is
+/// a debugging artefact, and cluster logs are not something to scatter into a
+/// user's Documents folder by default.
+pub fn export_dir() -> Result<PathBuf> {
+    Ok(project_dirs()?.data_local_dir().join("exports"))
+}
+
 /// Path to the user's settings file.
 pub fn settings_file() -> Result<PathBuf> {
     Ok(project_dirs()?.config_dir().join("settings.toml"))
@@ -40,6 +49,13 @@ mod tests {
     fn log_dir_is_under_an_app_specific_directory() {
         let dir = log_dir().expect("home directory resolves in tests");
         assert!(dir.ends_with("logs"));
+        assert!(dir.to_string_lossy().contains("Periscope"));
+    }
+
+    #[test]
+    fn exports_land_in_the_apps_own_directory() {
+        let dir = export_dir().expect("home directory resolves in tests");
+        assert!(dir.ends_with("exports"));
         assert!(dir.to_string_lossy().contains("Periscope"));
     }
 

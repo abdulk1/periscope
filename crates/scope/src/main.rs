@@ -15,7 +15,7 @@ use gpui::{
 };
 use gpui_component::Root;
 use gpui_component_assets::Assets;
-use periscope_bridge::{ClusterRuntime, PumpConfig, RuntimeConfig, spawn_event_pump};
+use periscope_bridge::{ClusterRuntime, LogTarget, PumpConfig, RuntimeConfig, spawn_event_pump};
 use periscope_cluster::KubeHandler;
 use periscope_ui::Workspace;
 
@@ -55,6 +55,13 @@ fn main() -> Result<()> {
     let commands = runtime.commands();
 
     let perf = cli.perf;
+    // `--tail app=web -n prod` opens the log view on the pods it names as soon
+    // as the cluster connects.
+    let tail = cli
+        .tail
+        .as_deref()
+        .zip(cli.namespace.as_deref())
+        .map(|(selector, namespace)| LogTarget::labels(namespace, selector));
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
@@ -71,8 +78,16 @@ fn main() -> Result<()> {
                 let commands = commands.clone();
 
                 cx.open_window(window_options(), move |window, cx| {
-                    let workspace =
-                        cx.new(|cx| Workspace::new(commands.clone(), started, perf, window, cx));
+                    let workspace = cx.new(|cx| {
+                        Workspace::with_tail(
+                            commands.clone(),
+                            started,
+                            perf,
+                            tail.clone(),
+                            window,
+                            cx,
+                        )
+                    });
                     *captured.borrow_mut() = Some(workspace.clone());
                     cx.new(|cx| Root::new(workspace, window, cx))
                 })?;

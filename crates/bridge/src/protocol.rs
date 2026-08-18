@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::coalesce::CoalesceKey;
+use crate::logs::{LogLine, LogSource, LogSourceState, LogTarget};
 use crate::resource::{
     ColumnSpec, ContextInfo, KindId, KindInfo, ObjectDetail, ResourceKey, ResourceRow,
 };
@@ -103,6 +104,19 @@ pub enum ClusterCommand {
         /// data is masked by default, in the YAML as well as in the table.
         reveal: bool,
     },
+    /// Start tailing logs. Replaces whatever session was running for this
+    /// cluster: one log view, one session.
+    StartLogs {
+        /// Which cluster.
+        cluster: ClusterId,
+        /// Which pods, which container, and how much history.
+        target: Arc<LogTarget>,
+    },
+    /// Stop tailing.
+    StopLogs {
+        /// Which cluster.
+        cluster: ClusterId,
+    },
     /// Round-trip liveness probe. The cluster layer answers with
     /// [`ClusterEvent::Pong`] carrying the same nonce.
     Ping {
@@ -128,7 +142,9 @@ impl ClusterCommand {
             | Self::Discover { cluster }
             | Self::Watch { cluster, .. }
             | Self::StopWatch { cluster, .. }
-            | Self::FetchObject { cluster, .. } => Some(cluster),
+            | Self::FetchObject { cluster, .. }
+            | Self::StartLogs { cluster, .. }
+            | Self::StopLogs { cluster } => Some(cluster),
             Self::ListContexts => None,
         }
     }
@@ -284,6 +300,32 @@ pub enum ClusterEvent {
         /// The object, its events and its owners.
         detail: Arc<ObjectDetail>,
     },
+    /// Log lines, merged across every pod in the session and batched.
+    ///
+    /// Never coalesced: a batch that is dropped is text nobody can get back.
+    /// The cluster layer keeps the rate manageable instead, by batching.
+    LogBatch {
+        /// Cluster the lines came from.
+        cluster: ClusterId,
+        /// The lines, in the order they were read.
+        lines: Arc<[LogLine]>,
+    },
+    /// A log source attached, ended, or failed.
+    LogSourceChanged {
+        /// Cluster the source belongs to.
+        cluster: ClusterId,
+        /// Which pod and container.
+        source: LogSource,
+        /// What it is doing now.
+        state: LogSourceState,
+    },
+    /// The log session itself could not start or could not continue.
+    LogsFailed {
+        /// Cluster the session belonged to.
+        cluster: ClusterId,
+        /// Verbatim underlying reason.
+        reason: String,
+    },
     /// An object could not be fetched. Shown in place of the detail view, never
     /// as an empty pane.
     ObjectFailed {
@@ -318,6 +360,10 @@ pub enum EventKey {
     ResourceReset(ClusterId, KindId),
     /// Only the newest detail fetch for an object matters.
     Object(ClusterId, KindId, ResourceKey),
+    /// Latest state of one log source wins.
+    LogSource(ClusterId, LogSource),
+    /// Only the newest log failure for a cluster matters.
+    LogsFailed(ClusterId),
 }
 
 impl CoalesceKey for EventKey {
@@ -376,6 +422,13 @@ impl ClusterEvent {
             Self::ObjectFailed {
                 cluster, kind, key, ..
             } => Some(EventKey::Object(cluster.clone(), kind.clone(), key.clone())),
+            // Dropping a batch would lose lines outright, so batches are never
+            // collapsed into one another.
+            Self::LogBatch { .. } => None,
+            Self::LogSourceChanged {
+                cluster, source, ..
+            } => Some(EventKey::LogSource(cluster.clone(), source.clone())),
+            Self::LogsFailed { cluster, .. } => Some(EventKey::LogsFailed(cluster.clone())),
         }
     }
 
@@ -389,7 +442,10 @@ impl ClusterEvent {
             | Self::ResourceApplied { cluster, .. }
             | Self::ResourceDeleted { cluster, .. }
             | Self::Object { cluster, .. }
-            | Self::ObjectFailed { cluster, .. } => Some(cluster),
+            | Self::ObjectFailed { cluster, .. }
+            | Self::LogBatch { cluster, .. }
+            | Self::LogSourceChanged { cluster, .. }
+            | Self::LogsFailed { cluster, .. } => Some(cluster),
             Self::Stale { cluster, .. } => cluster.as_ref(),
             Self::Contexts { .. } | Self::ConfigFailed { .. } => None,
         }
@@ -540,6 +596,51 @@ mod tests {
             current: None,
         };
         assert_eq!(failed.coalesce_key(), read.coalesce_key());
+    }
+
+    #[test]
+    fn log_batches_are_never_coalesced() {
+        let batch = ClusterEvent::LogBatch {
+            cluster: "prod".into(),
+            lines: Arc::from([] as [crate::logs::LogLine; 0]),
+        };
+        // Collapsing two batches would silently discard log lines, which is the
+        // one thing a log view may never do.
+        assert_eq!(batch.coalesce_key(), None);
+    }
+
+    #[test]
+    fn log_source_states_collapse_per_source() {
+        let attached = ClusterEvent::LogSourceChanged {
+            cluster: "prod".into(),
+            source: LogSource::new("api-0", "api"),
+            state: LogSourceState::Streaming,
+        };
+        let ended = ClusterEvent::LogSourceChanged {
+            cluster: "prod".into(),
+            source: LogSource::new("api-0", "api"),
+            state: LogSourceState::Ended,
+        };
+        let other = ClusterEvent::LogSourceChanged {
+            cluster: "prod".into(),
+            source: LogSource::new("api-1", "api"),
+            state: LogSourceState::Streaming,
+        };
+
+        assert_eq!(attached.coalesce_key(), ended.coalesce_key());
+        assert_ne!(attached.coalesce_key(), other.coalesce_key());
+    }
+
+    #[test]
+    fn a_resync_does_not_supersede_log_events() {
+        // Log lines have nothing to do with a resource listing; a resync that
+        // swallowed them would lose text.
+        let reset = EventKey::ResourceReset("prod".into(), KindId::new("", "v1", "Pod", "pods"));
+        assert!(!reset.supersedes(&EventKey::LogSource(
+            "prod".into(),
+            LogSource::new("api-0", "api")
+        )));
+        assert!(!reset.supersedes(&EventKey::LogsFailed("prod".into())));
     }
 
     #[test]
