@@ -224,3 +224,149 @@ a supported path rather than a workaround we invented.
   marginally faster start. It is one line in the workspace manifest.
 - CI on macOS runners does not need to download the toolchain, which keeps the
   pipeline fast.
+
+---
+
+## ADR-0009 — The MSRV floor is 1.89
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Amends:** ADR-0002, which declared `rust-version = "1.85"`.
+
+`kube 4.2.0` declares `rust-version = "1.89.0"`. Cargo will silently resolve a
+*older* `kube` — 2.0.1 — rather than break a 1.85 floor, which would have given
+us a two-major-version-old client without saying so. The floor moves to 1.89 so
+the dependency we actually reviewed is the one that gets built.
+
+The installed toolchain (1.97.1, ADR-0002) is unaffected. CI still builds on
+stable; the floor is a declaration, not a pin.
+
+---
+
+## ADR-0010 — `kube 4.2` with `k8s-openapi` pinned to the `v1_34` API
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Supersedes:** the version note in ADR-0007.
+
+### Decision
+
+```toml
+kube = { version = "4.2", features = [
+    "client", "runtime", "ws", "oidc", "oauth", "socks5", "http-proxy", "gzip",
+] }
+k8s-openapi = { version = "0.28", features = ["v1_34"] }
+```
+
+`kube` pins `kube-client`, `kube-core` and `kube-runtime` to its own version
+internally, so one version requirement fixes all four.
+
+### Why these features
+
+§2.5 makes enterprise auth non-negotiable: `oidc` and `oauth` cover OIDC refresh
+and GCP application-default credentials, `socks5` and `http-proxy` cover
+`HTTPS_PROXY`/`NO_PROXY` estates, `gzip` matters on a 10,000-object list. Exec
+credential plugins and client certificates need no feature flag. `ws` is not used
+until Phase 5's exec support but is enabled now so the TLS stack is not
+reconfigured later. TLS comes from `kube`'s default `rustls-tls`.
+
+### Why one API version, and why not the newest
+
+`k8s-openapi` permits exactly one version feature per build, and it is a
+workspace-wide choice. `v1_34` is two releases behind the newest it supports;
+core `v1` types are additive and deserialisation ignores unknown fields, so the
+generated types work against both older and newer apiservers — the `kind` cluster
+these were verified against runs 1.36. Pinning to the newest would gain nothing
+and would drift the moment a cluster is older.
+
+---
+
+## ADR-0011 — Kubernetes objects stop at the cluster layer
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+`k8s-openapi` types never cross the bridge. `crates/cluster` projects each `Pod`
+into a `PodSnapshot` (`crates/bridge/src/resource.rs`) — namespace, name, uid,
+status text, ready counts, restarts, node, creation time — and that is what the
+store and the UI see.
+
+Consequences:
+
+- The store and the UI have no kube dependency at all, so the entire rendering
+  path is testable with hand-written fixtures and no cluster.
+- The projection is a pure function with its own tests, including the parts of
+  `kubectl`'s `printPod` that make a crash-looping pod read `CrashLoopBackOff`
+  rather than `Running`.
+- The cost is that anything not projected is unavailable to the UI. Phase 2's
+  YAML and describe views need the whole object, so they will have to carry the
+  raw object *alongside* the projection rather than replace it. That is a
+  deliberate second step, not an oversight.
+
+---
+
+## ADR-0012 — Coalescing needs a barrier, not just a key
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Extends:** ADR-0004.
+
+Keyed collapsing replaces a pending event *in place* to keep batch order stable.
+That is correct for independent objects and wrong for a resync: a `PodsReset`
+carries a complete listing, so a pod update that arrives *after* it would be
+moved back to the earlier slot its key already occupied, applied first, and then
+wiped by the reset. The user would see a row silently revert.
+
+`CoalesceKey` therefore has two extra behaviours: `is_barrier`, and `supersedes`.
+A barrier key removes every pending item it supersedes and takes the end of the
+batch, so nothing it invalidates can be applied after it. `EventKey::PodsReset`
+is a barrier over that cluster's pod events, and over nothing else — another
+cluster's pods and this cluster's connection status survive it, as do unkeyed
+events that must all be delivered.
+
+The scan is linear, and only barrier pushes pay for it; ordinary object updates
+still take the hash-map path.
+
+---
+
+## ADR-0013 — A rejected credential ends the session; everything else retries
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+Watch failures split in two:
+
+- **401 and 403, or any `kube::Error::Auth`** — the watch stops, and the cluster
+  goes to `AuthFailed` carrying the apiserver's text. Retrying a credential the
+  cluster has already refused would hammer the API and, worse, would leave the UI
+  looking merely slow. The user gets an explicit "Reconnect", which re-runs the
+  exec plugin or OIDC refresh from scratch.
+- **Everything else** — the cluster goes to `Degraded` with the reason and the
+  watch keeps retrying under `kube`'s own backoff, returning to `Connected` when
+  a listing completes again.
+
+This is verified against a real apiserver, not a mock: `tests/e2e/tests/auth.rs`
+points a junk bearer token at the `kind` cluster and asserts the state and the
+message that come back.
+
+---
+
+## ADR-0014 — `KubeHandler` replaces `HealthHandler`, and kubeconfig is selectable
+
+**Date:** 2026-08-18
+**Status:** Accepted
+**Supersedes:** ADR-0007.
+
+Phase 0's `HealthHandler` is gone; `KubeHandler` owns one session per cluster —
+a task holding a `kube::Client` and a pod watch — and answers `ListContexts`,
+`Connect`, `Disconnect` and `Ping`. Sessions are independent tasks in a map, so a
+cluster that is unreachable cannot stall another, and `Disconnect` aborts exactly
+one of them. `Ping`/`Pong` survives as what it always was: a bridge liveness
+probe that makes no API call.
+
+`KubeHandler::with_kubeconfig(path)`, behind the `--kubeconfig` flag, reads one
+specific file instead of `$KUBECONFIG`/`~/.kube/config`. It matches `kubectl`, and
+it is what lets the auth-failure tests point a deliberately broken credential at
+a real apiserver without touching the developer's own kubeconfig — the
+alternative was mutating a process-wide environment variable from a test, which
+needs `unsafe` under the 2024 edition and is forbidden workspace-wide.

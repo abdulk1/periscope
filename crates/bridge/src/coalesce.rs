@@ -11,12 +11,41 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
+/// How a key relates to the other keys already pending.
+///
+/// Equal keys always collapse; that is the cheap, indexed case. Some events are
+/// wider than that: a full resync of a cluster's pods makes *every* pending
+/// update for that cluster redundant. Without this, in-place replacement could
+/// reorder a newer update ahead of the resync that was meant to precede it, and
+/// the resync would silently undo it.
+pub trait CoalesceKey: Eq + Hash + Clone {
+    /// Whether an item keyed by `self` makes one keyed by `other` redundant.
+    ///
+    /// Only consulted for keys that report [`CoalesceKey::is_barrier`].
+    fn supersedes(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    /// Whether this key supersedes anything beyond an equal key. Keys that do
+    /// not — the overwhelming majority — skip the linear scan entirely.
+    fn is_barrier(&self) -> bool {
+        false
+    }
+}
+
+/// One pending item and the key it collapses on.
+#[derive(Debug)]
+struct Pending<K, T> {
+    key: Option<K>,
+    item: T,
+}
+
 /// Accumulates items, collapsing those that share a key.
 #[derive(Debug)]
 pub struct Coalescer<K, T> {
     interval: Duration,
     max_batch: usize,
-    items: Vec<T>,
+    items: Vec<Pending<K, T>>,
     index: HashMap<K, usize>,
     deadline: Option<Instant>,
     collapsed: u64,
@@ -24,7 +53,7 @@ pub struct Coalescer<K, T> {
 
 impl<K, T> Coalescer<K, T>
 where
-    K: Eq + Hash + Clone,
+    K: CoalesceKey,
 {
     /// Creates a coalescer that flushes after `interval`, or sooner if the
     /// batch reaches `max_batch` items.
@@ -44,21 +73,56 @@ where
     /// Adds an item. If `key` is `Some` and an item with that key is already
     /// pending, the pending item is replaced in place — position in the batch is
     /// preserved so ordering stays stable.
+    ///
+    /// A barrier key instead *removes* everything it supersedes and takes its
+    /// place at the end of the batch, so nothing it invalidates can be applied
+    /// after it.
     pub fn push(&mut self, key: Option<K>, item: T, now: Instant) {
         if self.deadline.is_none() {
             self.deadline = Some(now + self.interval);
         }
 
-        if let Some(key) = key {
-            if let Some(&slot) = self.index.get(&key) {
-                self.items[slot] = item;
-                self.collapsed += 1;
-                return;
-            }
-            self.index.insert(key, self.items.len());
+        let Some(key) = key else {
+            self.items.push(Pending { key: None, item });
+            return;
+        };
+
+        if key.is_barrier() {
+            self.supersede(&key);
+        } else if let Some(&slot) = self.index.get(&key) {
+            self.items[slot].item = item;
+            self.collapsed += 1;
+            return;
         }
 
-        self.items.push(item);
+        self.index.insert(key.clone(), self.items.len());
+        self.items.push(Pending {
+            key: Some(key),
+            item,
+        });
+    }
+
+    /// Drops every pending item that `key` makes redundant, and reindexes.
+    ///
+    /// Unkeyed items always survive: they are the ones that must all be
+    /// delivered, so no barrier may swallow them.
+    fn supersede(&mut self, key: &K) {
+        let before = self.items.len();
+        self.items
+            .retain(|pending| !pending.key.as_ref().is_some_and(|k| key.supersedes(k)));
+
+        let removed = before - self.items.len();
+        if removed == 0 {
+            return;
+        }
+        self.collapsed += removed as u64;
+
+        self.index.clear();
+        for (slot, pending) in self.items.iter().enumerate() {
+            if let Some(key) = &pending.key {
+                self.index.insert(key.clone(), slot);
+            }
+        }
     }
 
     /// Number of items waiting to be flushed.
@@ -95,6 +159,9 @@ where
         self.index.clear();
         self.deadline = None;
         std::mem::take(&mut self.items)
+            .into_iter()
+            .map(|pending| pending.item)
+            .collect()
     }
 }
 
@@ -103,6 +170,31 @@ mod tests {
     use super::*;
 
     const FLUSH: Duration = Duration::from_millis(16);
+
+    impl CoalesceKey for &'static str {}
+    impl CoalesceKey for u32 {}
+
+    /// A key with two scopes: one object, or a whole cluster's worth of them.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    enum Scoped {
+        Object(&'static str, u32),
+        Resync(&'static str),
+    }
+
+    impl CoalesceKey for Scoped {
+        fn is_barrier(&self) -> bool {
+            matches!(self, Self::Resync(_))
+        }
+
+        fn supersedes(&self, other: &Self) -> bool {
+            match (self, other) {
+                (Self::Resync(cluster), Self::Object(other, _) | Self::Resync(other)) => {
+                    cluster == other
+                }
+                _ => false,
+            }
+        }
+    }
 
     fn coalescer() -> Coalescer<&'static str, i32> {
         Coalescer::new(FLUSH, 512)
@@ -209,6 +301,45 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c.deadline(), Some(later + FLUSH));
         assert_eq!(c.drain(), vec![2]);
+    }
+
+    #[test]
+    fn a_barrier_drops_what_it_supersedes_and_moves_to_the_end() {
+        let mut c: Coalescer<Scoped, &str> = Coalescer::new(FLUSH, usize::MAX);
+        let now = Instant::now();
+
+        c.push(Some(Scoped::Object("prod", 1)), "pod-1 v1", now);
+        c.push(Some(Scoped::Object("staging", 9)), "other cluster", now);
+        c.push(Some(Scoped::Resync("prod")), "prod resync", now);
+        // Arrives after the resync, so it must stay after it.
+        c.push(Some(Scoped::Object("prod", 1)), "pod-1 v2", now);
+
+        assert_eq!(c.drain(), vec!["other cluster", "prod resync", "pod-1 v2"]);
+    }
+
+    #[test]
+    fn a_barrier_never_swallows_unkeyed_items() {
+        let mut c: Coalescer<Scoped, &str> = Coalescer::new(FLUSH, usize::MAX);
+        let now = Instant::now();
+
+        c.push(None, "must be delivered", now);
+        c.push(Some(Scoped::Object("prod", 1)), "pod-1", now);
+        c.push(Some(Scoped::Resync("prod")), "prod resync", now);
+
+        assert_eq!(c.drain(), vec!["must be delivered", "prod resync"]);
+    }
+
+    #[test]
+    fn back_to_back_barriers_collapse_to_the_newest() {
+        let mut c: Coalescer<Scoped, &str> = Coalescer::new(FLUSH, usize::MAX);
+        let now = Instant::now();
+
+        c.push(Some(Scoped::Resync("prod")), "first", now);
+        c.push(Some(Scoped::Resync("prod")), "second", now);
+
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.collapsed(), 1);
+        assert_eq!(c.drain(), vec!["second"]);
     }
 
     #[test]

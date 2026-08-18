@@ -5,20 +5,27 @@ affordances: live resource streams, multi-cluster, and log tailing across pods.
 
 **Binary:** `scope` · **Language:** Rust · **UI:** GPUI
 
-> **Status: Phase 0 (skeleton).** The window opens and the tokio ↔ GPUI bridge
-> works end to end. It does not connect to Kubernetes yet — that is Phase 1. See
-> [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap and
-> [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not work.
+> **Status: Phase 1 (reads one cluster).** Connects to a kubeconfig context and
+> renders live pods in a virtualised table — namespace, name, ready, status,
+> restarts, age, node — with the connection state and the real API error text
+> always visible. Pods only: other resources, CRDs, detail views and logs are
+> Phases 2 and 3. See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap
+> and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not work.
 
 ## Build and run
 
-Requires Rust stable (developed on 1.97.1; MSRV 1.85).
+Requires Rust stable (developed on 1.97.1; MSRV 1.89) and a kubeconfig.
 
 ```sh
-cargo run --bin scope             # open the window
-cargo run --bin scope -- --verbose  # mirror the log to stderr
-cargo run --bin scope -- --perf     # log bridge throughput per flush
+cargo run --release --bin scope                        # open the window
+cargo run --release --bin scope -- --kubeconfig ./kc   # use one specific file
+cargo run --release --bin scope -- --verbose           # mirror the log to stderr
+cargo run --release --bin scope -- --perf              # log watch throughput and flush timings
 ```
+
+It connects to the `current-context` on start; the sidebar lists every context
+and connects to whichever you click. Prefer `--release`: debug builds miss the
+cold-start budget by a wide margin (`docs/LIMITATIONS.md`).
 
 Logs are written to a daily-rotating file under the platform's application data
 directory; the path is printed in the log's first line and shown by `--verbose`.
@@ -47,6 +54,14 @@ Every change must leave these green:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
+```
+
+The end-to-end suite needs a real cluster and is skipped unless asked for:
+
+```sh
+kind create cluster --name periscope
+cargo test -p periscope-e2e -- --ignored --test-threads 1
+cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fixture
 ```
 
 Architecture decisions are recorded in [`docs/DECISIONS.md`](docs/DECISIONS.md) —

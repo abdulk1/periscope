@@ -65,3 +65,40 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --bin scope
+
+  e2e:
+    name: kind
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The e2e crate needs no display, but it does link the same graphics
+      # dependencies through the workspace.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libfontconfig-dev \
+            libwayland-dev \
+            libxkbcommon-x11-dev \
+            libssl-dev \
+            libzstd-dev \
+            libvulkan-dev \
+            libgl1-mesa-dev \
+            libxcb-composite0-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Create a cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: periscope
+
+      - name: Seed the load fixture
+        run: cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000
+
+      - name: End-to-end tests
+        run: cargo test --release -p periscope-e2e -- --ignored --test-threads 1 --nocapture

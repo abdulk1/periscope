@@ -7,6 +7,10 @@ use periscope_config::Verbosity;
 #[derive(Debug, Parser)]
 #[command(name = "scope", version, about, long_about = None)]
 pub struct Cli {
+    /// Read this kubeconfig file instead of $KUBECONFIG or ~/.kube/config.
+    #[arg(long, value_name = "PATH")]
+    pub kubeconfig: Option<std::path::PathBuf>,
+
     /// Log everything, and mirror the log to stderr.
     #[arg(short, long)]
     pub verbose: bool,
@@ -52,6 +56,18 @@ mod tests {
     #[test]
     fn verbose_and_quiet_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["scope", "--verbose", "--quiet"]).is_err());
+    }
+
+    #[test]
+    fn kubeconfig_defaults_to_the_standard_search() {
+        assert_eq!(Cli::try_parse_from(["scope"]).unwrap().kubeconfig, None);
+        assert_eq!(
+            Cli::try_parse_from(["scope", "--kubeconfig", "/tmp/kc"])
+                .unwrap()
+                .kubeconfig
+                .as_deref(),
+            Some(std::path::Path::new("/tmp/kc"))
+        );
     }
 
     #[test]

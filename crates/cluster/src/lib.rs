@@ -5,14 +5,17 @@
 //! only by receiving [`periscope_bridge::ClusterCommand`]s and emitting
 //! [`periscope_bridge::ClusterEvent`]s.
 //!
-//! Phase 0 ships the health handler only. kube clients, kubeconfig parsing,
-//! watchers and log streams land in Phase 1.
-//!
 //! # Read-only invariant
 //!
-//! Until Phase 5 no code path in this crate may mutate cluster state. New
-//! commands must be reads.
+//! Until Phase 5 no code path in this crate may mutate cluster state. Every
+//! request it makes is a get, list or watch. New commands must be reads.
 
-pub mod health;
+pub mod errors;
+pub mod handler;
+pub mod kubeconfig;
+pub mod pods;
+pub mod watch;
 
-pub use health::HealthHandler;
+pub use errors::Failure;
+pub use handler::KubeHandler;
+pub use kubeconfig::Contexts;

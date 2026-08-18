@@ -16,7 +16,7 @@ use gpui::{
 use gpui_component::Root;
 use gpui_component_assets::Assets;
 use periscope_bridge::{ClusterRuntime, PumpConfig, RuntimeConfig, spawn_event_pump};
-use periscope_cluster::HealthHandler;
+use periscope_cluster::KubeHandler;
 use periscope_ui::Workspace;
 
 use crate::cli::Cli;
@@ -46,7 +46,11 @@ fn main() -> Result<()> {
         "starting Periscope"
     );
 
-    let (runtime, events) = ClusterRuntime::start(HealthHandler::new(), RuntimeConfig::default())
+    let handler = match cli.kubeconfig.clone() {
+        Some(path) => KubeHandler::with_kubeconfig(path),
+        None => KubeHandler::new(),
+    };
+    let (runtime, events) = ClusterRuntime::start(handler, RuntimeConfig::default())
         .context("could not start the cluster runtime")?;
     let commands = runtime.commands();
 
@@ -82,17 +86,22 @@ fn main() -> Result<()> {
                         PumpConfig::default(),
                         cx,
                         move |batch, stats, cx| {
+                            let applied = std::time::Instant::now();
+                            let rows = workspace.update(cx, |workspace, cx| {
+                                workspace.apply_events(batch, stats, cx);
+                                workspace.state().rows().len()
+                            });
+
                             if perf && stats.applied > 0 {
                                 tracing::info!(
                                     applied = stats.applied,
                                     collapsed = stats.collapsed,
                                     dropped = stats.dropped,
+                                    rows,
+                                    apply_us = applied.elapsed().as_micros() as u64,
                                     "flush"
                                 );
                             }
-                            workspace.update(cx, |workspace, cx| {
-                                workspace.apply_events(batch, stats, cx);
-                            });
                         },
                     );
                     cx.set_global(PumpHandle(pump));

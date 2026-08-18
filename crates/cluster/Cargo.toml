@@ -10,9 +10,16 @@ authors.workspace = true
 
 [dependencies]
 futures.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
 periscope-bridge.workspace = true
-tokio = { workspace = true, features = ["rt", "time"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true

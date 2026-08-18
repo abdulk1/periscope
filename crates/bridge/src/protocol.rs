@@ -8,6 +8,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::coalesce::CoalesceKey;
+use crate::resource::{ContextInfo, PodSnapshot, ResourceKey};
+
 /// Identifies a connected cluster. This is the kubeconfig context name, which
 /// is what the user sees and what every error message must be able to name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -50,6 +53,15 @@ impl From<String> for ClusterId {
 /// the compiler should name every place that has to handle them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClusterCommand {
+    /// Re-read kubeconfig and report the contexts it defines. Answered with
+    /// [`ClusterEvent::Contexts`] or [`ClusterEvent::ConfigFailed`].
+    ListContexts,
+    /// Connect to a context and start watching it. Idempotent: connecting to an
+    /// already-connected cluster is a no-op rather than a second set of watches.
+    Connect {
+        /// Which kubeconfig context to connect to.
+        cluster: ClusterId,
+    },
     /// Round-trip liveness probe. The cluster layer answers with
     /// [`ClusterEvent::Pong`] carrying the same nonce.
     Ping {
@@ -66,10 +78,13 @@ pub enum ClusterCommand {
 }
 
 impl ClusterCommand {
-    /// The cluster this command addresses.
-    pub fn cluster(&self) -> &ClusterId {
+    /// The cluster this command addresses, for commands that address one.
+    pub fn cluster(&self) -> Option<&ClusterId> {
         match self {
-            Self::Ping { cluster, .. } | Self::Disconnect { cluster } => cluster,
+            Self::Ping { cluster, .. }
+            | Self::Disconnect { cluster }
+            | Self::Connect { cluster } => Some(cluster),
+            Self::ListContexts => None,
         }
     }
 }
@@ -163,6 +178,43 @@ pub enum ClusterEvent {
         /// How many events were dropped since the last `Stale`.
         dropped: usize,
     },
+    /// The contexts kubeconfig defines.
+    Contexts {
+        /// Every context, in kubeconfig order.
+        contexts: Arc<[ContextInfo]>,
+        /// The `current-context`, when kubeconfig names one.
+        current: Option<ClusterId>,
+    },
+    /// Kubeconfig could not be read or parsed. The UI shows this instead of an
+    /// empty context list, which would look like "you have no clusters".
+    ConfigFailed {
+        /// Verbatim underlying reason.
+        reason: String,
+    },
+    /// A complete pod list for a cluster, replacing whatever the store held.
+    ///
+    /// Emitted when a watch starts and whenever it has to restart, which is the
+    /// only way to learn that objects disappeared while the watch was down.
+    PodsReset {
+        /// Cluster the list belongs to.
+        cluster: ClusterId,
+        /// Every pod visible to this client, in no particular order.
+        pods: Arc<[PodSnapshot]>,
+    },
+    /// A pod was added or changed.
+    PodApplied {
+        /// Cluster the pod belongs to.
+        cluster: ClusterId,
+        /// The pod's current state.
+        pod: Arc<PodSnapshot>,
+    },
+    /// A pod was deleted.
+    PodDeleted {
+        /// Cluster the pod belonged to.
+        cluster: ClusterId,
+        /// Which pod.
+        key: ResourceKey,
+    },
 }
 
 /// Identity used to collapse superseded events during coalescing.
@@ -175,6 +227,27 @@ pub enum EventKey {
     Status(ClusterId),
     /// Drop notices accumulate per cluster; the newest count supersedes.
     Stale(Option<ClusterId>),
+    /// Only the newest reading of kubeconfig matters.
+    Contexts,
+    /// Latest state of one pod wins; a delete supersedes an earlier update.
+    Pod(ClusterId, ResourceKey),
+    /// A full resync supersedes every pending pod event for its cluster.
+    PodsReset(ClusterId),
+}
+
+impl CoalesceKey for EventKey {
+    fn is_barrier(&self) -> bool {
+        matches!(self, Self::PodsReset(_))
+    }
+
+    fn supersedes(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::PodsReset(cluster), Self::Pod(other, _) | Self::PodsReset(other)) => {
+                cluster == other
+            }
+            _ => false,
+        }
+    }
 }
 
 impl ClusterEvent {
@@ -183,16 +256,29 @@ impl ClusterEvent {
         match self {
             // Every pong answers a distinct ping; collapsing them would lose replies.
             Self::Pong { .. } => None,
+            // A config failure explains itself; the next successful read
+            // replaces it via the Contexts key, so it must share that key.
+            Self::Contexts { .. } | Self::ConfigFailed { .. } => Some(EventKey::Contexts),
             Self::Status { cluster, .. } => Some(EventKey::Status(cluster.clone())),
             Self::Stale { cluster, .. } => Some(EventKey::Stale(cluster.clone())),
+            Self::PodsReset { cluster, .. } => Some(EventKey::PodsReset(cluster.clone())),
+            Self::PodApplied { cluster, pod } => {
+                Some(EventKey::Pod(cluster.clone(), pod.key.clone()))
+            }
+            Self::PodDeleted { cluster, key } => Some(EventKey::Pod(cluster.clone(), key.clone())),
         }
     }
 
     /// The cluster this event concerns, when it concerns one.
     pub fn cluster(&self) -> Option<&ClusterId> {
         match self {
-            Self::Pong { cluster, .. } | Self::Status { cluster, .. } => Some(cluster),
+            Self::Pong { cluster, .. }
+            | Self::Status { cluster, .. }
+            | Self::PodsReset { cluster, .. }
+            | Self::PodApplied { cluster, .. }
+            | Self::PodDeleted { cluster, .. } => Some(cluster),
             Self::Stale { cluster, .. } => cluster.as_ref(),
+            Self::Contexts { .. } | Self::ConfigFailed { .. } => None,
         }
     }
 }
@@ -246,6 +332,75 @@ mod tests {
         assert!(state.is_problem());
         assert_eq!(state.label(), "auth failed");
         assert!(state.detail().unwrap().contains("expired token"));
+    }
+
+    #[test]
+    fn a_resync_supersedes_pending_pod_events_for_its_own_cluster_only() {
+        let reset = EventKey::PodsReset("prod".into());
+        assert!(reset.is_barrier());
+
+        assert!(reset.supersedes(&EventKey::Pod(
+            "prod".into(),
+            ResourceKey::new("default", "api-0")
+        )));
+        assert!(reset.supersedes(&EventKey::PodsReset("prod".into())));
+
+        // Another cluster's pods, and this cluster's connection state, survive.
+        assert!(!reset.supersedes(&EventKey::Pod(
+            "staging".into(),
+            ResourceKey::new("default", "api-0")
+        )));
+        assert!(!reset.supersedes(&EventKey::Status("prod".into())));
+    }
+
+    #[test]
+    fn pod_events_are_keyed_by_object_so_a_delete_supersedes_an_update() {
+        let pod = PodSnapshot {
+            key: ResourceKey::new("default", "api-0"),
+            uid: None,
+            status: Arc::from("Running"),
+            ready: 1,
+            containers: 1,
+            restarts: 0,
+            node: None,
+            created: None,
+        };
+        let applied = ClusterEvent::PodApplied {
+            cluster: "prod".into(),
+            pod: Arc::new(pod.clone()),
+        };
+        let deleted = ClusterEvent::PodDeleted {
+            cluster: "prod".into(),
+            key: pod.key.clone(),
+        };
+
+        assert_eq!(applied.coalesce_key(), deleted.coalesce_key());
+        assert!(!applied.coalesce_key().unwrap().is_barrier());
+    }
+
+    #[test]
+    fn a_successful_kubeconfig_read_replaces_a_previous_failure() {
+        let failed = ClusterEvent::ConfigFailed {
+            reason: "no such file".into(),
+        };
+        let read = ClusterEvent::Contexts {
+            contexts: Arc::from([] as [ContextInfo; 0]),
+            current: None,
+        };
+        assert_eq!(failed.coalesce_key(), read.coalesce_key());
+    }
+
+    #[test]
+    fn commands_that_address_no_cluster_say_so() {
+        assert_eq!(ClusterCommand::ListContexts.cluster(), None);
+        assert_eq!(
+            ClusterCommand::Connect {
+                cluster: "prod".into()
+            }
+            .cluster()
+            .map(ClusterId::as_str),
+            Some("prod")
+        );
     }
 
     #[test]

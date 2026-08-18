@@ -115,6 +115,20 @@ impl ConnectionRegistry {
                 }
                 true
             }
+            // Resource and kubeconfig events say nothing about connection
+            // health; the store's other tables own those.
+            ClusterEvent::Contexts { .. }
+            | ClusterEvent::ConfigFailed { .. }
+            | ClusterEvent::PodsReset { .. }
+            | ClusterEvent::PodApplied { .. }
+            | ClusterEvent::PodDeleted { .. } => false,
+        }
+    }
+
+    /// Clears the stale marker for a cluster, once its data has been resynced.
+    pub fn mark_fresh(&mut self, cluster: &ClusterId) {
+        if let Some(connection) = self.clusters.get_mut(cluster) {
+            connection.dropped_events = 0;
         }
     }
 

@@ -234,10 +234,22 @@ mod tests {
                             elapsed: started.elapsed(),
                         });
                     }
+                    ClusterCommand::Connect { cluster } => {
+                        events.send(ClusterEvent::Status {
+                            cluster,
+                            state: ConnectionState::Connected,
+                        });
+                    }
                     ClusterCommand::Disconnect { cluster } => {
                         events.send(ClusterEvent::Status {
                             cluster,
                             state: ConnectionState::Disconnected { reason: None },
+                        });
+                    }
+                    ClusterCommand::ListContexts => {
+                        events.send(ClusterEvent::Contexts {
+                            contexts: Arc::from([] as [crate::resource::ContextInfo; 0]),
+                            current: None,
                         });
                     }
                 }

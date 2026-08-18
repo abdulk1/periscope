@@ -148,7 +148,7 @@ mod tests {
                 match event {
                     ClusterEvent::Pong { nonce, .. } => self.pongs.push(nonce),
                     ClusterEvent::Status { state, .. } => self.state = Some(state),
-                    ClusterEvent::Stale { .. } => {}
+                    _ => {}
                 }
             }
         }

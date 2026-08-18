@@ -1,0 +1,36 @@
+[package]
+name = "periscope-e2e"
+description = "kind-based integration tests and the load-test fixture generator"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+periscope-bridge.workspace = true
+periscope-cluster.workspace = true
+periscope-store.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[[bin]]
+name = "seed-pods"
+path = "src/bin/seed_pods.rs"
+
+# The workspace lints are inherited except for the print bans: this package is a
+# test harness and a CLI fixture generator, so stdout *is* its interface.
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"

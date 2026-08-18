@@ -1,26 +1,32 @@
 //! The root view.
 //!
-//! Phase 0 renders the bridge rather than a cluster: connection state, probe
-//! round trips and flush counters. That is deliberate — it makes the plumbing
-//! visible while there is nothing else to show, and the same panels become the
-//! status chrome once real resources arrive.
+//! It owns the [`AppState`] and renders it: the context picker on the left, the
+//! pod table on the right, and connection state everywhere it matters. It sends
+//! commands and reads state; it never talks to Kubernetes and never decides
+//! what is true.
 
-use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::fmt;
+use std::time::{Duration, Instant, SystemTime};
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Context, IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window, div,
-    px,
+    App, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::Button;
 use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use periscope_bridge::{
     ClusterCommand, ClusterEvent, ClusterId, CommandError, CommandSender, ConnectionState,
     FlushStats,
 };
 use periscope_config::ThemeChoice;
-use periscope_store::ConnectionRegistry;
+use periscope_store::AppState;
 
-use crate::theme;
+use crate::{format, table, theme};
+
+/// How often the view repaints with no events, so the age column keeps moving.
+const TICK: Duration = Duration::from_secs(1);
 
 /// Running totals from the event pump, shown in the footer and logged by `--perf`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,40 +51,59 @@ impl BridgeStats {
 }
 
 /// The application's root view.
-#[derive(Debug)]
 pub struct Workspace {
     commands: CommandSender,
-    connections: ConnectionRegistry,
+    state: AppState,
     stats: BridgeStats,
     theme: ThemeChoice,
     /// Process start, used to report cold-start time on first paint.
     started: Instant,
     cold_start: Option<Duration>,
-    next_nonce: u64,
-    /// The most recent thing that went wrong, shown verbatim.
+    /// Clusters this session has already tried to connect to, so a repainting
+    /// UI cannot spam the runtime with connect commands.
+    attempted: HashSet<ClusterId>,
+    /// The most recent thing that went wrong locally, shown verbatim.
     last_error: Option<SharedString>,
+    /// Repaints the age column while nothing else is happening.
+    _ticker: Task<()>,
 }
 
-/// The cluster Phase 0 probes. Phase 1 replaces this with kubeconfig contexts.
-const LOCAL: &str = "local";
+impl fmt::Debug for Workspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Workspace")
+            .field("active", &self.state.active())
+            .field("contexts", &self.state.contexts().len())
+            .field("rows", &self.state.rows().len())
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
 
 impl Workspace {
-    /// Builds the root view.
+    /// Builds the root view and asks the cluster layer what contexts exist.
     pub fn new(commands: CommandSender, started: Instant, cx: &mut Context<Self>) -> Self {
-        let mut connections = ConnectionRegistry::new();
-        connections.track(ClusterId::new(LOCAL), Instant::now());
-        cx.notify();
+        let ticker = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TICK).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
 
-        Self {
+        let mut workspace = Self {
             commands,
-            connections,
+            state: AppState::new(),
             stats: BridgeStats::default(),
             theme: ThemeChoice::default(),
             started,
             cold_start: None,
-            next_nonce: 0,
+            attempted: HashSet::new(),
             last_error: None,
-        }
+            _ticker: ticker,
+        };
+        workspace.send(ClusterCommand::ListContexts);
+        workspace
     }
 
     /// Applies one coalesced batch from the bridge. This is the only entry point
@@ -90,8 +115,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.stats.record(stats);
-        let now = Instant::now();
-        self.connections.apply_batch(events.iter(), now);
+        self.state.apply_batch(events.iter(), Instant::now());
+
+        // Reading kubeconfig picks a cluster; opening it is what the user
+        // actually asked for by starting the app.
+        if let Some(active) = self.state.active().cloned() {
+            self.connect_once(active);
+        }
+
         cx.notify();
     }
 
@@ -100,22 +131,37 @@ impl Workspace {
         self.stats
     }
 
-    fn send_probe(&mut self, cx: &mut Context<Self>) {
-        self.next_nonce += 1;
-        let command = ClusterCommand::Ping {
-            cluster: ClusterId::new(LOCAL),
-            nonce: self.next_nonce,
-        };
+    /// The state being rendered.
+    pub fn state(&self) -> &AppState {
+        &self.state
+    }
 
-        match self.commands.send(command) {
-            Ok(()) => self.last_error = None,
-            Err(error) => {
-                // Never swallow this: a button that silently did nothing is the
-                // exact failure mode the error-handling rules forbid.
-                tracing::error!(%error, "probe command was not queued");
-                self.last_error = Some(SharedString::from(error_text(error)));
-            }
+    /// Switches to a cluster, connecting to it if this session has not yet.
+    fn select(&mut self, cluster: ClusterId, cx: &mut Context<Self>) {
+        self.state.select(cluster.clone());
+        self.connect_once(cluster);
+        cx.notify();
+    }
+
+    /// Connects to a cluster once per session. Reconnecting is explicit.
+    fn connect_once(&mut self, cluster: ClusterId) {
+        if self.attempted.insert(cluster.clone()) {
+            self.send(ClusterCommand::Connect { cluster });
         }
+    }
+
+    /// Retries the active cluster after a failure.
+    fn reconnect(&mut self, cx: &mut Context<Self>) {
+        if let Some(cluster) = self.state.active().cloned() {
+            self.attempted.insert(cluster.clone());
+            self.send(ClusterCommand::Connect { cluster });
+        }
+        cx.notify();
+    }
+
+    /// Re-reads kubeconfig.
+    fn reload_contexts(&mut self, cx: &mut Context<Self>) {
+        self.send(ClusterCommand::ListContexts);
         cx.notify();
     }
 
@@ -125,9 +171,28 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Queues a command, surfacing a failure rather than swallowing it.
+    fn send(&mut self, command: ClusterCommand) {
+        match self.commands.send(command) {
+            Ok(()) => self.last_error = None,
+            Err(error) => {
+                // A button that silently did nothing is the exact failure mode
+                // the error-handling rules forbid.
+                tracing::error!(%error, "command was not queued");
+                self.last_error = Some(SharedString::from(error_text(error)));
+            }
+        }
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let subtitle = match self.state.active() {
+            Some(cluster) => format!("{cluster}"),
+            None => "no cluster selected".to_owned(),
+        };
+
         h_flex()
             .w_full()
+            .flex_none()
             .items_center()
             .justify_between()
             .px_5()
@@ -147,18 +212,18 @@ impl Workspace {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child("A native Kubernetes console"),
+                            .child(subtitle),
                     ),
             )
             .child(
                 h_flex()
                     .gap_2()
                     .child(
-                        Button::new("probe")
-                            .primary()
+                        Button::new("reload")
+                            .outline()
                             .small()
-                            .label("Send probe")
-                            .on_click(cx.listener(|this, _, _, cx| this.send_probe(cx))),
+                            .label("Reload contexts")
+                            .on_click(cx.listener(|this, _, _, cx| this.reload_contexts(cx))),
                     )
                     .child(
                         Button::new("theme")
@@ -172,86 +237,162 @@ impl Workspace {
             )
     }
 
-    fn connections_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<_> = self
-            .connections
-            .iter()
-            .map(|(id, connection)| {
-                let accent = state_color(&connection.state, cx);
-                let detail = connection
-                    .state
-                    .detail()
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        connection
-                            .last_round_trip
-                            .map(|rtt| format!("last probe {:.1}ms", rtt.as_secs_f64() * 1_000.0))
-                    })
-                    .unwrap_or_else(|| "no probe yet".to_owned());
+    /// The context picker.
+    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.state.active().cloned();
 
-                h_flex()
+        let rows: Vec<_> = self
+            .state
+            .contexts()
+            .iter()
+            .map(|context| {
+                let id = ClusterId::new(&*context.name);
+                let selected = active.as_ref() == Some(&id);
+                let connection = self.state.connection(&id);
+                let state = connection
+                    .map(|c| &c.state)
+                    .unwrap_or(&ConnectionState::Idle);
+                let pods = self.state.pod_count(&id);
+
+                let detail = match (state.detail(), pods) {
+                    (Some(reason), _) => reason.to_owned(),
+                    (None, 0) => state.label().to_owned(),
+                    (None, count) => format!("{count} pods"),
+                };
+
+                let click_id = id.clone();
+                div()
+                    .id(SharedString::from(context.name.to_string()))
                     .w_full()
-                    .items_center()
-                    .justify_between()
-                    .px_4()
-                    .py_3()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .when(selected, |row| row.bg(cx.theme().accent))
+                    .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select(click_id.clone(), cx);
+                    }))
                     .child(
                         h_flex()
-                            .gap_3()
+                            .gap_2()
                             .items_center()
-                            .child(div().size(px(8.)).rounded_full().bg(accent))
+                            .child(div().size(px(8.)).rounded_full().bg(state_color(state, cx)))
                             .child(
                                 v_flex()
-                                    .gap_1()
+                                    .gap_0p5()
+                                    .overflow_hidden()
                                     .child(
                                         div()
                                             .text_sm()
                                             .text_color(cx.theme().foreground)
-                                            .child(id.to_string()),
+                                            .child(context.name.to_string()),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
+                                            .truncate()
                                             .child(detail),
                                     ),
                             ),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(accent)
-                            .child(connection.state.label()),
-                    )
             })
             .collect();
 
-        panel("Clusters", cx).children(rows)
+        let empty = rows.is_empty().then(|| {
+            div()
+                .px_3()
+                .py_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("no contexts in kubeconfig")
+        });
+
+        v_flex()
+            .w(px(240.))
+            .flex_none()
+            .h_full()
+            .gap_1()
+            .p_2()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("CONTEXTS"),
+            )
+            .children(rows)
+            .children(empty)
     }
 
-    fn bridge_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let stats = self.stats;
-        panel("Bridge", cx).child(
+    /// The banner that explains whatever is currently wrong.
+    fn banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (message, retry) = if let Some(error) = self.last_error.clone() {
+            (error.to_string(), false)
+        } else if let Some(error) = self.state.config_error() {
+            (format!("kubeconfig: {error}"), false)
+        } else {
+            let connection = self.state.active_connection()?;
+            if !connection.state.is_problem() {
+                return None;
+            }
+            let cluster = self.state.active()?;
+            let detail = connection.state.detail().unwrap_or("no detail available");
+            (
+                format!("{cluster}: {} — {detail}", connection.state.label()),
+                true,
+            )
+        };
+
+        Some(
             h_flex()
                 .w_full()
-                .px_4()
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .px_5()
                 .py_3()
-                .gap_6()
-                .child(metric("flushes", stats.flushes.to_string(), cx))
-                .child(metric("events applied", stats.applied.to_string(), cx))
-                .child(metric("coalesced", stats.collapsed.to_string(), cx))
-                .child(metric("dropped", stats.dropped.to_string(), cx)),
+                .bg(cx.theme().danger)
+                .text_sm()
+                .text_color(cx.theme().danger_foreground)
+                .child(div().flex_1().child(message))
+                .children(retry.then(|| {
+                    Button::new("reconnect")
+                        .small()
+                        .label("Reconnect")
+                        .on_click(cx.listener(|this, _, _, cx| this.reconnect(cx)))
+                })),
         )
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (pods, ready) = self.state.active_counts();
+        let connection = self.state.active_connection();
+        let state = connection
+            .map(|c| c.state.label())
+            .unwrap_or("no cluster selected");
+
+        let stale = connection
+            .filter(|connection| connection.is_stale())
+            .map(|connection| format!("· {} events dropped", connection.dropped_events));
+
         let cold_start = self
             .cold_start
-            .map(|d| format!("cold start {}ms", d.as_millis()))
+            .map(|elapsed| format!("cold start {}ms", elapsed.as_millis()))
             .unwrap_or_else(|| "measuring cold start".to_owned());
+
+        let round_trip = connection
+            .and_then(|connection| connection.last_round_trip)
+            .map(|rtt| format!("· probe {}", format::millis(rtt)));
 
         h_flex()
             .w_full()
+            .flex_none()
             .items_center()
             .justify_between()
             .px_5()
@@ -260,11 +401,51 @@ impl Workspace {
             .border_color(cx.theme().border)
             .text_xs()
             .text_color(cx.theme().muted_foreground)
-            .child(format!(
-                "Phase 0 · read-only · v{}",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .child(cold_start)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(format!("{pods} pods · {ready} ready · {state}"))
+                    .children(stale)
+                    .children(round_trip),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(format!(
+                        "flushes {} · coalesced {} · dropped {}",
+                        self.stats.flushes, self.stats.collapsed, self.stats.dropped
+                    ))
+                    .child(cold_start),
+            )
+    }
+
+    /// The table, or an explanation of why there is no table.
+    fn content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.state.rows_shared();
+
+        let body = if rows.is_empty() {
+            let message = match self.state.active_connection().map(|c| &c.state) {
+                None => "Select a context to connect.".to_owned(),
+                Some(ConnectionState::Connecting) => "Connecting…".to_owned(),
+                Some(ConnectionState::Idle) => "Not connected.".to_owned(),
+                // A failure is already in the banner; do not repeat the reason,
+                // but never leave the table looking merely empty.
+                Some(state) if state.is_problem() => {
+                    format!("No pods to show — the cluster is {}.", state.label())
+                }
+                Some(_) => "No pods in this cluster.".to_owned(),
+            };
+            table::placeholder(message, cx).into_any_element()
+        } else {
+            table::body(rows, SystemTime::now()).into_any_element()
+        };
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .overflow_hidden()
+            .child(table::header(cx))
+            .child(body)
     }
 }
 
@@ -276,72 +457,22 @@ impl Render for Workspace {
             tracing::info!(cold_start_ms = elapsed.as_millis() as u64, "first paint");
         }
 
-        let error_banner = self.last_error.clone().map(|message| {
-            div()
-                .w_full()
-                .px_5()
-                .py_3()
-                .bg(cx.theme().danger)
-                .text_sm()
-                .text_color(cx.theme().danger_foreground)
-                .child(message)
-        });
-
         v_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(self.header(cx))
-            .children(error_banner)
+            .children(self.banner(cx))
             .child(
-                v_flex()
+                h_flex()
                     .flex_1()
                     .w_full()
-                    .gap_4()
-                    .p_5()
-                    .child(self.connections_panel(cx))
-                    .child(self.bridge_panel(cx)),
+                    .overflow_hidden()
+                    .child(self.sidebar(cx))
+                    .child(self.content(cx)),
             )
             .child(self.footer(cx))
     }
-}
-
-/// A titled card.
-fn panel(title: &'static str, cx: &App) -> gpui::Div {
-    v_flex()
-        .w_full()
-        .rounded_lg()
-        .border_1()
-        .border_color(cx.theme().border)
-        .bg(cx.theme().secondary)
-        .child(
-            div()
-                .px_4()
-                .py_2()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .border_b_1()
-                .border_color(cx.theme().border)
-                .child(title),
-        )
-}
-
-/// A label-over-value statistic.
-fn metric(label: &'static str, value: String, cx: &App) -> impl IntoElement {
-    v_flex()
-        .gap_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(label),
-        )
-        .child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().foreground)
-                .child(value),
-        )
 }
 
 /// The colour that carries connection state at a glance.
@@ -373,75 +504,167 @@ fn error_text(error: CommandError) -> String {
 mod tests {
     use super::*;
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use periscope_bridge::command_channel;
+    use periscope_bridge::{
+        CommandReceiver, ContextInfo, PodSnapshot, ResourceKey, command_channel,
+    };
+    use std::sync::Arc;
 
-    fn workspace(
-        cx: &mut TestAppContext,
-    ) -> (Entity<Workspace>, periscope_bridge::CommandReceiver) {
-        let (tx, rx) = command_channel(8);
-        let started = Instant::now();
-        let view = cx.new(|cx| Workspace::new(tx, started, cx));
+    fn workspace(cx: &mut TestAppContext) -> (Entity<Workspace>, CommandReceiver) {
+        let (tx, rx) = command_channel(16);
+        let view = cx.new(|cx| Workspace::new(tx, Instant::now(), cx));
         (view, rx)
     }
 
+    fn context(name: &str) -> ContextInfo {
+        ContextInfo {
+            name: Arc::from(name),
+            cluster: Arc::from("cluster"),
+            user: None,
+            namespace: None,
+        }
+    }
+
+    fn contexts(names: &[&str], current: &str) -> ClusterEvent {
+        ClusterEvent::Contexts {
+            contexts: names.iter().copied().map(context).collect(),
+            current: Some(ClusterId::new(current)),
+        }
+    }
+
+    fn pod(name: &str) -> PodSnapshot {
+        PodSnapshot {
+            key: ResourceKey::new("default", name),
+            uid: None,
+            status: Arc::from("Running"),
+            ready: 1,
+            containers: 1,
+            restarts: 0,
+            node: None,
+            created: None,
+        }
+    }
+
+    fn apply(view: &Entity<Workspace>, cx: &mut TestAppContext, events: Vec<ClusterEvent>) {
+        view.update(cx, |workspace, cx| {
+            workspace.apply_events(events, FlushStats::default(), cx);
+        });
+    }
+
+    fn drain(rx: &CommandReceiver) -> Vec<ClusterCommand> {
+        std::iter::from_fn(|| rx.try_recv()).collect()
+    }
+
     #[gpui::test]
-    fn a_batch_updates_connection_state(cx: &mut TestAppContext) {
-        let (view, _rx) = workspace(cx);
+    fn the_view_asks_for_contexts_as_soon_as_it_opens(cx: &mut TestAppContext) {
+        let (_view, rx) = workspace(cx);
+        assert_eq!(drain(&rx), vec![ClusterCommand::ListContexts]);
+    }
+
+    #[gpui::test]
+    fn the_current_context_is_connected_to_exactly_once(cx: &mut TestAppContext) {
+        let (view, rx) = workspace(cx);
+        drain(&rx);
+
+        apply(&view, cx, vec![contexts(&["prod", "staging"], "prod")]);
+        // A second batch must not re-issue the connect: repainting is not a
+        // reason to open another set of watches.
+        apply(&view, cx, vec![contexts(&["prod", "staging"], "prod")]);
+
+        assert_eq!(
+            drain(&rx),
+            vec![ClusterCommand::Connect {
+                cluster: ClusterId::new("prod")
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn selecting_a_context_switches_the_table_and_connects(cx: &mut TestAppContext) {
+        let (view, rx) = workspace(cx);
+        apply(&view, cx, vec![contexts(&["prod", "staging"], "prod")]);
+        apply(
+            &view,
+            cx,
+            vec![
+                ClusterEvent::PodsReset {
+                    cluster: "prod".into(),
+                    pods: Arc::from([pod("prod-pod")]),
+                },
+                ClusterEvent::PodsReset {
+                    cluster: "staging".into(),
+                    pods: Arc::from([pod("staging-pod")]),
+                },
+            ],
+        );
+        drain(&rx);
 
         view.update(cx, |workspace, cx| {
-            workspace.apply_events(
-                vec![ClusterEvent::Status {
-                    cluster: ClusterId::new(LOCAL),
-                    state: ConnectionState::Connected,
-                }],
-                FlushStats {
-                    applied: 1,
-                    collapsed: 3,
-                    dropped: 0,
-                },
-                cx,
-            );
+            workspace.select(ClusterId::new("staging"), cx);
         });
 
+        assert_eq!(
+            drain(&rx),
+            vec![ClusterCommand::Connect {
+                cluster: ClusterId::new("staging")
+            }]
+        );
         view.read_with(cx, |workspace, _| {
-            assert_eq!(workspace.stats().flushes, 1);
-            assert_eq!(workspace.stats().collapsed, 3);
-            assert_eq!(
-                workspace
-                    .connections
-                    .get(&ClusterId::new(LOCAL))
-                    .unwrap()
-                    .state,
-                ConnectionState::Connected
-            );
+            let rows = workspace.state().rows();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(&*rows[0].key.name, "staging-pod");
         });
     }
 
     #[gpui::test]
-    fn probes_are_queued_with_increasing_nonces(cx: &mut TestAppContext) {
-        let (view, rx) = workspace(cx);
+    fn pods_arriving_for_the_active_cluster_become_rows(cx: &mut TestAppContext) {
+        let (view, _rx) = workspace(cx);
+        apply(&view, cx, vec![contexts(&["prod"], "prod")]);
+        apply(
+            &view,
+            cx,
+            vec![ClusterEvent::PodApplied {
+                cluster: "prod".into(),
+                pod: Arc::new(pod("api-0")),
+            }],
+        );
 
-        view.update(cx, |workspace, cx| {
-            workspace.send_probe(cx);
-            workspace.send_probe(cx);
+        view.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.state().rows().len(), 1);
+            assert_eq!(workspace.stats().flushes, 2);
         });
+    }
 
-        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv()).collect();
+    #[gpui::test]
+    fn an_auth_failure_is_offered_with_a_retry(cx: &mut TestAppContext) {
+        let (view, rx) = workspace(cx);
+        apply(&view, cx, vec![contexts(&["prod"], "prod")]);
+        apply(
+            &view,
+            cx,
+            vec![ClusterEvent::Status {
+                cluster: "prod".into(),
+                state: ConnectionState::AuthFailed {
+                    reason: "exec plugin `aws` exited 255".into(),
+                },
+            }],
+        );
+        drain(&rx);
+
+        view.update(cx, |workspace, cx| workspace.reconnect(cx));
 
         assert_eq!(
-            sent,
-            vec![
-                ClusterCommand::Ping {
-                    cluster: ClusterId::new(LOCAL),
-                    nonce: 1
-                },
-                ClusterCommand::Ping {
-                    cluster: ClusterId::new(LOCAL),
-                    nonce: 2
-                },
-            ]
+            drain(&rx),
+            vec![ClusterCommand::Connect {
+                cluster: ClusterId::new("prod")
+            }]
         );
-        view.read_with(cx, |workspace, _| assert!(workspace.last_error.is_none()));
+        view.read_with(cx, |workspace, _| {
+            let connection = workspace.state().active_connection().unwrap();
+            assert_eq!(
+                connection.state.detail(),
+                Some("exec plugin `aws` exited 255")
+            );
+        });
     }
 
     #[gpui::test]
@@ -449,11 +672,30 @@ mod tests {
         let (view, rx) = workspace(cx);
         drop(rx);
 
-        view.update(cx, |workspace, cx| workspace.send_probe(cx));
+        view.update(cx, |workspace, cx| workspace.reload_contexts(cx));
 
         view.read_with(cx, |workspace, _| {
             let message = workspace.last_error.as_ref().expect("error surfaced");
             assert!(message.contains("Restart Periscope"), "{message}");
+        });
+    }
+
+    #[gpui::test]
+    fn a_kubeconfig_failure_is_reported_verbatim(cx: &mut TestAppContext) {
+        let (view, _rx) = workspace(cx);
+        apply(
+            &view,
+            cx,
+            vec![ClusterEvent::ConfigFailed {
+                reason: "open /home/x/.kube/config: permission denied".into(),
+            }],
+        );
+
+        view.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.state().config_error(),
+                Some("open /home/x/.kube/config: permission denied")
+            );
         });
     }
 }
