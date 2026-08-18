@@ -326,6 +326,35 @@ impl Keys {
     }
 }
 
+/// Which columns a kind shows, by kind.
+///
+/// Keyed the way `kubectl` names a kind — `pods`, `deployments.apps` — and
+/// valued with column headings as the table prints them, matched without regard
+/// to case. A kind that is not mentioned shows everything it always did.
+///
+/// `NAMESPACE`, `NAME` and `AGE` are structural and always shown; this chooses
+/// among the columns that are specific to the kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Columns(std::collections::BTreeMap<String, Vec<String>>);
+
+impl Columns {
+    /// The columns wanted for a kind, if the user chose any.
+    pub fn wanted(&self, kind: &str) -> Option<&[String]> {
+        self.0.get(kind).map(Vec::as_slice)
+    }
+
+    /// Chooses columns for a kind, for tests.
+    pub fn choose(
+        &mut self,
+        kind: impl Into<String>,
+        columns: impl IntoIterator<Item: Into<String>>,
+    ) {
+        self.0
+            .insert(kind.into(), columns.into_iter().map(Into::into).collect());
+    }
+}
+
 /// Everything the user can configure.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -338,6 +367,8 @@ pub struct Settings {
     pub limits: Limits,
     /// Which keys do what.
     pub keys: Keys,
+    /// Which columns each kind shows.
+    pub columns: Columns,
 }
 
 /// Why settings could not be read.

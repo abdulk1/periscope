@@ -53,7 +53,11 @@ fn cell(width: Option<f32>) -> gpui::Div {
 }
 
 /// The column headings for a kind.
-pub fn header(columns: &[ColumnSpec], namespaced: bool, cx: &App) -> impl IntoElement {
+///
+/// Columns arrive paired with their position in the kind's full set, because
+/// the user may have chosen a subset and cells are still indexed by the
+/// original position.
+pub fn header(columns: &[(usize, ColumnSpec)], namespaced: bool, cx: &App) -> impl IntoElement {
     let mut row = h_flex()
         .w_full()
         .h(px(ROW_HEIGHT))
@@ -70,7 +74,7 @@ pub fn header(columns: &[ColumnSpec], namespaced: bool, cx: &App) -> impl IntoEl
     }
     row = row.child(cell(None).child("NAME"));
 
-    for column in columns {
+    for (_, column) in columns {
         row =
             row.child(cell(column.width.map(|width| width as f32)).child(column.name.to_string()));
     }
@@ -81,7 +85,7 @@ pub fn header(columns: &[ColumnSpec], namespaced: bool, cx: &App) -> impl IntoEl
 /// One rendered row.
 fn row(
     entry: &ResourceRow,
-    columns: &[ColumnSpec],
+    columns: &[(usize, ColumnSpec)],
     namespaced: bool,
     selected: bool,
     now: SystemTime,
@@ -108,11 +112,13 @@ fn row(
     }
     line = line.child(cell(None).child(entry.key.name.to_string()));
 
-    for (index, column) in columns.iter().enumerate() {
-        let text = entry.cell(index).to_owned();
+    for (index, column) in columns {
+        let text = entry.cell(*index).to_owned();
         // The first kind-specific column carries the row's state, which is
-        // where the eye lands: READY for a pod, STATUS for a node.
-        let color = if index == 0 {
+        // where the eye lands: READY for a pod, STATUS for a node. Keyed to the
+        // original position, so hiding it does not move the colour somewhere it
+        // means nothing.
+        let color = if *index == 0 {
             state_color(entry.state, cx)
         } else {
             cx.theme().foreground
@@ -147,7 +153,7 @@ pub fn body(
     workspace: Entity<Workspace>,
     pane: usize,
     rows: Arc<[Arc<ResourceRow>]>,
-    columns: Arc<[ColumnSpec]>,
+    columns: Arc<[(usize, ColumnSpec)]>,
     namespaced: bool,
     selected: Option<ResourceKey>,
     now: SystemTime,

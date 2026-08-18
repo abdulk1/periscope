@@ -81,6 +81,7 @@ fn main() -> Result<()> {
     let theme = settings.theme;
     let limits = settings.limits;
     let keys = settings.keys.clone();
+    let columns = settings.columns.clone();
 
     Application::new()
         .with_assets(Assets)
@@ -115,6 +116,7 @@ fn main() -> Result<()> {
                         );
                         workspace.set_permissions(permissions.clone());
                         workspace.set_limits(limits);
+                        workspace.set_columns(columns.clone());
                         workspace.set_theme(theme, window, cx);
                         if let Some(problem) = keymap_problems.first() {
                             workspace.report(problem.clone());

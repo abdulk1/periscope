@@ -163,6 +163,12 @@ idle-timeout = "5m"         # how long a cluster stays warm after its pane close
 row-budget = 200000         # rows one cluster may hold before unviewed tables are freed
 log-buffer = 100000         # lines a log or command buffer keeps
 
+[columns]
+# Which columns a kind shows. NAMESPACE, NAME and AGE are structural and always
+# there; this chooses among the rest, in the order you write them.
+pods = ["READY", "STATUS", "NODE"]
+"deployments.apps" = ["READY", "UP-TO-DATE"]
+
 [keys]
 palette = ["cmd-k", "ctrl-k", ":"]
 dismiss = ["escape", "q"]
@@ -185,6 +191,12 @@ command name is refused with a message naming what was expected — a keymap tha
 ignores a line it does not understand gives you a key that does nothing and no
 way to tell that from a bug. A keystroke that is not a key is reported on screen
 and skipped, and the rest of the keymap still works.
+
+Column names are matched without regard to case. A column a kind does not have
+is ignored rather than fatal — column sets differ between Kubernetes versions
+and between CRDs — and if none of the names match, the kind keeps all of its
+columns, because a table with nothing in it looks like a bug rather than a
+setting.
 
 ## Port forwards and commands
 

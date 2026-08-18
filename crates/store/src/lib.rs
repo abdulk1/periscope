@@ -5,12 +5,14 @@
 //! window and without a cluster.
 
 pub mod app;
+pub mod columns;
 pub mod connections;
 pub mod logs;
 pub mod permissions;
 pub mod table;
 
 pub use app::{AppState, Detail, ExecSession, Filters};
+pub use columns::Layout;
 pub use connections::{Connection, ConnectionRegistry};
 pub use logs::{FilterSpec, LogBuffer};
 pub use permissions::{Authorized, AuthorizedExec, Permissions, Refusal};

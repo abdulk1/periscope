@@ -330,6 +330,8 @@ pub struct Workspace {
     forwards_open: bool,
     /// How many lines a session keeps before dropping the oldest.
     log_capacity: usize,
+    /// Which columns each kind shows.
+    columns: periscope_store::Layout,
     /// Counts exports, so two in one session do not overwrite each other.
     exports: u32,
     /// Frame timing, collected only under `--perf`.
@@ -498,6 +500,7 @@ impl Workspace {
             exec_input,
             forwards_open: false,
             log_capacity: periscope_store::logs::DEFAULT_CAPACITY,
+            columns: periscope_store::Layout::default(),
             exports: 0,
             frames: FrameMeter::new(perf),
             _subscriptions: subscriptions,
@@ -583,6 +586,11 @@ impl Workspace {
     /// only ever appear in a log file nobody has opened.
     pub fn report(&mut self, problem: impl Into<SharedString>) {
         self.last_error = Some(problem.into());
+    }
+
+    /// Applies the configured column choices.
+    pub fn set_columns(&mut self, columns: periscope_config::Columns) {
+        self.columns = periscope_store::Layout::new(columns);
     }
 
     /// Applies the configured limits: how long clusters stay warm, how many
@@ -1787,6 +1795,27 @@ impl Workspace {
             )
     }
 
+    /// The columns a pane renders, each paired with its position in the kind's
+    /// full set.
+    ///
+    /// The pairing is what lets a subset be chosen: a row's cells are indexed
+    /// by the original position, so dropping a column must not shift the rest.
+    pub fn visible_columns(&self, index: usize) -> Vec<(usize, periscope_bridge::ColumnSpec)> {
+        let pane = &self.state.panes()[index];
+        let specs = pane.columns();
+
+        match pane
+            .kind()
+            .and_then(|kind| self.columns.indices(kind, specs))
+        {
+            Some(chosen) => chosen
+                .into_iter()
+                .map(|index| (index, specs[index].clone()))
+                .collect(),
+            None => specs.iter().cloned().enumerate().collect(),
+        }
+    }
+
     /// One pane: its cluster, its table, and whether it has focus.
     fn pane_view(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = &self.state.panes()[index];
@@ -1794,7 +1823,8 @@ impl Workspace {
         let split = self.state.is_split();
 
         let rows = pane.rows_shared();
-        let columns: Arc<[periscope_bridge::ColumnSpec]> = Arc::from(pane.columns().to_vec());
+        let columns: Arc<[(usize, periscope_bridge::ColumnSpec)]> =
+            Arc::from(self.visible_columns(index));
         let namespaced = pane
             .kind()
             .and_then(|kind| self.state.kind_info(kind))
@@ -3324,6 +3354,86 @@ mod tests {
             // Its rows go with it: warm is a memory cost, and this is where it
             // is given back.
             assert_eq!(workspace.state().cluster_rows(&ClusterId::new("prod")), 0);
+        });
+    }
+
+    /// A reset carrying several columns, so a choice between them is possible.
+    fn wide_reset(cluster: &str, kind: KindId) -> ClusterEvent {
+        ClusterEvent::ResourceReset {
+            cluster: cluster.into(),
+            kind,
+            columns: Arc::from([
+                ColumnSpec::fixed("READY", 60),
+                ColumnSpec::fixed("STATUS", 100),
+                ColumnSpec::fixed("RESTARTS", 80),
+                ColumnSpec::flexible("NODE"),
+            ]),
+            rows: Arc::from([ResourceRow {
+                key: ResourceKey::new("default", "api-0"),
+                uid: None,
+                cells: Arc::from([
+                    Arc::from("1/1"),
+                    Arc::from("Running"),
+                    Arc::from("0"),
+                    Arc::from("node-1"),
+                ]),
+                state: RowState::Healthy,
+                created: None,
+            }]),
+        }
+    }
+
+    #[gpui::test]
+    fn configured_columns_are_the_ones_rendered(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(&harness, cx, vec![wide_reset("prod", pods())]);
+
+        harness.update(cx, |workspace, _window, _cx| {
+            let mut chosen = periscope_config::Columns::default();
+            chosen.choose("pods", ["STATUS", "NODE"]);
+            workspace.set_columns(chosen);
+        });
+
+        harness.read(cx, |workspace| {
+            let columns = workspace.visible_columns(0);
+            let names: Vec<_> = columns
+                .iter()
+                .map(|(_, spec)| spec.name.to_string())
+                .collect();
+            assert_eq!(names, ["STATUS", "NODE"]);
+
+            // The cell index travels with the column: rendering STATUS must
+            // read the row's second cell, not its first.
+            assert_eq!(
+                columns.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+                [1, 3]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn an_unconfigured_kind_still_shows_every_column(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(&harness, cx, vec![wide_reset("prod", pods())]);
+
+        harness.update(cx, |workspace, _window, _cx| {
+            let mut chosen = periscope_config::Columns::default();
+            chosen.choose("deployments.apps", ["READY"]);
+            workspace.set_columns(chosen);
+        });
+
+        harness.read(cx, |workspace| {
+            assert_eq!(workspace.visible_columns(0).len(), 4);
         });
     }
 
