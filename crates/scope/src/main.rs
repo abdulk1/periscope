@@ -80,12 +80,19 @@ fn main() -> Result<()> {
     let permissions = periscope_store::Permissions::from_access(&settings.access);
     let theme = settings.theme;
     let limits = settings.limits;
+    let keys = settings.keys.clone();
 
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
-            periscope_ui::init(cx);
+            // A keystroke in settings.toml that is not a key must not take the
+            // app down before there is a window to complain in: the rest of the
+            // keymap is bound, and the problems are put on screen below.
+            let keymap_problems = periscope_ui::init_with_keys(cx, &keys);
+            for problem in &keymap_problems {
+                tracing::warn!(%problem, "keymap");
+            }
             cx.set_global(RuntimeHandle(runtime));
 
             // The window is opened from a task because `open_window` needs to run
@@ -109,6 +116,9 @@ fn main() -> Result<()> {
                         workspace.set_permissions(permissions.clone());
                         workspace.set_limits(limits);
                         workspace.set_theme(theme, window, cx);
+                        if let Some(problem) = keymap_problems.first() {
+                            workspace.report(problem.clone());
+                        }
                         workspace
                     });
                     *captured.borrow_mut() = Some(workspace.clone());

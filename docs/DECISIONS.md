@@ -897,3 +897,47 @@ The residual dishonesty is small and worth naming: the probe can succeed while
 the watch is still failing for a reason specific to watching, in which case the
 next watch error flips the state straight back to degraded. Reporting healthy a
 few seconds early is recoverable; reporting broken forever is not.
+
+## ADR-0035 — Typable keys are bound outside text fields only
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+Phase 6 asks for "keybindings modeled on k9s/vim defaults so the target user is
+immediately productive; fully remappable". k9s's defaults are single letters —
+`:` for the jump prompt, `l` for logs, `q` to go back — and single letters are
+also characters people type.
+
+GPUI dispatches an action from the focused element upwards, so a binding on the
+root fires even while a text input has focus. Bound naively, `l` tails logs
+instead of typing an `l` into the namespace filter. That is not a hypothetical:
+the first version did exactly that, and the test that types into a filter field
+is what caught it.
+
+So the context depends on the *keystroke*, not on the command. A keystroke with
+no `ctrl`/`cmd`/`alt`/`fn` modifier whose key is a single character is bound with
+the predicate `!Input && !NumberInput && !SearchPanel`; everything else — `cmd-l`,
+`escape`, `enter` — binds unrestricted, because a chord is unambiguous. Shift
+still counts as typable: `:` is shift-semicolon and is very much a character.
+
+Two consequences worth knowing:
+
+* The palette's own navigation is never a letter. Inside the palette a text field
+  always has focus, so `j`/`k` would be swallowed or, worse, both typed and acted
+  on. It uses the arrows and the readline pair `ctrl-n`/`ctrl-p`, and a test
+  asserts no palette binding is a single character.
+* Closing the palette now returns focus to the root. It used to leave focus on
+  the palette's input, which is no longer on screen — harmless when every binding
+  was a chord, and fatal once any binding is scoped to "not in a text field":
+  every typable key stopped working for the rest of the session. Found by the
+  same batch of tests, fixed with the focus call that should always have been
+  there.
+
+Remapping replaces a command's defaults rather than adding to them, an empty list
+unbinds, and a command that is not mentioned keeps its defaults. A misspelled
+command name is an error naming what was expected, which is a deliberate
+exception to this file's usual "ignore what you do not understand" rule: an
+ignored keymap line gives you a key that does nothing, and no way to tell that
+apart from a bug in the app. A keystroke that is not a key is skipped and
+reported on screen — `KeyBinding::new` panics on a malformed one, and a typo in
+a config file must not take the app down before it has a window to complain in.

@@ -214,6 +214,118 @@ impl Limits {
     }
 }
 
+/// Something a key can be bound to.
+///
+/// Deliberately a closed set rather than free-form strings: a keymap that
+/// silently ignores a line it does not understand is the worst kind of config,
+/// because the only symptom is a key that does nothing. A misspelled command
+/// name is refused, and the error names what was expected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Command {
+    /// Open or close the jump palette.
+    Palette,
+    /// Close whatever is on top.
+    Dismiss,
+    /// Tail logs for the selection.
+    Logs,
+    /// Stick the log view to the newest line, or stop.
+    Follow,
+    /// Show two clusters side by side, or go back to one.
+    Split,
+    /// Move down the palette's results.
+    Next,
+    /// Move up the palette's results.
+    Previous,
+    /// Take the highlighted palette result.
+    Confirm,
+}
+
+impl Command {
+    /// Every command, so the UI can bind them all.
+    pub const ALL: [Self; 8] = [
+        Self::Palette,
+        Self::Dismiss,
+        Self::Logs,
+        Self::Follow,
+        Self::Split,
+        Self::Next,
+        Self::Previous,
+        Self::Confirm,
+    ];
+
+    /// How it is written in `settings.toml`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Palette => "palette",
+            Self::Dismiss => "dismiss",
+            Self::Logs => "logs",
+            Self::Follow => "follow",
+            Self::Split => "split",
+            Self::Next => "next",
+            Self::Previous => "previous",
+            Self::Confirm => "confirm",
+        }
+    }
+
+    /// The keys this command answers to unless the user says otherwise.
+    ///
+    /// The single-letter ones are k9s's: `:` opens the jump prompt, `l` tails
+    /// logs, `q` goes back. They are bound only where no text field has focus,
+    /// so typing `l` into a namespace filter types an `l`.
+    pub fn default_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::Palette => &["cmd-k", "ctrl-k", ":"],
+            Self::Dismiss => &["escape", "q"],
+            Self::Logs => &["cmd-l", "ctrl-l", "l"],
+            Self::Follow => &["cmd-shift-f"],
+            Self::Split => &["cmd-\\", "ctrl-\\"],
+            // Inside the palette a text field always has focus, so these are
+            // the arrows and the readline pair — never `j` and `k`, which are
+            // letters somebody is trying to type.
+            Self::Next => &["down", "ctrl-n"],
+            Self::Previous => &["up", "ctrl-p"],
+            Self::Confirm => &["enter"],
+        }
+    }
+}
+
+/// Which keys do what.
+///
+/// A command named in the file **replaces** its defaults rather than adding to
+/// them, and an empty list unbinds it. A command that is not named keeps its
+/// defaults, so remapping one key does not silently drop the rest.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Keys(std::collections::BTreeMap<Command, Vec<String>>);
+
+impl Keys {
+    /// The keys bound to a command: what the user wrote, or the defaults.
+    pub fn keys(&self, command: Command) -> Vec<String> {
+        match self.0.get(&command) {
+            Some(keys) => keys.clone(),
+            None => command
+                .default_keys()
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect(),
+        }
+    }
+
+    /// Every command and the keys it answers to.
+    pub fn bindings(&self) -> impl Iterator<Item = (Command, Vec<String>)> + '_ {
+        Command::ALL
+            .into_iter()
+            .map(move |command| (command, self.keys(command)))
+    }
+
+    /// Binds a command, for tests.
+    pub fn bind(&mut self, command: Command, keys: impl IntoIterator<Item: Into<String>>) {
+        self.0
+            .insert(command, keys.into_iter().map(Into::into).collect());
+    }
+}
+
 /// Everything the user can configure.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -224,6 +336,8 @@ pub struct Settings {
     pub access: Access,
     /// How much this process holds on to.
     pub limits: Limits,
+    /// Which keys do what.
+    pub keys: Keys,
 }
 
 /// Why settings could not be read.
@@ -508,6 +622,60 @@ log-buffer = 5000
                 error.to_string().contains("more than zero"),
                 "{key}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn keys_default_to_the_built_in_ones() {
+        let keys = Keys::default();
+
+        assert_eq!(keys.keys(Command::Palette), ["cmd-k", "ctrl-k", ":"]);
+        assert_eq!(keys.bindings().count(), Command::ALL.len());
+    }
+
+    #[test]
+    fn a_remapped_command_replaces_its_defaults_and_leaves_the_rest_alone() {
+        let (_dir, path) = write("[keys]\npalette = [\"cmd-p\"]\n");
+        let keys = Settings::read_from(&path).expect("parses").keys;
+
+        // Replaced, not added to: somebody who rebinds a key means it.
+        assert_eq!(keys.keys(Command::Palette), ["cmd-p"]);
+        // And everything they did not mention still works.
+        assert_eq!(keys.keys(Command::Logs), Command::Logs.default_keys());
+    }
+
+    #[test]
+    fn a_command_bound_to_nothing_is_unbound() {
+        let (_dir, path) = write("[keys]\ndismiss = []\n");
+        let keys = Settings::read_from(&path).expect("parses").keys;
+
+        assert!(keys.keys(Command::Dismiss).is_empty());
+    }
+
+    #[test]
+    fn a_misspelled_command_is_refused_rather_than_doing_nothing() {
+        // The alternative is a key that silently never fires, with no way to
+        // tell that from a bug in the app.
+        let (_dir, path) = write("[keys]\npallette = [\"cmd-p\"]\n");
+        let error = Settings::read_from(&path).expect_err("a typo is an error");
+
+        let message = error.to_string();
+        assert!(message.contains("pallette"), "{message}");
+        assert!(message.contains("palette"), "{message}");
+    }
+
+    #[test]
+    fn the_palette_is_never_bound_to_a_letter() {
+        // Inside the palette a text field has focus, so a letter bound there
+        // would be swallowed instead of typed — or worse, both.
+        for command in [Command::Next, Command::Previous, Command::Confirm] {
+            for key in command.default_keys() {
+                assert!(
+                    key.len() > 1,
+                    "{} is bound to the single key `{key}`",
+                    command.name()
+                );
+            }
         }
     }
 

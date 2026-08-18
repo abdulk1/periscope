@@ -57,24 +57,112 @@ actions!(
     ]
 );
 
-/// Registers Periscope's own key bindings.
+/// Registers Periscope's default key bindings.
 ///
 /// Called once at startup, after `gpui_component::init`, which binds the keys
 /// the text inputs need.
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-k", TogglePalette, None),
-        KeyBinding::new("ctrl-k", TogglePalette, None),
-        KeyBinding::new("escape", Dismiss, None),
-        KeyBinding::new("down", SelectNext, Some("Palette")),
-        KeyBinding::new("up", SelectPrevious, Some("Palette")),
-        KeyBinding::new("enter", Confirm, Some("Palette")),
-        KeyBinding::new("cmd-l", ToggleLogs, None),
-        KeyBinding::new("ctrl-l", ToggleLogs, None),
-        KeyBinding::new("cmd-shift-f", ToggleFollow, None),
-        KeyBinding::new("cmd-\\", ToggleSplit, None),
-        KeyBinding::new("ctrl-\\", ToggleSplit, None),
-    ]);
+    let problems = init_with_keys(cx, &periscope_config::Keys::default());
+    debug_assert!(problems.is_empty(), "the built-in keymap is valid");
+}
+
+/// Where anything typable applies: everywhere except inside a text field.
+///
+/// A single-letter binding is the whole point of a k9s-style keymap and also
+/// its whole danger — `l` tails logs, and almost every namespace anyone types
+/// contains an `l`. GPUI dispatches from the focused element upwards, so a
+/// binding on the root fires even while an input has focus unless it says
+/// otherwise. This is that "otherwise", and a test types into a filter field to
+/// prove it.
+const OUTSIDE_TEXT_FIELDS: &str = "!Input && !NumberInput && !SearchPanel";
+
+/// Where a command's keys apply.
+///
+/// `Palette` bindings only fire while the palette is open, so `enter` in a
+/// filter field is not swallowed by the palette's own confirm. Everything else
+/// depends on the keystroke rather than the command: `cmd-l` is unambiguous
+/// anywhere, while a bare `l` is a letter somebody may be trying to type.
+fn context_of(command: periscope_config::Command, keystroke: &str) -> Option<&'static str> {
+    use periscope_config::Command;
+
+    match command {
+        Command::Next | Command::Previous | Command::Confirm => Some("Palette"),
+        _ if is_typable(keystroke) => Some(OUTSIDE_TEXT_FIELDS),
+        _ => None,
+    }
+}
+
+/// Whether a keystroke is something a person could be typing into a field.
+///
+/// One key, one character, and no modifier that would take it out of the text
+/// stream. `shift` stays typable: `:` is shift-semicolon on most keyboards and
+/// is very much a character.
+fn is_typable(keystroke: &str) -> bool {
+    let Ok(parsed) = gpui::Keystroke::parse(keystroke) else {
+        return false;
+    };
+    let modifiers = parsed.modifiers;
+
+    !modifiers.control
+        && !modifiers.alt
+        && !modifiers.platform
+        && !modifiers.function
+        && parsed.key.chars().count() == 1
+}
+
+/// Registers key bindings from settings, reporting the ones that make no sense.
+///
+/// Every keystroke is parsed before it is bound: `KeyBinding::new` panics on a
+/// malformed one, and a typo in a config file must not be able to take the app
+/// down before it has a window to complain in. Whatever is returned here is
+/// shown to the user; the rest of the keymap still works.
+pub fn init_with_keys(cx: &mut App, keys: &periscope_config::Keys) -> Vec<String> {
+    use periscope_config::Command;
+
+    let mut problems = Vec::new();
+    let mut bindings = Vec::new();
+
+    for (command, keystrokes) in keys.bindings() {
+        for keystroke in keystrokes {
+            let context = context_of(command, &keystroke);
+
+            if let Err(error) = validate(&keystroke) {
+                problems.push(format!(
+                    "`{keystroke}` is not a key ({} in settings.toml): {error}",
+                    command.name()
+                ));
+                continue;
+            }
+
+            // One arm per command because the action types are distinct types,
+            // not values of one enum.
+            bindings.push(match command {
+                Command::Palette => KeyBinding::new(&keystroke, TogglePalette, context),
+                Command::Dismiss => KeyBinding::new(&keystroke, Dismiss, context),
+                Command::Logs => KeyBinding::new(&keystroke, ToggleLogs, context),
+                Command::Follow => KeyBinding::new(&keystroke, ToggleFollow, context),
+                Command::Split => KeyBinding::new(&keystroke, ToggleSplit, context),
+                Command::Next => KeyBinding::new(&keystroke, SelectNext, context),
+                Command::Previous => KeyBinding::new(&keystroke, SelectPrevious, context),
+                Command::Confirm => KeyBinding::new(&keystroke, Confirm, context),
+            });
+        }
+    }
+
+    cx.bind_keys(bindings);
+    problems
+}
+
+/// Whether GPUI can make sense of a keystroke, without binding it.
+fn validate(keystrokes: &str) -> Result<(), String> {
+    if keystrokes.trim().is_empty() {
+        return Err("it is empty".to_owned());
+    }
+
+    for keystroke in keystrokes.split_whitespace() {
+        gpui::Keystroke::parse(keystroke).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// How often the view repaints with no events, so the age column keeps moving.
@@ -486,6 +574,15 @@ impl Workspace {
         self.theme = choice;
         theme::apply(choice, Some(window), cx);
         cx.notify();
+    }
+
+    /// Puts something the user needs to know on screen, verbatim.
+    ///
+    /// Used for problems found before the window existed — a keystroke in
+    /// settings.toml that is not a key, for instance — which would otherwise
+    /// only ever appear in a log file nobody has opened.
+    pub fn report(&mut self, problem: impl Into<SharedString>) {
+        self.last_error = Some(problem.into());
     }
 
     /// Applies the configured limits: how long clusters stay warm, how many
@@ -1206,7 +1303,7 @@ impl Workspace {
 
     fn toggle_palette(&mut self, _: &TogglePalette, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette_open {
-            self.close_palette(cx);
+            self.close_palette(window, cx);
             return;
         }
 
@@ -1233,18 +1330,22 @@ impl Workspace {
         cx.notify();
     }
 
-    fn close_palette(&mut self, cx: &mut Context<Self>) {
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
         self.palette_matches.clear();
+        // Focus goes back to the root. Leaving it on the palette's input —
+        // which is no longer on screen — strands every key that is only bound
+        // outside text fields, and quietly sends typing into an invisible box.
+        window.focus(&self.palette_focus);
         cx.notify();
     }
 
-    fn dismiss(&mut self, _: &Dismiss, _window: &mut Window, cx: &mut Context<Self>) {
+    fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending.is_some() {
             // Escape closes the most dangerous thing on screen first.
             self.cancel_mutation(cx);
         } else if self.palette_open {
-            self.close_palette(cx);
+            self.close_palette(window, cx);
         } else if self.state.exec().is_some() {
             self.close_command(cx);
         } else if self.state.logs().is_some() {
@@ -1283,7 +1384,7 @@ impl Workspace {
             return;
         };
 
-        self.close_palette(cx);
+        self.close_palette(window, cx);
         match found.candidate.target {
             Target::Cluster(name) => self.select_cluster(ClusterId::new(&*name), cx),
             Target::Kind(kind) => self.select_kind(kind, cx),
@@ -3012,9 +3113,17 @@ mod tests {
     }
 
     fn workspace(cx: &mut TestAppContext) -> (Harness, CommandReceiver) {
+        workspace_with_keys(cx, &periscope_config::Keys::default())
+    }
+
+    fn workspace_with_keys(
+        cx: &mut TestAppContext,
+        keys: &periscope_config::Keys,
+    ) -> (Harness, CommandReceiver) {
         cx.update(|cx| {
             gpui_component::init(cx);
-            crate::init(cx);
+            let problems = init_with_keys(cx, keys);
+            assert!(problems.is_empty(), "{problems:?}");
         });
 
         let (tx, rx) = command_channel(64);
@@ -3533,6 +3642,126 @@ mod tests {
 
         harness.keys(cx, "escape");
         assert!(!harness.read(cx, |workspace| workspace.palette_open()));
+    }
+
+    #[gpui::test]
+    fn the_k9s_keys_work_too(cx: &mut TestAppContext) {
+        // `:` for the jump prompt and `q` to go back are what the target user's
+        // fingers already do.
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        drain(&rx);
+
+        harness.keys(cx, ":");
+        assert!(harness.read(cx, |workspace| workspace.palette_open()));
+
+        harness.keys(cx, "escape");
+        open_pod_detail(&harness, cx, "api-0");
+        harness.keys(cx, "q");
+        assert!(harness.read(cx, |workspace| workspace.state().detail().is_none()));
+    }
+
+    #[gpui::test]
+    fn closing_the_palette_gives_focus_back(cx: &mut TestAppContext) {
+        // It used to stay on the palette's input, which is no longer on screen.
+        // Every key bound only outside text fields then stopped working for the
+        // rest of the session, and typing went into an invisible box.
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        drain(&rx);
+
+        harness.keys(cx, "cmd-k");
+        harness.keys(cx, "escape");
+
+        harness.keys(cx, "q");
+        assert!(
+            harness.read(cx, |workspace| workspace.state().detail().is_none()),
+            "a typable binding stopped working after the palette was used"
+        );
+    }
+
+    #[gpui::test]
+    fn a_letter_bound_to_a_command_is_still_typed_into_a_filter(cx: &mut TestAppContext) {
+        // The risk single-letter bindings carry: `l` tails logs, and the
+        // namespace field contains an `l` in almost every namespace anyone has.
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        drain(&rx);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace.namespace_input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+        harness.keys(cx, "l");
+
+        harness.read(cx, |workspace| {
+            assert!(
+                workspace.state().logs().is_none(),
+                "a keystroke meant for a text field started a log session"
+            );
+        });
+        harness.update(cx, |workspace, _window, cx| {
+            assert_eq!(workspace.namespace_input.read(cx).value(), "l");
+        });
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_remapped_key_replaces_the_default(cx: &mut TestAppContext) {
+        let mut keys = periscope_config::Keys::default();
+        keys.bind(periscope_config::Command::Palette, ["cmd-p"]);
+        let (harness, rx) = workspace_with_keys(cx, &keys);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        drain(&rx);
+
+        harness.keys(cx, "cmd-p");
+        assert!(harness.read(cx, |workspace| workspace.palette_open()));
+
+        harness.keys(cx, "escape");
+        // And the default is gone, because remapping replaces rather than adds.
+        harness.keys(cx, "cmd-k");
+        assert!(!harness.read(cx, |workspace| workspace.palette_open()));
+    }
+
+    #[gpui::test]
+    fn a_keystroke_that_is_not_a_key_is_reported_rather_than_fatal(cx: &mut TestAppContext) {
+        // `KeyBinding::new` panics on a malformed keystroke, and a typo in a
+        // config file must not be able to take the app down before it has a
+        // window to complain in.
+        let mut keys = periscope_config::Keys::default();
+        keys.bind(periscope_config::Command::Logs, ["ctrl-shift-nonsense-key"]);
+
+        let problems = cx.update(|cx| {
+            gpui_component::init(cx);
+            init_with_keys(cx, &keys)
+        });
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("logs"), "{}", problems[0]);
+        assert!(
+            problems[0].contains("ctrl-shift-nonsense-key"),
+            "{}",
+            problems[0]
+        );
     }
 
     #[gpui::test]

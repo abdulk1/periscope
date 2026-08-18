@@ -12,4 +12,4 @@ pub mod table;
 pub mod theme;
 pub mod workspace;
 
-pub use workspace::{BridgeStats, Workspace, init};
+pub use workspace::{BridgeStats, Workspace, init, init_with_keys};

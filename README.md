@@ -40,13 +40,17 @@ cold-start budget by a wide margin (`docs/LIMITATIONS.md`).
 
 | Key | Does |
 |---|---|
-| `⌘K` / `ctrl-K` | Jump to a cluster, a kind, or an object by name |
-| `↑` `↓` `enter` | Move through the jump results and open one |
-| `escape` | Close the palette, then the detail pane |
+| `⌘K` / `ctrl-K` / `:` | Jump to a cluster, a kind, or an object by name |
+| `↑` `↓` / `ctrl-P` `ctrl-N`, `enter` | Move through the jump results and open one |
+| `escape` / `q` | Close the palette, then the command output, the log view, the detail pane |
 | `enter` in the namespace or selector field | Re-list with that filter |
-| `⌘L` / `ctrl-L` | Tail the open pod, or every pod matching the current namespace + selector |
+| `⌘L` / `ctrl-L` / `l` | Tail the open pod, or every pod matching the current namespace + selector |
 | `⌘⇧F` | Follow the newest line, or pause where you are |
 | `⌘\` | Show two clusters side by side, or go back to one |
+
+The single-letter keys are k9s's, and they only fire when no text field has
+focus — typing `l` into the namespace filter types an `l`. All of them are
+remappable; see Settings below.
 
 Logs are written to a daily-rotating file under the platform's application data
 directory; the path is printed in the log's first line and shown by `--verbose`.
@@ -158,11 +162,29 @@ read-only = ["prod"]
 idle-timeout = "5m"         # how long a cluster stays warm after its pane closes
 row-budget = 200000         # rows one cluster may hold before unviewed tables are freed
 log-buffer = 100000         # lines a log or command buffer keeps
+
+[keys]
+palette = ["cmd-k", "ctrl-k", ":"]
+dismiss = ["escape", "q"]
+logs = ["cmd-l", "ctrl-l", "l"]
+follow = ["cmd-shift-f"]
+split = ["cmd-\\", "ctrl-\\"]
+next = ["down", "ctrl-n"]
+previous = ["up", "ctrl-p"]
+confirm = ["enter"]
 ```
 
 Durations are written the way people write them — `30s`, `5m`, `1h` — and a bare
 number is seconds. Unknown keys are ignored, so a file written by a newer version
 does not stop an older one from starting. Settings are read once at startup.
+
+A command listed under `[keys]` **replaces** its defaults rather than adding to
+them, and `command = []` unbinds it entirely; anything not listed keeps its
+defaults, so remapping one key does not silently drop the rest. A misspelled
+command name is refused with a message naming what was expected — a keymap that
+ignores a line it does not understand gives you a key that does nothing and no
+way to tell that from a bug. A keystroke that is not a key is reported on screen
+and skipped, and the rest of the keymap still works.
 
 ## Port forwards and commands
 
