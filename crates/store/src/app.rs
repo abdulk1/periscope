@@ -1857,6 +1857,19 @@ mod tests {
     }
 
     #[test]
+    fn the_built_in_limits_match_what_settings_default_to() {
+        // Two copies of these numbers exist — these constants, which apply when
+        // nobody configured anything, and `periscope_config::Limits`, which the
+        // settings file fills in. They must agree, or the documented default
+        // and the actual default are different numbers.
+        let configured = periscope_config::Limits::default();
+
+        assert_eq!(configured.row_budget, DEFAULT_ROW_BUDGET);
+        assert_eq!(configured.idle_timeout.get(), DEFAULT_IDLE_TIMEOUT);
+        assert_eq!(configured.log_buffer, crate::logs::DEFAULT_CAPACITY);
+    }
+
+    #[test]
     fn a_read_only_cluster_rejects_mutations_at_the_store_layer() {
         // The Phase 5 acceptance criterion, in one test: the refusal happens
         // here, not in the UI, and not only in the cluster layer.

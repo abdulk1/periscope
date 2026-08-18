@@ -10,4 +10,4 @@ pub mod settings;
 
 pub use audit::{AuditLog, Entry as AuditEntry, Outcome as AuditOutcome};
 pub use logging::{LogGuard, Verbosity};
-pub use settings::{Access, Settings, SettingsError, ThemeChoice};
+pub use settings::{Access, Limits, Settings, SettingsError, Span, ThemeChoice};

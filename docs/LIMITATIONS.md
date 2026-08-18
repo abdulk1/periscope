@@ -109,8 +109,9 @@ What is **not** there:
   not the docking framework (ADR-0027).
 - **Per-pane logs.** A tail belongs to the focused pane's cluster and closes
   when that pane changes cluster; two tails at once is not supported.
-- **Configurable timeouts.** The five-minute idle timeout and 200,000-row budget
-  are constants. The config file is Phase 6, and that is where they belong.
+- ~~**Configurable timeouts.**~~ Settled in Phase 6: the idle timeout, row budget
+  and log buffer are `[limits]` in `settings.toml`. The built-in defaults are
+  unchanged, and a test asserts the two copies of those numbers agree.
 - **A cross-cluster table.** Search finds objects on any warm cluster and jumps
   to them, but there is no view that lists two clusters' pods in one table.
 - **Cluster groups or profiles.** Contexts come from kubeconfig, in kubeconfig

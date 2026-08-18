@@ -477,6 +477,25 @@ impl Workspace {
         self.state.set_permissions(permissions);
     }
 
+    /// Applies the configured appearance.
+    ///
+    /// Separate from the constructor because the theme is applied to the whole
+    /// app, not to this view: it needs a `Window`, which only exists once one
+    /// is open.
+    pub fn set_theme(&mut self, choice: ThemeChoice, window: &mut Window, cx: &mut Context<Self>) {
+        self.theme = choice;
+        theme::apply(choice, Some(window), cx);
+        cx.notify();
+    }
+
+    /// Applies the configured limits: how long clusters stay warm, how many
+    /// rows one may hold, and how many lines a buffer keeps.
+    pub fn set_limits(&mut self, limits: periscope_config::Limits) {
+        self.idle_timeout = limits.idle_timeout.get();
+        self.log_capacity = limits.log_buffer;
+        self.state.set_budget(limits.row_budget);
+    }
+
     /// Running bridge counters.
     pub fn stats(&self) -> BridgeStats {
         self.stats
@@ -3196,6 +3215,103 @@ mod tests {
             // Its rows go with it: warm is a memory cost, and this is where it
             // is given back.
             assert_eq!(workspace.state().cluster_rows(&ClusterId::new("prod")), 0);
+        });
+    }
+
+    #[gpui::test]
+    fn the_configured_theme_is_applied_not_just_parsed(cx: &mut TestAppContext) {
+        // `theme` was read from settings.toml and then never used: the app
+        // always started on the system appearance whatever the file said.
+        let (harness, _rx) = workspace(cx);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace.set_theme(ThemeChoice::Dark, window, cx);
+            assert!(crate::theme::is_dark(cx));
+        });
+        harness.update(cx, |workspace, window, cx| {
+            workspace.set_theme(ThemeChoice::Light, window, cx);
+            assert!(!crate::theme::is_dark(cx));
+        });
+    }
+
+    #[gpui::test]
+    fn configured_limits_replace_the_built_in_ones(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod", "staging"], "prod"), kinds_event("prod")],
+        );
+        apply(&harness, cx, vec![reset("prod", pods(), &["api-0"])]);
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.set_limits(periscope_config::Limits {
+                idle_timeout: periscope_config::Span(Duration::from_secs(30)),
+                row_budget: 1_000,
+                log_buffer: 500,
+            });
+            workspace.select_cluster(ClusterId::new("staging"), cx);
+        });
+        drain(&rx);
+
+        harness.read(cx, |workspace| {
+            assert_eq!(workspace.state().budget(), 1_000);
+        });
+
+        // A minute is past the configured 30s but well inside the five-minute
+        // default, so this only passes if the setting is the one being used.
+        let later = Instant::now() + Duration::from_secs(60);
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.sweep_idle_clusters(later, cx);
+        });
+
+        assert_eq!(
+            drain(&rx),
+            vec![ClusterCommand::StopWatch {
+                cluster: ClusterId::new("prod"),
+                kind: pods(),
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn a_configured_log_buffer_bounds_a_tail(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        harness.update(cx, |workspace, _window, _cx| {
+            workspace.set_limits(periscope_config::Limits {
+                log_buffer: 3,
+                ..periscope_config::Limits::default()
+            });
+        });
+        open_pod_detail(&harness, cx, "api-0");
+        harness.keys(cx, "cmd-l");
+        drain(&rx);
+
+        let lines: Vec<_> = (0..10)
+            .map(|index| periscope_bridge::LogLine {
+                source: periscope_bridge::LogSource::new("api-0", "api"),
+                timestamp: None,
+                text: Arc::from(format!("line {index}").as_str()),
+            })
+            .collect();
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::LogBatch {
+                cluster: "prod".into(),
+                lines: Arc::from(lines),
+            }],
+        );
+
+        harness.read(cx, |workspace| {
+            let buffer = &workspace.state().logs().expect("a tail").buffer;
+            assert_eq!(buffer.len(), 3, "the configured cap is what bounds it");
+            assert_eq!(buffer.dropped(), 7);
         });
     }
 

@@ -141,6 +141,29 @@ again by the cluster layer, immediately before the request. Every attempt —
 applied, dry-run, refused or failed — is appended to `audit.log` beside the
 application logs.
 
+## Settings
+
+`settings.toml` lives in the platform's config directory beside the log
+directory. It is optional — no file means defaults — but a malformed one is
+refused rather than ignored, because starting with permissive defaults when
+somebody has written a read-only rule is the worst thing this file could do.
+
+```toml
+theme = "system"            # system | light | dark
+
+[access]
+read-only = ["prod"]
+
+[limits]
+idle-timeout = "5m"         # how long a cluster stays warm after its pane closes
+row-budget = 200000         # rows one cluster may hold before unviewed tables are freed
+log-buffer = 100000         # lines a log or command buffer keeps
+```
+
+Durations are written the way people write them — `30s`, `5m`, `1h` — and a bare
+number is seconds. Unknown keys are ignored, so a file written by a newer version
+does not stop an older one from starting. Settings are read once at startup.
+
 ## Port forwards and commands
 
 A pod's detail pane has a port field and **Forward**: it binds a local port on

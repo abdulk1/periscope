@@ -78,6 +78,8 @@ fn main() -> Result<()> {
         .map(|(selector, namespace)| LogTarget::labels(namespace, selector));
     // The store's copy of the policy; the cluster layer has its own.
     let permissions = periscope_store::Permissions::from_access(&settings.access);
+    let theme = settings.theme;
+    let limits = settings.limits;
 
     Application::new()
         .with_assets(Assets)
@@ -105,6 +107,8 @@ fn main() -> Result<()> {
                             cx,
                         );
                         workspace.set_permissions(permissions.clone());
+                        workspace.set_limits(limits);
+                        workspace.set_theme(theme, window, cx);
                         workspace
                     });
                     *captured.borrow_mut() = Some(workspace.clone());

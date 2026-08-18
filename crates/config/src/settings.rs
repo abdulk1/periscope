@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,135 @@ impl Access {
     }
 }
 
+/// A span of time, written the way a person would write it.
+///
+/// `"5m"`, `"30s"`, `"1h"` — or a bare number, which is seconds. A duration in
+/// a config file is read far more often than it is written, and `300` is not a
+/// thing anyone recognises as five minutes at a glance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span(pub Duration);
+
+impl Span {
+    /// The duration itself.
+    pub fn get(self) -> Duration {
+        self.0
+    }
+
+    /// Parses `5m`, `30s`, `1h`, or a bare count of seconds.
+    fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        let (value, multiplier) = match text.chars().last() {
+            Some('s') => (&text[..text.len() - 1], 1),
+            Some('m') => (&text[..text.len() - 1], 60),
+            Some('h') => (&text[..text.len() - 1], 3_600),
+            // No suffix means seconds, which is what every other tool does.
+            Some(digit) if digit.is_ascii_digit() => (text, 1),
+            _ => {
+                return Err(format!(
+                    "`{text}` is not a duration, e.g. `5m`, `30s`, `1h`"
+                ));
+            }
+        };
+
+        let seconds: u64 = value
+            .trim()
+            .parse()
+            .map_err(|_| format!("`{text}` is not a duration, e.g. `5m`, `30s`, `1h`"))?;
+        Ok(Self(Duration::from_secs(seconds * multiplier)))
+    }
+
+    /// How it is written back out.
+    fn render(self) -> String {
+        let seconds = self.0.as_secs();
+        match seconds {
+            0 => "0s".to_owned(),
+            _ if seconds.is_multiple_of(3_600) => format!("{}h", seconds / 3_600),
+            _ if seconds.is_multiple_of(60) => format!("{}m", seconds / 60),
+            _ => format!("{seconds}s"),
+        }
+    }
+}
+
+impl Serialize for Span {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.render())
+    }
+}
+
+impl<'de> Deserialize<'de> for Span {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Either form is accepted: `"5m"` or `300`.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Text(String),
+            Seconds(u64),
+        }
+
+        match Written::deserialize(deserializer)? {
+            Written::Text(text) => Self::parse(&text).map_err(serde::de::Error::custom),
+            Written::Seconds(seconds) => Ok(Self(Duration::from_secs(seconds))),
+        }
+    }
+}
+
+/// How long a cluster nobody is looking at keeps streaming.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Rows one cluster may hold before its unviewed tables are released.
+const DEFAULT_ROW_BUDGET: usize = 200_000;
+
+/// Lines a log or command buffer keeps before dropping the oldest.
+const DEFAULT_LOG_BUFFER: usize = 100_000;
+
+/// The numbers that used to be constants in the code.
+///
+/// All three are about the same thing — how much of a cluster this process is
+/// willing to hold on to — and all three are workload-dependent enough that
+/// somebody running one enormous cluster and somebody running thirty small ones
+/// want different answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Limits {
+    /// How long a cluster stays warm after its last pane closes.
+    pub idle_timeout: Span,
+    /// Rows one cluster may hold before its unviewed tables are released.
+    pub row_budget: usize,
+    /// Lines a log or command buffer keeps before dropping the oldest.
+    pub log_buffer: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Span(DEFAULT_IDLE_TIMEOUT),
+            row_budget: DEFAULT_ROW_BUDGET,
+            log_buffer: DEFAULT_LOG_BUFFER,
+        }
+    }
+}
+
+impl Limits {
+    /// Rejects values that would leave the app unable to do its job.
+    ///
+    /// Zero is the only thing refused: a zero idle timeout releases a cluster
+    /// the instant it leaves the screen, a zero row budget holds nothing, and a
+    /// zero log buffer drops every line as it arrives. None of those are
+    /// configurations, they are ways to make the app look broken.
+    fn validate(&self) -> Result<(), String> {
+        if self.idle_timeout.get().is_zero() {
+            return Err("`limits.idle-timeout` must be more than zero".to_owned());
+        }
+        if self.row_budget == 0 {
+            return Err("`limits.row-budget` must be more than zero".to_owned());
+        }
+        if self.log_buffer == 0 {
+            return Err("`limits.log-buffer` must be more than zero".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// Everything the user can configure.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -92,6 +222,8 @@ pub struct Settings {
     pub theme: ThemeChoice,
     /// Which clusters may be changed.
     pub access: Access,
+    /// How much this process holds on to.
+    pub limits: Limits,
 }
 
 /// Why settings could not be read.
@@ -115,6 +247,14 @@ pub enum SettingsError {
         #[source]
         source: toml::de::Error,
     },
+    /// The file parsed, but a value in it cannot be honoured.
+    #[error("{path}: {reason}")]
+    Invalid {
+        /// Which file.
+        path: String,
+        /// What is wrong with it, and what would be acceptable.
+        reason: String,
+    },
 }
 
 impl Settings {
@@ -134,10 +274,20 @@ impl Settings {
             }
         };
 
-        toml::from_str(&text).map_err(|source| SettingsError::Parse {
+        let settings: Self = toml::from_str(&text).map_err(|source| SettingsError::Parse {
             path: path.display().to_string(),
             source,
-        })
+        })?;
+
+        settings
+            .limits
+            .validate()
+            .map_err(|reason| SettingsError::Invalid {
+                path: path.display().to_string(),
+                reason,
+            })?;
+
+        Ok(settings)
     }
 
     /// Reads settings from the platform's config directory.
@@ -287,6 +437,78 @@ writable = []
         let (_dir, path) = write("theme = \"light\"\nfuture-option = 42\n");
         let settings = Settings::read_from(&path).expect("parses");
         assert_eq!(settings.theme, ThemeChoice::Light);
+    }
+
+    #[test]
+    fn durations_are_written_the_way_people_write_them() {
+        assert_eq!(Span::parse("5m").expect("parses").get().as_secs(), 300);
+        assert_eq!(Span::parse("30s").expect("parses").get().as_secs(), 30);
+        assert_eq!(Span::parse("1h").expect("parses").get().as_secs(), 3_600);
+        // A bare number is seconds, as it is everywhere else.
+        assert_eq!(Span::parse("90").expect("parses").get().as_secs(), 90);
+    }
+
+    #[test]
+    fn a_duration_that_is_not_one_says_what_a_duration_looks_like() {
+        for text in ["soon", "5 minutes", "m", "-1", "5d"] {
+            let error = Span::parse(text).expect_err("{text} is not a duration");
+            assert!(error.contains("5m"), "{text}: {error}");
+        }
+    }
+
+    #[test]
+    fn durations_survive_a_round_trip() {
+        for text in ["30s", "5m", "2h"] {
+            let span = Span::parse(text).expect("parses");
+            assert_eq!(span.render(), text);
+        }
+        // Anything that is not a whole number of minutes stays in seconds.
+        assert_eq!(Span(Duration::from_secs(90)).render(), "90s");
+    }
+
+    #[test]
+    fn limits_are_read_from_toml() {
+        let (_dir, path) = write(
+            r#"
+[limits]
+idle-timeout = "90s"
+row-budget = 50000
+log-buffer = 5000
+"#,
+        );
+
+        let limits = Settings::read_from(&path).expect("parses").limits;
+        assert_eq!(limits.idle_timeout.get().as_secs(), 90);
+        assert_eq!(limits.row_budget, 50_000);
+        assert_eq!(limits.log_buffer, 5_000);
+    }
+
+    #[test]
+    fn a_partial_limits_table_keeps_the_defaults_for_the_rest() {
+        let (_dir, path) = write("[limits]\nrow-budget = 1000\n");
+
+        let limits = Settings::read_from(&path).expect("parses").limits;
+        assert_eq!(limits.row_budget, 1_000);
+        assert_eq!(limits.idle_timeout, Limits::default().idle_timeout);
+        assert_eq!(limits.log_buffer, Limits::default().log_buffer);
+    }
+
+    #[test]
+    fn a_zero_limit_is_refused_rather_than_making_the_app_look_broken() {
+        for (key, value) in [
+            ("idle-timeout", "\"0s\""),
+            ("row-budget", "0"),
+            ("log-buffer", "0"),
+        ] {
+            let (_dir, path) = write(&format!("[limits]\n{key} = {value}\n"));
+            let error = Settings::read_from(&path).expect_err("{key} = 0 is refused");
+
+            assert!(error.to_string().contains(key), "{key}: {error}");
+            assert!(
+                error.to_string().contains("more than zero"),
+                "{key}: {error}"
+            );
+        }
     }
 
     #[test]
