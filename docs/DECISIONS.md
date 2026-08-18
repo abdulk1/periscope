@@ -215,9 +215,11 @@ a supported path rather than a workaround we invented.
 
 ### Consequences
 
-- Shader compilation moves into startup. This is a direct cost against the
-  <500ms cold-start budget in §4 and must be re-measured whenever the budget is
-  checked; the measured figure is in the Phase 0 report.
+- Shader compilation moves into startup. Measured cost: the first ever run takes
+  527ms to first paint, subsequent release runs 122–158ms (Metal caches the
+  compiled shaders). The <500ms budget in §4 therefore holds for release builds
+  from the second run onward, and the very first launch on a new machine exceeds
+  it slightly. Re-measure whenever this feature changes.
 - Anyone who *does* have the Metal toolchain installed can drop the feature for a
   marginally faster start. It is one line in the workspace manifest.
 - CI on macOS runners does not need to download the toolchain, which keeps the

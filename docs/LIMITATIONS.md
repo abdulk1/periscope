@@ -26,6 +26,22 @@ roughly ten months behind GPUI `main` (see `docs/DECISIONS.md` ADR-0001). Featur
 that exist only on `main` are unavailable. `gpui_platform`, which `main` requires,
 is not published at all.
 
+## Cold start in debug builds
+
+Measured on an M-series Mac, process start to first paint:
+
+| Build | Cold start |
+|---|---|
+| Release, warm (n=14) | 122–158ms, median ~145ms |
+| Release, first ever run | 527ms |
+| Debug | ~1170ms |
+
+The <500ms budget in `IMPLEMENTATION.md` §4 is met comfortably by release builds
+and **missed by debug builds**, which are what `cargo run` produces. The budget is
+therefore tracked against `--release`. Some of the debug cost is the runtime
+shader compilation from ADR-0008; the rest is unoptimised GPUI layout code that
+the `[profile.dev.package]` overrides only partly cover.
+
 ## Phase 0 scope
 
 The current build is the skeleton only. It does **not** connect to Kubernetes:
@@ -44,3 +60,14 @@ flaky on a heavily loaded machine.
 
 There is no `kind`-based integration suite yet; it arrives with Phase 1, when
 there is a cluster to integrate with.
+
+## Unverified in Phase 0
+
+- **The window's appearance.** The app opens and paints — first paint is logged on
+  every run — but screen capture is not permitted for the shell used to build it,
+  so the rendered output has not been inspected visually. The light/dark toggle
+  and the panel layout are unconfirmed beyond compiling and running.
+- **CI.** `.github/workflows/ci.yml` has not run; nothing has been pushed to a
+  remote. The Linux build dependency list in particular is written from GPUI's
+  requirements rather than observed from a green run.
+- **Linux.** Neither built nor run on Linux.
