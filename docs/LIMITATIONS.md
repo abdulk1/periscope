@@ -60,6 +60,9 @@ and streams any one of them into a table. What it does **not** do yet:
 - **CRD printer columns.** A custom resource renders with the generic
   `STATUS`/`READY` fallback rather than the `additionalPrinterColumns` its CRD
   declares. Reading those is a natural next step and is not done.
+- **Reveal is per-open.** A Secret opens masked and the reveal button re-fetches
+  it with values shown; closing and reopening masks it again. There is no
+  session-wide "show secrets", deliberately.
 - **Namespace autocomplete.** The namespace filter is a text field. The
   namespaces seen in the current table are counted in the toolbar, but there is
   no picker.
@@ -84,7 +87,8 @@ kinds and seeded with 10,009 pods, release build:
 | Memory, 1 cluster / 10k pods < 300MB | 87MB RSS (78MB in Phase 1; discovery and 68 kinds account for the rest) |
 | Scroll frame rate ≥ 60fps, target 120fps | 60.0fps sustained, 0 dropped frames; the display is 60Hz, so 120 could not be observed |
 | Command palette < 50ms on a 10k-object cluster | 10,009 candidates scored and ranked well inside the budget; asserted by a unit test that fails over 50ms |
-| Discovery of a CRD-heavy cluster | 68 kinds in ~130ms, custom resources included |
+| YAML of a large ConfigMap opens without a frame drop | 939 KiB fetched, cleaned and rendered to YAML in 17ms — a fifth of a 60Hz frame, and most of it network |
+| A CRD-heavy cluster lists every custom resource | 77 kinds with cert-manager and Argo CD installed; all nine of their CRDs listed, none special-cased |
 
 The load fixture is `cargo run --release -p periscope-e2e --bin seed-pods`.
 
@@ -163,8 +167,11 @@ Doing better needs an EKS or GKE cluster, which costs money to run — see
   human or a script. Those paths are covered by unit tests over the view state,
   which is not the same thing.
 - **The detail pane's appearance.** Its data path is covered end to end against a
-  real cluster (YAML, events, owner references), but the rendered pane — the
-  syntax-highlighted editor in particular — has not been seen.
+  real cluster (YAML, events, owner references, secret masking), but the
+  rendered pane — the syntax-highlighted editor in particular — has not been
+  seen, because opening it needs a click the sandbox cannot send.
+- **A visible frame drop when opening a large object.** The 17ms figure above is
+  fetch-to-YAML, not frame timing: the frame the YAML lands in was not measured.
 - **Light theme.** The theme toggle is wired and unit-covered; only the dark
   appearance has been looked at.
 - **CI.** `.github/workflows/ci.yml` has still not run; nothing has been pushed

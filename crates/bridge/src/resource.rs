@@ -244,6 +244,11 @@ pub struct ObjectDetail {
     pub key: ResourceKey,
     /// The object as YAML, ready to render.
     pub yaml: Arc<str>,
+    /// Whether this object carries values that are masked unless revealed —
+    /// true for Secrets, so the UI can offer the reveal and say what it did.
+    pub maskable: bool,
+    /// Whether the values in `yaml` are the real ones.
+    pub revealed: bool,
     /// Events referring to this object, newest last.
     pub events: Arc<[EventLine]>,
     /// Owner references, for navigating up the chain.

@@ -769,6 +769,8 @@ mod tests {
         let object = Arc::new(ObjectDetail {
             key: key.clone(),
             yaml: Arc::from("kind: Pod"),
+            maskable: false,
+            revealed: true,
             events: Arc::from([] as [periscope_bridge::EventLine; 0]),
             owners: Arc::from([] as [periscope_bridge::OwnerRef; 0]),
         });

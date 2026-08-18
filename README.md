@@ -80,3 +80,7 @@ append, never rewrite.
 
 No credentials are ever written to disk. No telemetry, no phone-home, no crash
 reporting. The only network calls are to the clusters you configure.
+
+Secrets are masked: the table shows how many keys a Secret has and never a
+value, and its YAML shows `<hidden, N bytes>` until you press **Reveal values**,
+which re-fetches it. Closing the pane masks it again.

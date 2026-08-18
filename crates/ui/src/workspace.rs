@@ -377,7 +377,33 @@ impl Workspace {
         };
 
         self.state.open_detail(kind.clone(), key.clone());
-        self.send(ClusterCommand::FetchObject { cluster, kind, key });
+        self.send(ClusterCommand::FetchObject {
+            cluster,
+            kind,
+            key,
+            // Secrets open masked. Revealing is a separate, deliberate act.
+            reveal: false,
+        });
+        cx.notify();
+    }
+
+    /// Re-fetches the object on screen with its secret values shown.
+    fn reveal(&mut self, cx: &mut Context<Self>) {
+        let (Some(cluster), Some(detail)) = (self.state.active().cloned(), self.state.detail())
+        else {
+            return;
+        };
+        let (kind, key) = (detail.kind().clone(), detail.key().clone());
+
+        tracing::info!(%cluster, %kind, %key, "revealing secret values");
+        self.state.open_detail(kind.clone(), key.clone());
+        self.yaml_showing = None;
+        self.send(ClusterCommand::FetchObject {
+            cluster,
+            kind,
+            key,
+            reveal: true,
+        });
         cx.notify();
     }
 
@@ -389,7 +415,12 @@ impl Workspace {
 
         if let Some(cluster) = self.state.active().cloned() {
             self.state.open_detail(kind.clone(), key.clone());
-            self.send(ClusterCommand::FetchObject { cluster, kind, key });
+            self.send(ClusterCommand::FetchObject {
+                cluster,
+                kind,
+                key,
+                reveal: false,
+            });
         }
         cx.notify();
     }
@@ -888,6 +919,24 @@ impl Workspace {
         let detail = self.state.detail()?;
         let title = format!("{} · {}", detail.kind(), detail.key());
 
+        // Secrets are masked until asked for; the button says which state it is
+        // in, so nobody has to guess whether they are looking at real values.
+        let reveal_label = match detail {
+            Detail::Ready { object, .. } if object.maskable => Some(if object.revealed {
+                "Values shown"
+            } else {
+                "Reveal values"
+            }),
+            _ => None,
+        };
+
+        let masked_note = match detail {
+            Detail::Ready { object, .. } if object.maskable && !object.revealed => {
+                Some("values hidden")
+            }
+            _ => None,
+        };
+
         let body = match detail {
             Detail::Loading { .. } => div()
                 .p_4()
@@ -1027,12 +1076,31 @@ impl Workspace {
                         .border_b_1()
                         .border_color(cx.theme().border)
                         .child(
-                            div()
-                                .text_sm()
-                                .truncate()
-                                .text_color(cx.theme().foreground)
-                                .child(title),
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .truncate()
+                                        .text_color(cx.theme().foreground)
+                                        .child(title),
+                                )
+                                .children(masked_note.map(|note| {
+                                    div()
+                                        .text_xs()
+                                        .flex_none()
+                                        .text_color(cx.theme().warning)
+                                        .child(note)
+                                })),
                         )
+                        .children(reveal_label.map(|label| {
+                            Button::new("reveal")
+                                .outline()
+                                .small()
+                                .label(label)
+                                .on_click(cx.listener(|this, _, _, cx| this.reveal(cx)))
+                        }))
                         .child(
                             Button::new("close-detail")
                                 .outline()
@@ -1526,6 +1594,7 @@ mod tests {
                 cluster: ClusterId::new("prod"),
                 kind: pods(),
                 key: ResourceKey::new("default", "api-0"),
+                reveal: false,
             }]
         );
         harness.read(cx, |workspace| {
@@ -1645,6 +1714,40 @@ mod tests {
             workspace.dismiss(&Dismiss, window, cx);
             assert!(workspace.state().detail().is_none());
         });
+    }
+
+    #[gpui::test]
+    fn revealing_a_secret_re_fetches_it_with_the_values(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+
+        let key = ResourceKey::new("default", "db");
+        harness.update(cx, |workspace, window, cx| {
+            workspace.open_object(key.clone(), window, cx);
+        });
+        // Opening never asks for the values.
+        assert!(drain(&rx).contains(&ClusterCommand::FetchObject {
+            cluster: ClusterId::new("prod"),
+            kind: pods(),
+            key: key.clone(),
+            reveal: false,
+        }));
+
+        harness.update(cx, |workspace, _window, cx| workspace.reveal(cx));
+
+        assert_eq!(
+            drain(&rx),
+            vec![ClusterCommand::FetchObject {
+                cluster: ClusterId::new("prod"),
+                kind: pods(),
+                key,
+                reveal: true,
+            }]
+        );
     }
 
     #[gpui::test]

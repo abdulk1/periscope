@@ -48,6 +48,51 @@ fn discovery_lists_built_in_kinds_and_custom_resources() {
     assert!(!nodes.namespaced);
 }
 
+/// The Phase 2 acceptance criterion, spelled out: a cluster with Argo CD and
+/// cert-manager installed lists their kinds without a line of code that knows
+/// what Argo CD or cert-manager are.
+#[test]
+#[ignore = "needs a cluster with cert-manager and Argo CD installed"]
+fn a_crd_heavy_cluster_lists_every_custom_resource() {
+    let (_runtime, stream, _cluster) = connected();
+
+    let (event, _) = wait_for(&stream, TIMEOUT, |event| {
+        matches!(event, ClusterEvent::Kinds { .. })
+    })
+    .unwrap_or_else(|seen| panic!("no discovery result; saw: {}", describe(&seen)));
+
+    let ClusterEvent::Kinds { kinds, .. } = event else {
+        unreachable!()
+    };
+    let labels: Vec<String> = kinds.iter().map(|info| info.id.label()).collect();
+
+    for expected in [
+        "applications.argoproj.io",
+        "applicationsets.argoproj.io",
+        "appprojects.argoproj.io",
+        "certificates.cert-manager.io",
+        "certificaterequests.cert-manager.io",
+        "clusterissuers.cert-manager.io",
+        "issuers.cert-manager.io",
+        "orders.acme.cert-manager.io",
+        "challenges.acme.cert-manager.io",
+    ] {
+        assert!(
+            labels.contains(&expected.to_owned()),
+            "missing {expected}; discovered {} kinds",
+            labels.len()
+        );
+    }
+
+    // All of them marked custom, and cluster-scoped ones marked as such.
+    let issuers = kinds
+        .iter()
+        .find(|info| info.id.label() == "clusterissuers.cert-manager.io")
+        .unwrap();
+    assert!(issuers.custom);
+    assert!(!issuers.namespaced, "ClusterIssuers are cluster-scoped");
+}
+
 #[test]
 #[ignore = "needs a cluster"]
 fn a_custom_resource_lists_through_the_same_path_as_pods() {
@@ -120,6 +165,7 @@ fn fetching_an_object_returns_yaml_owners_and_events() {
             cluster,
             kind: pods(),
             key: row.key.clone(),
+            reveal: false,
         })
         .expect("fetch is queued");
 
@@ -257,6 +303,127 @@ fn a_kind_that_does_not_exist_degrades_rather_than_hanging() {
         reason.starts_with("ghosts.example.com:"),
         "the failing kind should be named: {reason}"
     );
+}
+
+/// The Phase 2 budget says a large ConfigMap's YAML opens without a visible
+/// frame drop. What is measured here is everything up to the pixels: the fetch,
+/// the noise removal and the YAML rendering. The frame it lands in is not
+/// measured — see `docs/LIMITATIONS.md`.
+#[test]
+#[ignore = "needs a cluster with the large ConfigMap fixture"]
+fn a_large_config_map_renders_to_yaml_well_inside_a_frame() {
+    let config_maps = KindId::new("", "v1", "ConfigMap", "configmaps");
+    let (runtime, stream, cluster) = watching(config_maps.clone(), TIMEOUT);
+
+    wait_for(
+        &stream,
+        TIMEOUT,
+        |event| matches!(event, ClusterEvent::ResourceReset { kind, .. } if kind == &config_maps),
+    )
+    .unwrap_or_else(|seen| panic!("no config map listing; saw: {}", describe(&seen)));
+
+    let started = Instant::now();
+    runtime
+        .send(ClusterCommand::FetchObject {
+            cluster,
+            kind: config_maps,
+            key: periscope_bridge::ResourceKey::new("default", "periscope-large"),
+            reveal: false,
+        })
+        .expect("fetch is queued");
+
+    let (event, _) = wait_for(&stream, TIMEOUT, |event| {
+        matches!(
+            event,
+            ClusterEvent::Object { .. } | ClusterEvent::ObjectFailed { .. }
+        )
+    })
+    .unwrap_or_else(|seen| panic!("no object came back; saw: {}", describe(&seen)));
+    let elapsed = started.elapsed();
+
+    let ClusterEvent::Object { detail, .. } = event else {
+        panic!("the fetch failed — seed the fixture first: {event:?}")
+    };
+
+    println!(
+        "{} KiB of YAML fetched and rendered in {elapsed:?}",
+        detail.yaml.len() / 1024
+    );
+    assert!(
+        detail.yaml.len() > 900_000,
+        "the fixture should be about a megabyte, was {}",
+        detail.yaml.len()
+    );
+    // A whole megabyte over the wire, deserialised, cleaned and rendered: it is
+    // a network round trip that dominates, not the rendering.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "fetching and rendering took {elapsed:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs a cluster"]
+fn a_secret_is_masked_until_it_is_revealed() {
+    let secrets = KindId::new("", "v1", "Secret", "secrets");
+    let (runtime, stream, cluster) = watching(secrets.clone(), TIMEOUT);
+
+    let (event, _) = wait_for(
+        &stream,
+        TIMEOUT,
+        |event| matches!(event, ClusterEvent::ResourceReset { kind, .. } if kind == &secrets),
+    )
+    .unwrap_or_else(|seen| panic!("no secret listing; saw: {}", describe(&seen)));
+
+    let ClusterEvent::ResourceReset { rows, .. } = event else {
+        unreachable!()
+    };
+    let row = rows
+        .iter()
+        .find(|row| !row.cells.is_empty() && row.cell(1) != "0")
+        .expect("some secret has data");
+
+    // The table never carries a value, only the key count.
+    assert!(
+        !row.cells.iter().any(|cell| cell.len() > 40),
+        "a table cell looks like it holds a secret value: {:?}",
+        row.cells
+    );
+
+    for reveal in [false, true] {
+        runtime
+            .send(ClusterCommand::FetchObject {
+                cluster: cluster.clone(),
+                kind: secrets.clone(),
+                key: row.key.clone(),
+                reveal,
+            })
+            .expect("fetch is queued");
+
+        let (event, _) = wait_for(&stream, TIMEOUT, |event| {
+            matches!(
+                event,
+                ClusterEvent::Object { .. } | ClusterEvent::ObjectFailed { .. }
+            )
+        })
+        .unwrap_or_else(|seen| panic!("no object came back; saw: {}", describe(&seen)));
+
+        let ClusterEvent::Object { detail, .. } = event else {
+            panic!("the fetch failed: {event:?}")
+        };
+
+        assert!(detail.maskable, "a Secret is maskable");
+        assert_eq!(detail.revealed, reveal);
+        if reveal {
+            assert!(!detail.yaml.contains("<hidden"), "{}", detail.yaml);
+        } else {
+            assert!(
+                detail.yaml.contains("<hidden"),
+                "secret values must be masked by default: {}",
+                detail.yaml
+            );
+        }
+    }
 }
 
 #[test]

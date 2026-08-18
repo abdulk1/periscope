@@ -22,12 +22,32 @@ const NOISY_METADATA: [&str; 3] = ["managedFields", "generation", "resourceVersi
 /// Annotation kubectl writes with an entire copy of the object in it.
 const LAST_APPLIED: &str = "kubectl.kubernetes.io/last-applied-configuration";
 
+/// What a masked secret value is replaced with.
+///
+/// The length is kept: "this is a 40-character token" is useful, and it is not
+/// the secret.
+fn masked(value: &str) -> String {
+    // Secret values are base64; report the decoded size, which is what the user
+    // would have got.
+    let bytes = value.len() * 3 / 4;
+    format!("<hidden, {bytes} bytes>")
+}
+
+/// Whether a kind's values are hidden unless the user asks for them.
+fn is_maskable(kind: &KindId) -> bool {
+    kind.is_core() && &*kind.kind == "Secret"
+}
+
 /// Fetches an object, its events and its owners.
+///
+/// `reveal` only does anything for kinds that mask: a Secret's values are
+/// replaced with their size unless it is set.
 pub async fn fetch(
     client: Client,
     kind: &KindId,
     namespaced: bool,
     key: &ResourceKey,
+    reveal: bool,
 ) -> Result<ObjectDetail, kube::Error> {
     let api = api_for(
         client.clone(),
@@ -48,9 +68,12 @@ pub async fn fetch(
         }
     };
 
+    let maskable = is_maskable(kind);
     Ok(ObjectDetail {
         key: key.clone(),
-        yaml: Arc::from(to_yaml(&object)?.as_str()),
+        yaml: Arc::from(to_yaml(&object, maskable && !reveal)?.as_str()),
+        maskable,
+        revealed: !maskable || reveal,
         events: Arc::from(events),
         owners: Arc::from(owners),
     })
@@ -61,8 +84,21 @@ pub async fn fetch(
 /// `managedFields` is usually longer than the object itself and is never what
 /// the reader wants; `last-applied-configuration` is a second copy of the
 /// object hidden in an annotation.
-fn to_yaml(object: &DynamicObject) -> Result<String, kube::Error> {
+fn to_yaml(object: &DynamicObject, mask: bool) -> Result<String, kube::Error> {
     let mut value = serde_json::to_value(object).map_err(kube::Error::SerdeError)?;
+
+    if mask {
+        // A Secret's YAML is where its values would otherwise be printed in
+        // full, which is exactly what "masked by default" has to prevent.
+        for field in ["data", "stringData"] {
+            if let Some(data) = value.get_mut(field).and_then(Value::as_object_mut) {
+                for entry in data.values_mut() {
+                    let hidden = entry.as_str().map(masked).unwrap_or_else(|| masked(""));
+                    *entry = Value::String(hidden);
+                }
+            }
+        }
+    }
 
     if let Some(metadata) = value.get_mut("metadata").and_then(Value::as_object_mut) {
         for key in NOISY_METADATA {
@@ -376,7 +412,7 @@ mod tests {
             "data": { "key": "value" }
         }));
 
-        let rendered = to_yaml(&object).expect("renders");
+        let rendered = to_yaml(&object, false).expect("renders");
         assert!(!rendered.contains("managedFields"), "{rendered}");
         assert!(!rendered.contains("last-applied"), "{rendered}");
         assert!(!rendered.contains("resourceVersion"), "{rendered}");
@@ -397,8 +433,62 @@ mod tests {
             }
         }));
 
-        let rendered = to_yaml(&object).expect("renders");
+        let rendered = to_yaml(&object, false).expect("renders");
         assert!(!rendered.contains("annotations"), "{rendered}");
+    }
+
+    #[test]
+    fn a_secrets_values_are_hidden_unless_revealed() {
+        let secret = object(json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "db", "namespace": "default" },
+            "type": "Opaque",
+            "data": { "password": "aHVudGVyMg==", "token": "c2hoaGho" }
+        }));
+
+        let masked = to_yaml(&secret, true).expect("renders");
+        assert!(!masked.contains("aHVudGVyMg"), "{masked}");
+        assert!(!masked.contains("c2hoaGho"), "{masked}");
+        // The keys and the sizes stay: knowing a secret has a `password` key is
+        // the point of opening it.
+        assert!(masked.contains("password:"), "{masked}");
+        assert!(masked.contains("bytes"), "{masked}");
+
+        let revealed = to_yaml(&secret, false).expect("renders");
+        assert!(revealed.contains("aHVudGVyMg"), "{revealed}");
+    }
+
+    #[test]
+    fn string_data_is_masked_too() {
+        let secret = object(json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "db", "namespace": "default" },
+            "stringData": { "password": "hunter2" }
+        }));
+
+        let masked = to_yaml(&secret, true).expect("renders");
+        assert!(!masked.contains("hunter2"), "{masked}");
+    }
+
+    #[test]
+    fn only_secrets_mask() {
+        assert!(is_maskable(&KindId::new("", "v1", "Secret", "secrets")));
+        assert!(!is_maskable(&KindId::new(
+            "",
+            "v1",
+            "ConfigMap",
+            "configmaps"
+        )));
+        // A custom resource that happens to be called Secret is not the one
+        // Kubernetes means.
+        assert!(!is_maskable(&KindId::new(
+            "example.com",
+            "v1",
+            "Secret",
+            "secrets"
+        )));
     }
 
     #[test]

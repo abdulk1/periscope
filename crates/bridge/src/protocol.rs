@@ -99,6 +99,9 @@ pub enum ClusterCommand {
         kind: KindId,
         /// Which object.
         key: ResourceKey,
+        /// Show secret values. Off unless the user explicitly asked: a Secret's
+        /// data is masked by default, in the YAML as well as in the table.
+        reveal: bool,
     },
     /// Round-trip liveness probe. The cluster layer answers with
     /// [`ClusterEvent::Pong`] carrying the same nonce.
@@ -509,6 +512,8 @@ mod tests {
             detail: Arc::new(crate::resource::ObjectDetail {
                 key: key.clone(),
                 yaml: Arc::from("kind: Pod"),
+                maskable: false,
+                revealed: true,
                 events: Arc::from([] as [crate::resource::EventLine; 0]),
                 owners: Arc::from([] as [crate::resource::OwnerRef; 0]),
             }),

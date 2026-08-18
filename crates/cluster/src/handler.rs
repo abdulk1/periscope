@@ -370,7 +370,12 @@ impl CommandHandler for KubeHandler {
                     });
                 }
 
-                ClusterCommand::FetchObject { cluster, kind, key } => {
+                ClusterCommand::FetchObject {
+                    cluster,
+                    kind,
+                    key,
+                    reveal,
+                } => {
                     let Some(session) = sessions.session(&cluster) else {
                         events.send(ClusterEvent::ObjectFailed {
                             cluster,
@@ -382,7 +387,7 @@ impl CommandHandler for KubeHandler {
                     };
 
                     let namespaced = is_namespaced(&session, &kind);
-                    match detail::fetch(session.client, &kind, namespaced, &key).await {
+                    match detail::fetch(session.client, &kind, namespaced, &key, reveal).await {
                         Ok(detail) => events.send(ClusterEvent::Object {
                             cluster,
                             kind,
@@ -547,6 +552,7 @@ mod tests {
                 cluster: "not-connected".into(),
                 kind: default_kind(),
                 key: ResourceKey::new("default", "api-0"),
+                reveal: false,
             })
             .unwrap();
 
