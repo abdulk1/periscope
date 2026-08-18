@@ -1,0 +1,23 @@
+[package]
+name = "periscope-bridge"
+description = "tokio <-> GPUI plumbing: bounded channels, coalescing, runtime host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+flume.workspace = true
+futures.workspace = true
+gpui.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "scope"
+description = "Periscope — a native, GPU-accelerated Kubernetes console"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+default-run = "scope"
+
+[[bin]]
+name = "scope"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+periscope-bridge.workspace = true
+periscope-cluster.workspace = true
+periscope-config.workspace = true
+periscope-ui.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

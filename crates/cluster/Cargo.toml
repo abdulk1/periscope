@@ -1,0 +1,18 @@
+[package]
+name = "periscope-cluster"
+description = "Kubernetes clients, watchers and log streams"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+futures.workspace = true
+periscope-bridge.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+tracing.workspace = true
+
+[lints]
+workspace = true
