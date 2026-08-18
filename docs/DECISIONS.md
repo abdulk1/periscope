@@ -859,3 +859,41 @@ Periscope cannot tell `ls` from `rm -rf` before it runs it.
 
 The audit line is written *before* the command runs, not after: a command that
 hangs, or one Periscope is killed in the middle of, still has to leave a trace.
+
+## ADR-0034 — A degraded watch asks the apiserver whether it is back
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+Recovery from a broken watch used to be inferred from the stream: after a
+failure, the next `InitDone` — the end of a fresh listing — cleared the degraded
+state and reported `Connected`.
+
+That inference is wrong, and the fault-injection test is what proved it.
+`kube`'s watcher resumes an interrupted watch from the last resource version it
+saw rather than re-listing, so a brief outage produces **no** `InitDone`. On a
+namespace where nothing happens to be changing it produces no events at all.
+The watch was healthy again within a second or two; the UI went on showing
+*"Degraded — pods: tls handshake eof"* indefinitely, with rows that were in fact
+live. A false alarm that never clears is worse than no indicator, because it
+teaches people to ignore the one that matters.
+
+Two changes:
+
+* Any successful event now clears the degraded state, not only `InitDone`.
+  Recovery is reported before the event is translated, because most watch events
+  produce nothing for the UI and waiting for one that does is the same bug in
+  smaller form.
+* While degraded — and only while degraded — the stream is raced against a
+  liveness probe every three seconds: one `list` with `limit=1` against the same
+  kind and namespace. When it succeeds, the cluster is reported healthy.
+
+The probe costs nothing on a healthy cluster because it does not run, it asks
+about the same objects the watch covers rather than something incidental, and it
+does not do the reconnecting — `kube`'s backoff still owns that. It only answers
+the question the status bar is claiming to answer.
+
+The residual dishonesty is small and worth naming: the probe can succeed while
+the watch is still failing for a reason specific to watching, in which case the
+next watch error flips the state straight back to degraded. Reporting healthy a
+few seconds early is recoverable; reporting broken forever is not.

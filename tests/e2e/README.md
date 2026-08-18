@@ -28,6 +28,7 @@ for the same one-node cluster.
 | `tests/mutations.rs` | Delete, scale, restart, cordon, drain, apply and dry run — plus a read-only cluster refusing, and the audit log |
 | `tests/forwards.rs` | Real HTTP traffic through a forward, several connections, teardown closing the port, a dead port reported, and recovery after a broken connection |
 | `tests/exec.rs` | Running a command, its exit code, stdout and stderr kept apart, a command that does not exist, cancellation, and the audit log |
+| `tests/faults.rs` | The apiserver going away mid-watch: the break is reported with a reason, the rows are kept, and the watch recovers by itself when it comes back |
 
 `tests/mutations.rs` **changes the cluster**: each test creates the deployment it
 acts on and deletes it afterwards, the cordon test always uncordons, and the
@@ -41,6 +42,13 @@ is in the read-only test, which asserts it never ran.
 The auth tests write a throwaway kubeconfig into the temp directory and point the
 app at it with `--kubeconfig`'s programmatic equivalent, so the developer's own
 kubeconfig is never touched.
+
+`tests/faults.rs` does **not** stop the apiserver — that would take the cluster
+down for every other test in the run. It puts a TCP proxy
+(`periscope_e2e::proxy`) in front of it, points a throwaway kubeconfig at the
+proxy, and cuts it: established connections are reset and new ones refused, which
+is what the app's sockets would see either way. Bytes are copied verbatim, so TLS
+still verifies against the cluster's own CA.
 
 ## Workload fixtures
 

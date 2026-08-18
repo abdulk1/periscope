@@ -55,6 +55,9 @@ pub struct ResourceStream {
     pending: Vec<ResourceRow>,
     /// The credential plugin this cluster authenticates with, if any.
     credential_plugin: Option<String>,
+    /// Whether the last thing this stream saw was a failure, so a recovery is
+    /// reported once rather than on every event afterwards.
+    degraded: bool,
 }
 
 impl ResourceStream {
@@ -67,7 +70,35 @@ impl ResourceStream {
             table,
             pending: Vec::new(),
             credential_plugin: None,
+            degraded: false,
         }
+    }
+
+    /// Whether the last thing this stream saw was a failure.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// Notes that the stream is producing events again, if it was not.
+    ///
+    /// Any successful event means the apiserver answered, and that is the only
+    /// signal available: `kube`'s watcher resumes an interrupted watch from the
+    /// last resource version it saw, so a brief outage produces no fresh list
+    /// and no `InitDone` — on a quiet namespace it produces nothing at all for
+    /// a while. Waiting for a resync to declare recovery therefore left the
+    /// cluster marked degraded indefinitely, with a stale error on screen,
+    /// while the watch was in fact healthy. The e2e fault-injection test is
+    /// what caught it.
+    pub fn on_success(&mut self) -> Option<ClusterEvent> {
+        if !self.degraded {
+            return None;
+        }
+        self.degraded = false;
+
+        Some(ClusterEvent::Status {
+            cluster: self.cluster.clone(),
+            state: ConnectionState::Connected,
+        })
     }
 
     /// Names the credential plugin, so auth failures can say which binary was
@@ -113,6 +144,7 @@ impl ResourceStream {
     pub fn on_error(&mut self, error: &watcher::Error) -> (ClusterEvent, AfterError) {
         // Whatever we had buffered belongs to a list that will now be redone.
         self.pending.clear();
+        self.degraded = true;
 
         let (state, after) = match classify_watch(error) {
             Failure::Auth(reason) => (
@@ -179,6 +211,24 @@ pub fn api_for(
     }
 }
 
+/// How often a degraded watch asks the apiserver whether it is back.
+///
+/// Only ever runs while something is already broken, so the cost is zero on a
+/// healthy cluster, and it is deliberately slower than `kube`'s own retry —
+/// this answers the UI's question, it does not do the reconnecting.
+const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether the apiserver will answer for this kind right now.
+///
+/// One object, not a listing: the question is whether the request completes at
+/// all, and asking for a whole namespace to answer it would be its own load
+/// problem on a large cluster.
+async fn is_reachable(api: &Api<DynamicObject>) -> bool {
+    api.list(&kube::api::ListParams::default().limit(1))
+        .await
+        .is_ok()
+}
+
 /// Watches a kind until the task is cancelled, the credential is rejected, or
 /// the UI goes away.
 pub async fn run(
@@ -195,6 +245,8 @@ pub async fn run(
         label_selector: filter.selector.as_deref().map(str::to_owned),
         ..watcher::Config::default()
     };
+    // Kept for the liveness probe below; the watcher takes ownership of its own.
+    let probe = api.clone();
 
     let mut stream = Box::pin(
         watcher(api, config)
@@ -208,13 +260,50 @@ pub async fn run(
     );
     let mut translator = ResourceStream::new(cluster.clone(), kind.clone())
         .with_credential_plugin(credential_plugin);
-    // Only report a recovery once, rather than on every event after one.
-    let mut degraded = false;
 
-    while let Some(next) = stream.next().await {
+    loop {
+        // While degraded, the stream is raced against a cheap liveness probe.
+        // A watch that `kube` resumed from its last resource version emits
+        // nothing at all until something in the namespace changes, so on a
+        // quiet cluster there is no event to recover on — and the UI would sit
+        // on a stale error indefinitely. Asking the apiserver directly is the
+        // only thing that actually answers "is it back".
+        let next = if translator.is_degraded() {
+            tokio::select! {
+                next = stream.next() => next,
+                _ = tokio::time::sleep(PROBE_INTERVAL) => {
+                    if is_reachable(&probe).await
+                        && let Some(recovered) = translator.on_success()
+                    {
+                        tracing::info!(%cluster, %kind, "watch recovered");
+                        if events.send(recovered).is_closed() {
+                            return;
+                        }
+                    }
+                    continue;
+                }
+            }
+        } else {
+            stream.next().await
+        };
+
+        let Some(next) = next else {
+            break;
+        };
+
         match next {
             Ok(event) => {
-                let recovered = degraded && matches!(event, watcher::Event::InitDone);
+                // Reported before the event itself, and before translating:
+                // most watch events produce nothing for the UI, and a recovery
+                // that waits for one that does may wait forever on a quiet
+                // namespace.
+                if let Some(recovered) = translator.on_success() {
+                    tracing::info!(%cluster, %kind, "watch recovered");
+                    if events.send(recovered).is_closed() {
+                        return;
+                    }
+                }
+
                 let Some(event) = translator.apply(event) else {
                     continue;
                 };
@@ -222,24 +311,9 @@ pub async fn run(
                 if events.send(event).is_closed() {
                     return;
                 }
-
-                if recovered {
-                    degraded = false;
-                    tracing::info!(%cluster, %kind, "watch recovered");
-                    if events
-                        .send(ClusterEvent::Status {
-                            cluster: cluster.clone(),
-                            state: ConnectionState::Connected,
-                        })
-                        .is_closed()
-                    {
-                        return;
-                    }
-                }
             }
             Err(error) => {
                 let (event, after) = translator.on_error(&error);
-                degraded = true;
                 tracing::warn!(%cluster, %kind, %error, ?after, "watch failed");
 
                 if events.send(event).is_closed() {
@@ -426,6 +500,47 @@ mod tests {
             } => assert!(reason.starts_with("pods:"), "{reason}"),
             other => panic!("expected a degraded status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_healthy_stream_reports_no_recovery() {
+        // Every event would otherwise carry a "connected" behind it.
+        let mut stream = ResourceStream::new("prod".into(), pods());
+        assert!(stream.on_success().is_none());
+
+        stream.apply(watcher::Event::Init);
+        assert!(stream.on_success().is_none());
+    }
+
+    #[test]
+    fn any_event_after_a_failure_counts_as_recovered() {
+        // The regression this exists for: recovery used to wait for `InitDone`,
+        // which a resumed watch never sends. A cluster that blinked stayed
+        // marked degraded forever, with a stale reason on screen, while the
+        // watch was actually healthy.
+        let mut stream = ResourceStream::new("prod".into(), pods());
+        stream.on_error(&api_error(500));
+
+        match stream.on_success() {
+            Some(ClusterEvent::Status { state, .. }) => {
+                assert_eq!(state, ConnectionState::Connected);
+            }
+            other => panic!("expected a recovery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_recovery_is_reported_once_not_on_every_event_afterwards() {
+        let mut stream = ResourceStream::new("prod".into(), pods());
+        stream.on_error(&api_error(500));
+
+        assert!(stream.on_success().is_some());
+        assert!(stream.on_success().is_none());
+        assert!(stream.on_success().is_none());
+
+        // A second failure arms it again.
+        stream.on_error(&api_error(500));
+        assert!(stream.on_success().is_some());
     }
 
     #[test]

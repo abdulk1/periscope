@@ -13,6 +13,7 @@
 //! (`seed-pods`) writes, and it writes only to the cluster it is told to.
 
 pub mod exec;
+pub mod proxy;
 
 use std::time::{Duration, Instant};
 
