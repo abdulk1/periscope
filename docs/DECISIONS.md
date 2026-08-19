@@ -1225,3 +1225,41 @@ It lives in `scope` rather than `periscope-config::logging` because redaction
 lives in `periscope-cluster`, which depends on `config`; only the binary can see
 both.
 
+## ADR-0042 — The watch keeps quorum reads and pays for them
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+A performance review proposed two changes to `watcher::Config`: switch
+`list_semantic` to `Any`, and use `StreamingList` for the initial listing. Both
+were refused, and this records why so they are not re-proposed as an oversight.
+
+`ListSemantic::Any` serves the initial list from the apiserver's watch cache
+instead of a quorum read. It is genuinely cheaper on the cluster, and `kube`'s
+own documentation recommends it for controllers — where events sit in a queue
+for a while anyway, so a slightly stale list costs nothing real. That reasoning
+does not transfer. This program's entire claim is that what is on screen is what
+the apiserver says, right now; a table that opens with an HA-partitioned cached
+listing and reconciles a few seconds later is a table that was briefly lying,
+during the exact seconds somebody was reading it to decide whether to restart
+something. The cost is one quorum read per kind per session, paid at open.
+
+`InitialListStrategy::StreamingList` is a real improvement — it streams the
+initial state over a watch rather than paging a list — but it needs
+`WatchListClient`, an opt-in feature gate before it went GA. Turning it on
+unconditionally means a worse failure than the one it fixes, on exactly the
+older clusters most likely to be strained by the list. It is worth revisiting
+once the supported floor is past it.
+
+What the defaults already give us is most of the win: `page_size` is 500, so the
+initial listing is paged rather than one enormous response, and bookmarks are on,
+so a resumed watch rarely re-lists at all.
+
+The same review noted that `managedFields` is deserialised and then discarded.
+The discarding is deliberate and already there — `.modify()` clears it as each
+object arrives, which is what keeps a 10,000-object listing out of the hundreds
+of megabytes — and the deserialising is not avoidable while the watch is typed
+as `DynamicObject`. Paying to parse bytes we immediately drop is the price of
+one code path that works for every kind, including CRDs nobody has compiled a
+type for.
+
