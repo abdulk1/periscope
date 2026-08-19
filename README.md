@@ -131,6 +131,17 @@ cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fi
 Architecture decisions are recorded in [`docs/DECISIONS.md`](docs/DECISIONS.md) —
 append, never rewrite.
 
+To look at what you changed, on macOS:
+
+```sh
+cargo run --release --bin scope &
+cargo run --manifest-path tools/winid/Cargo.toml -- scope   # prints a window id
+screencapture -x -o -l<id> shot.png
+```
+
+That captures the application's window and nothing else on the display. See
+[`tools/winid/README.md`](tools/winid/README.md).
+
 ## Finding things
 
 The sidebar groups every kind the cluster serves the way Rancher and the EKS

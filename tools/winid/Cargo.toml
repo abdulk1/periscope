@@ -1,0 +1,15 @@
+# Deliberately outside the workspace: this is a macOS-only development tool, and
+# nothing that ships should depend on it. `cargo build` from inside this
+# directory is the whole build.
+[package]
+name = "winid"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Its own workspace, so `cargo build` at the repository root never sees it.
+[workspace]
+
+[dependencies]
+core-foundation = "0.9"
+core-graphics = "0.23"

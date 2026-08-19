@@ -439,6 +439,19 @@ Doing better needs an EKS or GKE cluster, which costs money to run — see
 
 ## Unverified
 
+### What can now be checked
+
+`tools/winid` prints the window id of the running application so `screencapture
+-l<id>` can photograph that window and nothing else — even when it is behind
+something. The layout, the type hierarchy, the colours and both themes were
+looked at that way while the interface was reworked, which is the first time in
+this project that any of it was verified by eye rather than by test.
+
+What that still does not cover: anything that only exists while the pointer or
+the keyboard is doing something. Hover and pressed states, the row flash as it
+fades, an animating chevron and a pulsing status dot are all asserted by tests
+that paint a frame, not seen.
+
 - **Scrolling, clicking and typing in the real window.** The rendered window has
   been inspected visually with 10,009 rows and 68 kinds loaded, and the palette's
   key handling is driven through GPUI's real dispatch in tests
