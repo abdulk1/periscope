@@ -79,6 +79,11 @@ Measured on an M-series Mac, process start to first paint:
 | Debug | ~1170ms |
 | `Periscope.app`, first launch of a freshly built unsigned bundle | 1385ms |
 | `Periscope.app`, every launch after (n=3) | 245–291ms |
+| Release, after the update check's HTTP stack was added (n=3) | 119–225ms |
+
+Adding an HTTP client for the update check cost 1.25 MiB of binary (21.9 → 23.2
+MiB) and nothing measurable at startup — the client is built only when a check
+actually runs, which by default is never.
 
 The bundle's first launch is dominated by Gatekeeper scanning a binary it has
 never seen, which is a one-off per build and not something the app can affect.
