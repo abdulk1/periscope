@@ -13,6 +13,8 @@
 //! arrives as a `DynamicObject` — one watch path for pods and for a CRD nobody
 //! has seen before.
 
+use std::sync::Arc;
+
 use kube::api::DynamicObject;
 use serde_json::Value;
 
@@ -103,6 +105,45 @@ pub fn counts(data: &Value) -> PodCounts {
         total,
         restarts,
     }
+}
+
+/// One container of a pod, as a container selector offers it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PodContainer {
+    /// The name, which is what `kubectl exec -c` and [`crate::exec`] take.
+    pub name: Arc<str>,
+    /// Whether it is an init container.
+    ///
+    /// Worth saying out loud next to a Run button: an exec only reaches one of
+    /// these while it is still running, which for a sidecar is the pod's whole
+    /// life and for an ordinary init container is a few seconds near the start
+    /// of it.
+    pub init: bool,
+}
+
+/// The containers of a pod, in the order a selector should offer them.
+///
+/// `spec.containers` first, because the apiserver's default is the first of
+/// those, then `spec.initContainers`. Reads the object rather than the pod's
+/// statuses, so a pod that has not started yet still lists what it will run.
+pub fn containers(data: &Value) -> Vec<PodContainer> {
+    let declared = |field: &str, init: bool| {
+        array(data, &["spec", field])
+            .iter()
+            .map(|container| text(container, &["name"]))
+            // A container with no name cannot be exec'd into and cannot be
+            // labelled, so offering it would be offering nothing.
+            .filter(|name| !name.is_empty())
+            .map(|name| PodContainer {
+                name: Arc::from(name),
+                init,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut containers = declared("containers", false);
+    containers.extend(declared("initContainers", true));
+    containers
 }
 
 /// The `Init:...` status for a pod still working through its init containers,
@@ -544,5 +585,47 @@ mod tests {
         assert_eq!(node(&pod), None);
         assert_eq!(status(&pod), "Pending");
         assert_eq!(counts(&pod.data).total, 1);
+    }
+
+    #[test]
+    fn a_pods_containers_are_listed_before_its_init_containers() {
+        let pod = pod(json!({
+            "metadata": { "name": "api-0", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "api" }, { "name": "envoy" }],
+                "initContainers": [{ "name": "migrate" }]
+            }
+        }));
+
+        let containers = containers(&pod.data);
+        let names: Vec<_> = containers.iter().map(|c| &*c.name).collect();
+        assert_eq!(names, ["api", "envoy", "migrate"]);
+        // The first of `spec.containers` is what the apiserver would have
+        // picked, so it is also the first thing a selector offers.
+        assert!(!containers[0].init);
+        assert!(containers[2].init);
+    }
+
+    #[test]
+    fn a_pod_that_has_not_started_still_lists_what_it_will_run() {
+        // The containers come from the spec, not from the statuses, so a
+        // pending pod can still have a command aimed at one of them.
+        let pod = pod(json!({
+            "metadata": { "name": "api-0", "namespace": "default" },
+            "spec": { "containers": [{ "name": "api" }] },
+            "status": { "phase": "Pending" }
+        }));
+
+        assert_eq!(containers(&pod.data).len(), 1);
+    }
+
+    #[test]
+    fn an_object_that_is_not_a_pod_offers_no_containers() {
+        let service = pod(json!({
+            "metadata": { "name": "api", "namespace": "default" },
+            "spec": { "ports": [{ "port": 80 }] }
+        }));
+
+        assert!(containers(&service.data).is_empty());
     }
 }

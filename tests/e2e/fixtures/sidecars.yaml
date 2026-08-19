@@ -1,0 +1,25 @@
+# A pod with two containers and an init container, for the container selector.
+#
+# Each container writes its own name to /identity, so a command that reads that
+# file says which container it actually ran in — which is the whole claim the
+# selector makes.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: sidecars, namespace: default, labels: { app: sidecars } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: sidecars } }
+  template:
+    metadata: { labels: { app: sidecars } }
+    spec:
+      initContainers:
+        - name: migrate
+          image: busybox:1.36
+          command: ["sh", "-c", "true"]
+      containers:
+        - name: alpha
+          image: busybox:1.36
+          command: ["sh", "-c", "echo alpha > /identity && sleep 86400"]
+        - name: beta
+          image: busybox:1.36
+          command: ["sh", "-c", "echo beta > /identity && sleep 86400"]

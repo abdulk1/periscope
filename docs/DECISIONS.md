@@ -1038,3 +1038,53 @@ heuristic: printer columns say what to *print*, never how healthy an object is.
 Columns still travel with the rows as data. The UI learned nothing: it renders a
 CRD's declared columns through the same path it renders a Pod's, and the
 `[columns]` setting narrows them by name like any other kind's.
+
+## ADR-0037 — The container selector reads the object the detail pane already has
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+`ExecTarget` has carried a container name since ADR-0033, and the confirmation
+sentence has always named it; what was missing was the control, so every command
+ran wherever the apiserver chose. Offering a choice means knowing what a pod's
+containers are called, and there were three ways to find out.
+
+Asking the apiserver is the obvious one and the wrong one: the pane that has the
+Run button is showing an object it *just fetched*, and `spec.containers` is in
+it. A second `get` for a list already on screen is a round trip that can fail,
+can be stale relative to what is being displayed, and needs its own loading
+state next to a button.
+
+Carrying the names alongside the YAML — a `containers` field on `ObjectDetail`,
+filled in by the cluster layer, which has the object as JSON before it renders
+it — was the other candidate. It is cheaper to read and it is what a fourth
+kind of consumer would want. It was not taken because it puts a pod-shaped field
+on the type every kind travels in, for one caller in one pane.
+
+So the selector parses the YAML the store holds back into a document and reads
+`spec.containers` and `spec.initContainers` out of it (`pods::containers`). The
+costs, both real:
+
+* A parse of a few kilobytes, once per object opened — at render time, in the
+  same place the YAML editor is filled in, and gated on the same "is this a
+  different object than last frame" check, so it is never per frame.
+* The list is only as available as the object. While the fetch is in flight, or
+  after it failed, there is no selector and the command goes to the default
+  container. That is the same behaviour as before, in the same situation, so
+  nothing regresses; it is written down in `docs/LIMITATIONS.md` rather than
+  hidden behind a spinner.
+
+The names are read by the cluster layer's own pod code, not by a second copy in
+the view, so what the selector offers and what `kubectl exec -c` would accept
+cannot drift; an e2e test fetches a real two-container pod through the runtime
+and asserts the list, which is the claim that would otherwise be untested
+because it needs a click.
+
+Init containers are listed after the pod's own — the apiserver's default is
+`spec.containers[0]`, so that is what a selector should offer first — and
+labelled `(init)`, because an exec only reaches one while it is running, which
+for a plain init container is a few seconds near the start of the pod's life.
+
+A pod with one container gets no button. There is nothing to choose, the
+confirmation says nothing about a container, and a control that offers one
+option is noise in a header that is already full.

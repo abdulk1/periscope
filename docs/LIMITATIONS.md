@@ -121,15 +121,27 @@ how you get one, and it runs in the container.
 
 Smaller gaps in what *is* built:
 
-- **Exec picks the container the apiserver picks.** There is no container
-  selector next to Run, so a multi-container pod runs the command in its default
-  container — the same thing `kubectl exec` does without `-c`. The protocol and
-  the confirmation sentence both carry a container name already; only the
-  control is missing.
-- **Command output cannot be filtered from the UI.** It goes into the same
-  bounded, filterable buffer as logs, and the store exposes the filter, but the
-  output pane has no filter box, no export and no copy button — the log pane
-  has all three.
+- **The container selector only appears when there is a choice.** A pod with
+  one container has none, so no control is drawn, no container is named, and the
+  confirmation sentence says nothing about one — which is honest, since there is
+  only one place the command could run. A multi-container pod gets a button
+  listing its containers and its init containers, `Default container` included;
+  what is picked is in the confirmation and in the audit log's command line.
+- **The container list comes from the object the detail pane fetched**, by
+  parsing its YAML back into a document once per object opened. That costs a
+  parse of a few kilobytes rather than a second request, and it means the
+  selector is absent until the object arrives: a command run while the pane is
+  still loading, or after the fetch failed, goes to the default container. See
+  ADR-0037.
+- **The container that was picked is forgotten when another pod is opened.** A
+  name that meant a sidecar in one pod can mean something else in the next, and
+  running a command in the wrong container is not a mistake worth making
+  possible.
+- **The command output pane has a filter, copy and export, and nothing else the
+  log pane has.** No follow toggle — it always sticks to the newest line,
+  because a command ends by itself — no wrapping, no timestamp order and no
+  jump. Those exist for a stream that runs for hours; a command's output does
+  not.
 - **One command at a time, per cluster.** Running another replaces the first,
   which is also how it is cancelled.
 - **Forwards use an OS-chosen local port.** There is no field for asking for a
@@ -324,6 +336,7 @@ kinds and seeded with 10,009 pods, release build:
 | Port-forwards survive a brief interruption or die loudly | Verified against a real pod: a broken connection kills its own stream and the next connection works; a port nothing is listening on is reported as `Degraded` with the apiserver's reason, naming the pod, rather than being accepted silently |
 | Fault injection: the apiserver goes away mid-watch | Verified by interposing a proxy and cutting it: the break is reported within milliseconds with the reason attached and the rows left alone, and the watch reports itself healthy again within ~3s of the apiserver returning, without anyone touching anything. This is what found ADR-0034 |
 | Exec runs a command in a container and reports how it ended | Verified end to end: output arrives split by stream, a non-zero exit is reported as `exited 1`, a command that never started is a failure rather than a quiet finish, cancellation stops it, and a read-only cluster refuses and records the refusal. Not a terminal — see the Phase 5 scope above |
+| Exec runs in the container it was told to | Verified against the `sidecars` fixture, whose two containers each write their own name into their own filesystem: the same `cat /identity` prints `alpha` in one and `beta` in the other, a container the pod does not have is refused by name, and the three containers the selector offers are read out of the object the detail pane fetched rather than from a second request |
 
 The load fixture is `cargo run --release -p periscope-e2e --bin seed-pods`.
 
@@ -424,7 +437,11 @@ Doing better needs an EKS or GKE cluster, which costs money to run — see
 - **The detail pane's appearance.** Its data path is covered end to end against a
   real cluster (YAML, events, owner references, secret masking), but the
   rendered pane — the syntax-highlighted editor in particular — has not been
-  seen, because opening it needs a click the sandbox cannot send.
+  seen, because opening it needs a click the sandbox cannot send. That now
+  includes the container selector, the list it drops down, the header row that
+  wraps once a pod's controls no longer fit 560 pixels, and the command output's
+  own filter, copy and export toolbar. A `#[gpui::test]` paints each of them, so
+  they are element trees that really build; nobody has looked at them.
 - **The log view's appearance, in full.** `--tail` puts the app straight into
   it, and the rendered lines have been seen — timestamp, colour-coded source,
   text — but only as the strip of the window that was not covered by another

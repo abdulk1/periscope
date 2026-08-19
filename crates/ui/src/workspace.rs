@@ -319,6 +319,19 @@ impl DetailTab {
     }
 }
 
+/// Which of the two panes of lines a shared control is acting on.
+///
+/// A log tail and a command's output are the same [`periscope_store::LogBuffer`]
+/// behind the same filter, copy and export; naming the pane is the only
+/// difference between the two sets of buttons, so it is the only thing passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lines {
+    /// The log view.
+    Logs,
+    /// The output of a command run in a container.
+    Command,
+}
+
 /// The application's root view.
 pub struct Workspace {
     commands: CommandSender,
@@ -381,6 +394,10 @@ pub struct Workspace {
     exec_visible: usize,
     /// What the log view last told the user about an export.
     log_notice: Option<SharedString>,
+    /// Narrows the command output, exactly as `log_filter_input` narrows a tail.
+    exec_filter_input: Entity<InputState>,
+    /// The same one-line answer, for the command output's own controls.
+    exec_notice: Option<SharedString>,
 
     palette: Palette,
     palette_open: bool,
@@ -401,6 +418,14 @@ pub struct Workspace {
     port_input: Entity<InputState>,
     /// The command to run in a container, as typed.
     exec_input: Entity<InputState>,
+    /// The containers of the pod in the detail pane, read from the object it
+    /// fetched. Empty for anything that is not a pod.
+    exec_containers: Vec<periscope_cluster::pods::PodContainer>,
+    /// Which of them to run the command in. `None` is the pod's default, which
+    /// is what `kubectl exec` picks without `-c`.
+    exec_container: Option<Arc<str>>,
+    /// Whether the container list is showing.
+    container_menu_open: bool,
     /// Whether the forwards panel is open.
     forwards_open: bool,
     /// Whether the namespace list is showing.
@@ -480,6 +505,8 @@ impl Workspace {
             cx.new(|cx| InputState::new(window, cx).placeholder("filter kinds"));
         let exec_input = cx.new(|cx| InputState::new(window, cx).placeholder("command"));
         let log_filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("filter lines"));
+        let exec_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("filter output"));
         let log_selector_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("label selector (all pods)"));
         let log_container_input = cx.new(|cx| InputState::new(window, cx).placeholder("container"));
@@ -524,7 +551,13 @@ impl Workspace {
             cx.subscribe(&log_filter_input, |this, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     let pattern = input.read(cx).value().to_string();
-                    this.apply_log_filter(pattern, cx);
+                    this.apply_filter(Lines::Logs, pattern, cx);
+                }
+            }),
+            cx.subscribe(&exec_filter_input, |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let pattern = input.read(cx).value().to_string();
+                    this.apply_filter(Lines::Command, pattern, cx);
                 }
             }),
             // Re-targeting does restart it, so those apply on Enter.
@@ -593,6 +626,8 @@ impl Workspace {
             log_visible: 0,
             exec_visible: 0,
             log_notice: None,
+            exec_filter_input,
+            exec_notice: None,
             yaml_view,
             yaml_showing: None,
             palette: Palette::new(),
@@ -606,6 +641,9 @@ impl Workspace {
             replicas_input,
             port_input,
             exec_input,
+            exec_containers: Vec::new(),
+            exec_container: None,
+            container_menu_open: false,
             forwards_open: false,
             namespace_menu_open: false,
             detail_tab: DetailTab::default(),
@@ -865,6 +903,7 @@ impl Workspace {
         // A new object starts on YAML: the tab you were on for the last one
         // says nothing about this one, and Events is empty for most objects.
         self.detail_tab = DetailTab::default();
+        self.forget_containers();
         self.state.open_detail(kind.clone(), key.clone());
         self.send(ClusterCommand::FetchObject {
             cluster,
@@ -874,6 +913,19 @@ impl Workspace {
             reveal: false,
         });
         cx.notify();
+    }
+
+    /// Forgets the containers of the object that was on screen.
+    ///
+    /// Called when the pane is pointed somewhere else, not when its object
+    /// arrives: between the two there is a window in which Run is on screen and
+    /// the list belongs to the previous pod, and a command aimed at a container
+    /// name from another pod is exactly the mistake the selector exists to
+    /// prevent.
+    fn forget_containers(&mut self) {
+        self.exec_containers = Vec::new();
+        self.exec_container = None;
+        self.container_menu_open = false;
     }
 
     /// Re-fetches the object on screen with its secret values shown.
@@ -903,6 +955,7 @@ impl Workspace {
         self.ensure_watches();
 
         if let Some(cluster) = self.state.active().cloned() {
+            self.forget_containers();
             self.state.open_detail(kind.clone(), key.clone());
             self.send(ClusterCommand::FetchObject {
                 cluster,
@@ -1057,9 +1110,11 @@ impl Workspace {
         let key = detail.key().clone();
         let typed = self.exec_input.read(cx).value().to_string();
 
-        // No container is named, so the apiserver picks the pod's default —
-        // the same thing `kubectl exec` does without `-c`.
-        let Some(target) = ExecTarget::parse(&*key.namespace, &*key.name, None, &typed) else {
+        // `None` leaves the choice to the apiserver, which picks the pod's
+        // default — the same thing `kubectl exec` does without `-c`. Either way
+        // the confirmation sentence says which container it will be.
+        let container = self.exec_container.clone();
+        let Some(target) = ExecTarget::parse(&*key.namespace, &*key.name, container, &typed) else {
             self.last_error = Some(SharedString::from(
                 "Type a command to run next to Run, such as `ls -la /etc`.",
             ));
@@ -1078,10 +1133,23 @@ impl Workspace {
                 let (cluster, target) = authorized.into_parts();
                 tracing::info!(%cluster, target = %target.label(), "running a command");
 
+                // Running a second command keeps the filter the first one was
+                // being read through, because the filter box on screen still
+                // says so — and a control that disagrees with what is under it
+                // is worse than either behaviour.
+                let filter = self
+                    .state
+                    .exec()
+                    .map(|session| session.buffer.filter().clone());
+
                 // The pane opens now, empty, rather than when the first line
                 // arrives: a command that prints nothing still ran.
                 self.state
                     .open_exec(cluster.clone(), Arc::clone(&target), self.log_capacity);
+                if let Some(filter) = filter {
+                    self.state.set_exec_filter(filter);
+                }
+                self.exec_notice = None;
                 self.send(ClusterCommand::Exec { cluster, target });
             }
             Err(refusal) => {
@@ -1102,7 +1170,7 @@ impl Workspace {
     }
 
     /// Closes the output pane, stopping the command if it is still running.
-    fn close_command(&mut self, cx: &mut Context<Self>) {
+    fn close_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self
             .state
             .exec()
@@ -1111,6 +1179,29 @@ impl Workspace {
             self.stop_command(cx);
         }
         self.state.close_exec();
+        // The filter box goes with the pane it belonged to: the next command
+        // starts with the buffer unfiltered, and a box left holding a pattern
+        // nothing is applying would say otherwise.
+        self.exec_filter_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.exec_notice = None;
+        cx.notify();
+    }
+
+    /// Shows or hides the list of the open pod's containers.
+    fn toggle_container_menu(&mut self, cx: &mut Context<Self>) {
+        self.container_menu_open = !self.container_menu_open;
+        cx.notify();
+    }
+
+    /// Aims the next command at a container, or back at the pod's default.
+    ///
+    /// Nothing runs here: which container is part of what the confirmation
+    /// sentence has to say, so picking one only changes what will be proposed.
+    fn pick_container(&mut self, container: Option<Arc<str>>, cx: &mut Context<Self>) {
+        self.exec_container = container;
+        self.container_menu_open = false;
         cx.notify();
     }
 
@@ -1259,30 +1350,59 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Applies the filter box to the open session.
-    fn apply_log_filter(&mut self, pattern: String, cx: &mut Context<Self>) {
-        let Some(session) = self.state.logs() else {
+    /// The lines one of the two panes is showing, if it is open.
+    fn buffer(&self, lines: Lines) -> Option<&periscope_store::LogBuffer> {
+        match lines {
+            Lines::Logs => self.state.logs().map(|session| &session.buffer),
+            Lines::Command => self.state.exec().map(|session| &session.buffer),
+        }
+    }
+
+    /// What a pane is being read through, if it is open.
+    fn filter_of(&self, lines: Lines) -> Option<FilterSpec> {
+        self.buffer(lines).map(|buffer| buffer.filter()).cloned()
+    }
+
+    /// Narrows one of the two panes, reporting whether anything changed.
+    fn set_filter(&mut self, lines: Lines, spec: FilterSpec) -> bool {
+        match lines {
+            Lines::Logs => self.state.set_log_filter(spec),
+            Lines::Command => self.state.set_exec_filter(spec),
+        }
+    }
+
+    /// What the pane's controls put on their one-line notice.
+    fn say(&mut self, lines: Lines, said: String) {
+        let said = Some(SharedString::from(said));
+        match lines {
+            Lines::Logs => self.log_notice = said,
+            Lines::Command => self.exec_notice = said,
+        }
+    }
+
+    /// Applies a filter box to the pane it belongs to.
+    fn apply_filter(&mut self, lines: Lines, pattern: String, cx: &mut Context<Self>) {
+        let Some(current) = self.filter_of(lines) else {
             return;
         };
-        let spec = FilterSpec {
-            pattern,
-            regex: session.buffer.filter().regex,
-            case_sensitive: session.buffer.filter().case_sensitive,
-        };
-        if self.state.set_log_filter(spec) {
+        let spec = FilterSpec { pattern, ..current };
+
+        if self.set_filter(lines, spec) {
             // A narrower filter renumbers every line, so the index a jump left
-            // behind no longer names the line it landed on.
-            self.log_anchor = None;
+            // behind no longer names the line it landed on. Only the log view
+            // has a jump; the command output is never anchored anywhere.
+            if lines == Lines::Logs {
+                self.log_anchor = None;
+            }
             cx.notify();
         }
     }
 
     /// Flips one of the filter's modes without touching the pattern.
-    fn toggle_filter_mode(&mut self, regex: bool, cx: &mut Context<Self>) {
-        let Some(session) = self.state.logs() else {
+    fn toggle_filter_mode(&mut self, lines: Lines, regex: bool, cx: &mut Context<Self>) {
+        let Some(current) = self.filter_of(lines) else {
             return;
         };
-        let current = session.buffer.filter().clone();
         let spec = if regex {
             FilterSpec {
                 regex: !current.regex,
@@ -1294,8 +1414,11 @@ impl Workspace {
                 ..current
             }
         };
-        if self.state.set_log_filter(spec) {
-            self.log_anchor = None;
+
+        if self.set_filter(lines, spec) {
+            if lines == Lines::Logs {
+                self.log_anchor = None;
+            }
             cx.notify();
         }
     }
@@ -1384,33 +1507,37 @@ impl Workspace {
         }
     }
 
+    /// How a pane names itself: the tail's target, or the command that ran.
+    fn label_of(&self, lines: Lines) -> Option<String> {
+        match lines {
+            Lines::Logs => self.state.logs().map(|session| session.target.label()),
+            Lines::Command => self.state.exec().map(|session| session.target.label()),
+        }
+    }
+
     /// Copies the visible lines to the clipboard.
-    fn copy_logs(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self.state.logs() else {
+    fn copy_lines(&mut self, lines: Lines, cx: &mut Context<Self>) {
+        let Some(buffer) = self.buffer(lines) else {
             return;
         };
-        let text = session.buffer.to_text();
-        let lines = session.buffer.visible_len();
+        let text = buffer.to_text();
+        let copied = buffer.visible_len();
 
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-        self.log_notice = Some(SharedString::from(format!("Copied {lines} lines")));
+        self.say(lines, format!("Copied {copied} lines"));
         cx.notify();
     }
 
     /// Writes the visible lines to a file and says where it went.
-    fn export_logs(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self.state.logs() else {
+    fn export_lines(&mut self, lines: Lines, cx: &mut Context<Self>) {
+        let (Some(label), Some(text)) = (
+            self.label_of(lines),
+            self.buffer(lines).map(periscope_store::LogBuffer::to_text),
+        ) else {
             return;
         };
 
-        let name = format!(
-            "periscope-{}-{}.log",
-            session
-                .target
-                .label()
-                .replace(['/', ' ', '[', ']', '(', ')'], "-"),
-            self.exports
-        );
+        let name = export_name(&label, self.exports);
         self.exports += 1;
 
         let path = periscope_config::paths::export_dir()
@@ -1419,16 +1546,19 @@ impl Workspace {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(&path, session.buffer.to_text())?;
+                std::fs::write(&path, text)?;
                 Ok(path)
             });
 
-        self.log_notice = Some(SharedString::from(match path {
-            Ok(path) => format!("Exported to {}", path.display()),
-            // Failing to write a file is not a reason to lose the logs; say
-            // what happened and leave them on screen.
-            Err(error) => format!("Could not export: {error}"),
-        }));
+        self.say(
+            lines,
+            match path {
+                Ok(path) => format!("Exported to {}", path.display()),
+                // Failing to write a file is not a reason to lose the lines;
+                // say what happened and leave them on screen.
+                Err(error) => format!("Could not export: {error}"),
+            },
+        );
         cx.notify();
     }
 
@@ -1549,10 +1679,13 @@ impl Workspace {
         } else if self.namespace_menu_open {
             self.namespace_menu_open = false;
             cx.notify();
+        } else if self.container_menu_open {
+            self.container_menu_open = false;
+            cx.notify();
         } else if self.palette_open {
             self.close_palette(window, cx);
         } else if self.state.exec().is_some() {
-            self.close_command(cx);
+            self.close_command(window, cx);
         } else if self.state.logs().is_some() {
             self.close_logs(cx);
         } else if self.state.detail().is_some() {
@@ -2378,118 +2511,123 @@ impl Workspace {
         let sorted = buffer.order() == periscope_store::LogOrder::Timestamp;
         let window = logview::wrap_window(buffer.visible_len(), self.log_anchor);
 
-        let toolbar = h_flex()
-            .w_full()
-            .flex_none()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            // There are more controls here than fit a narrow window, and a
-            // button that has fallen off the right edge might as well not exist.
-            .flex_wrap()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                Button::new("follow")
-                    .outline()
-                    .small()
-                    .label(if session.following {
-                        "Following"
-                    } else {
-                        "Paused"
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_follow(&ToggleFollow, window, cx)
-                    })),
-            )
-            .child(
-                div()
-                    .w(px(200.))
-                    .child(Input::new(&self.log_filter_input).small()),
-            )
-            .child(
-                Button::new("regex")
-                    .outline()
-                    .small()
-                    .label(if spec.regex { ".* on" } else { ".* off" })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_mode(true, cx))),
-            )
-            .child(
-                Button::new("case")
-                    .outline()
-                    .small()
-                    .label(if spec.case_sensitive { "Aa" } else { "aa" })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_mode(false, cx))),
-            )
-            .child(
-                div()
-                    .w(px(180.))
-                    .child(Input::new(&self.log_selector_input).small()),
-            )
-            .child(
-                div()
-                    .w(px(130.))
-                    .child(Input::new(&self.log_container_input).small()),
-            )
-            .child(
-                Button::new("previous")
-                    .outline()
-                    .small()
-                    .label(if session.target.previous {
-                        "Previous"
-                    } else {
-                        "Current"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_previous(cx))),
-            )
-            .child(
-                div()
-                    .w(px(120.))
-                    .child(Input::new(&self.log_time_input).small()),
-            )
-            .child(
-                Button::new("jump")
-                    .outline()
-                    .small()
-                    .label("Jump")
-                    .on_click(cx.listener(|this, _, _, cx| this.jump_to_time(cx))),
-            )
-            .child(
-                Button::new("wrap")
-                    .outline()
-                    .small()
-                    .label(if self.log_wrap { "Wrap on" } else { "Wrap off" })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_wrap(cx))),
-            )
-            .child(
-                Button::new("order")
-                    .outline()
-                    .small()
-                    .label(if sorted { "By time" } else { "By arrival" })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_order(cx))),
-            )
-            .child(
-                Button::new("copy-logs")
-                    .outline()
-                    .small()
-                    .label("Copy")
-                    .on_click(cx.listener(|this, _, _, cx| this.copy_logs(cx))),
-            )
-            .child(
-                Button::new("export-logs")
-                    .outline()
-                    .small()
-                    .label("Export")
-                    .on_click(cx.listener(|this, _, _, cx| this.export_logs(cx))),
-            )
-            .child(
-                Button::new("close-logs")
-                    .outline()
-                    .small()
-                    .label("Close")
-                    .on_click(cx.listener(|this, _, _, cx| this.close_logs(cx))),
-            );
+        let toolbar =
+            h_flex()
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                // There are more controls here than fit a narrow window, and a
+                // button that has fallen off the right edge might as well not exist.
+                .flex_wrap()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    Button::new("follow")
+                        .outline()
+                        .small()
+                        .label(if session.following {
+                            "Following"
+                        } else {
+                            "Paused"
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_follow(&ToggleFollow, window, cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .w(px(200.))
+                        .child(Input::new(&self.log_filter_input).small()),
+                )
+                .child(
+                    Button::new("regex")
+                        .outline()
+                        .small()
+                        .label(if spec.regex { ".* on" } else { ".* off" })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_filter_mode(Lines::Logs, true, cx)
+                        })),
+                )
+                .child(
+                    Button::new("case")
+                        .outline()
+                        .small()
+                        .label(if spec.case_sensitive { "Aa" } else { "aa" })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_filter_mode(Lines::Logs, false, cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .w(px(180.))
+                        .child(Input::new(&self.log_selector_input).small()),
+                )
+                .child(
+                    div()
+                        .w(px(130.))
+                        .child(Input::new(&self.log_container_input).small()),
+                )
+                .child(
+                    Button::new("previous")
+                        .outline()
+                        .small()
+                        .label(if session.target.previous {
+                            "Previous"
+                        } else {
+                            "Current"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_previous(cx))),
+                )
+                .child(
+                    div()
+                        .w(px(120.))
+                        .child(Input::new(&self.log_time_input).small()),
+                )
+                .child(
+                    Button::new("jump")
+                        .outline()
+                        .small()
+                        .label("Jump")
+                        .on_click(cx.listener(|this, _, _, cx| this.jump_to_time(cx))),
+                )
+                .child(
+                    Button::new("wrap")
+                        .outline()
+                        .small()
+                        .label(if self.log_wrap { "Wrap on" } else { "Wrap off" })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_wrap(cx))),
+                )
+                .child(
+                    Button::new("order")
+                        .outline()
+                        .small()
+                        .label(if sorted { "By time" } else { "By arrival" })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_order(cx))),
+                )
+                .child(
+                    Button::new("copy-logs")
+                        .outline()
+                        .small()
+                        .label("Copy")
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_lines(Lines::Logs, cx))),
+                )
+                .child(
+                    Button::new("export-logs")
+                        .outline()
+                        .small()
+                        .label("Export")
+                        .on_click(cx.listener(|this, _, _, cx| this.export_lines(Lines::Logs, cx))),
+                )
+                .child(
+                    Button::new("close-logs")
+                        .outline()
+                        .small()
+                        .label("Close")
+                        .on_click(cx.listener(|this, _, _, cx| this.close_logs(cx))),
+                );
 
         // Anything the session wants to say — a failure, a bad pattern, where
         // an export went — goes on one line rather than into a dialog. A
@@ -2613,6 +2751,7 @@ impl Workspace {
         let session = self.state.exec()?;
         let buffer = &session.buffer;
         let running = session.is_running();
+        let spec = buffer.filter();
 
         let status = session.summary();
         let bad = session
@@ -2620,9 +2759,84 @@ impl Workspace {
             .as_ref()
             .is_some_and(periscope_bridge::ExecStatus::is_problem);
 
+        let counts = if buffer.visible_len() == buffer.len() {
+            format!("{} lines", buffer.len())
+        } else {
+            format!("{} of {} lines", buffer.visible_len(), buffer.len())
+        };
+
+        // The same controls as the log toolbar, over the same buffer, because
+        // grepping a command's output is the same act as grepping a tail.
+        let toolbar = h_flex()
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .flex_wrap()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .w(px(200.))
+                    .child(Input::new(&self.exec_filter_input).small()),
+            )
+            .child(
+                Button::new("exec-regex")
+                    .outline()
+                    .small()
+                    .label(if spec.regex { ".* on" } else { ".* off" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_filter_mode(Lines::Command, true, cx)
+                    })),
+            )
+            .child(
+                Button::new("exec-case")
+                    .outline()
+                    .small()
+                    .label(if spec.case_sensitive { "Aa" } else { "aa" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_filter_mode(Lines::Command, false, cx)
+                    })),
+            )
+            .child(
+                Button::new("copy-command")
+                    .outline()
+                    .small()
+                    .label("Copy")
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_lines(Lines::Command, cx))),
+            )
+            .child(
+                Button::new("export-command")
+                    .outline()
+                    .small()
+                    .label("Export")
+                    .on_click(cx.listener(|this, _, _, cx| this.export_lines(Lines::Command, cx))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(counts),
+            );
+
+        // A pattern that will not compile is the one thing here that has to
+        // shout: without it the pane looks like a command that printed nothing.
+        let notice = buffer
+            .filter_error()
+            .map(|reason| (format!("filter: {reason}"), true))
+            .or_else(|| {
+                self.exec_notice
+                    .as_ref()
+                    .map(|said| (said.to_string(), false))
+            });
+
         let lines = Arc::<[Arc<periscope_bridge::LogLine>]>::from(buffer.visible_lines());
         let body = if lines.is_empty() {
-            let message = if running {
+            let message = if !buffer.is_empty() {
+                "Nothing matches the current filter.".to_owned()
+            } else if running {
                 "Running — waiting for output.".to_owned()
             } else {
                 // A command that printed nothing is a result, not a bug, and
@@ -2688,12 +2902,27 @@ impl Workspace {
                                         .outline()
                                         .small()
                                         .label("Close")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.close_command(cx)),
-                                        ),
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_command(window, cx)
+                                        })),
                                 ),
                         ),
                 )
+                .child(toolbar)
+                .children(notice.map(|(text, bad)| {
+                    div()
+                        .w_full()
+                        .flex_none()
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .text_color(if bad {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(text)
+                }))
                 .child(body),
         )
     }
@@ -3043,8 +3272,14 @@ impl Workspace {
                         .flex_none()
                         .items_center()
                         .justify_between()
+                        .gap_2()
                         .px_3()
                         .py_2()
+                        // A pod with actions, a port, a container, a command and
+                        // three buttons is more than 560 pixels of controls, and
+                        // one that has fallen off the right edge might as well
+                        // not exist — the log toolbar wraps for the same reason.
+                        .flex_wrap()
                         .border_b_1()
                         .border_color(cx.theme().border)
                         .child(
@@ -3079,6 +3314,25 @@ impl Workspace {
                                 .label("Forward")
                                 .on_click(cx.listener(|this, _, _, cx| this.start_forward(cx)))
                         }))
+                        // Only where there is something to choose between: a pod
+                        // with one container has no choice to offer, and one
+                        // whose object has not arrived yet does not know.
+                        .children((is_pod && writable && self.exec_containers.len() > 1).then(
+                            || {
+                                Button::new("exec-container")
+                                    .outline()
+                                    .small()
+                                    .label(match &self.exec_container {
+                                        Some(container) => container.to_string(),
+                                        None => "Default container".to_owned(),
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.toggle_container_menu(cx)
+                                        }),
+                                    )
+                            },
+                        ))
                         .children((is_pod && writable).then(|| {
                             div()
                                 .w(px(150.))
@@ -3420,6 +3674,97 @@ impl Workspace {
         )
     }
 
+    /// The containers a command can be aimed at.
+    ///
+    /// Read from the object the detail pane already fetched, so opening this
+    /// costs no request: see the note in [`Render::render`] on where the names
+    /// come from.
+    fn container_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.container_menu_open {
+            return None;
+        }
+
+        let mut entries: Vec<gpui::AnyElement> = Vec::new();
+        let row = |id: String, selected: bool, label: String, cx: &mut Context<Self>| {
+            div()
+                .id(SharedString::from(id))
+                .w_full()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .when(selected, |row| row.bg(cx.theme().accent))
+                .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
+                .child(
+                    div()
+                        .text_sm()
+                        .truncate()
+                        .text_color(cx.theme().foreground)
+                        .child(label),
+                )
+        };
+
+        entries.push(
+            row(
+                "container-default".to_owned(),
+                self.exec_container.is_none(),
+                "Default container".to_owned(),
+                cx,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.pick_container(None, cx)))
+            .into_any_element(),
+        );
+
+        for container in &self.exec_containers {
+            let picked = Arc::clone(&container.name);
+            let selected = self.exec_container.as_deref() == Some(&*container.name);
+            // An init container is worth flagging: unless it is a sidecar, it
+            // has already exited by the time anyone is looking at the pod, and
+            // the apiserver's refusal would otherwise be a surprise.
+            let label = if container.init {
+                format!("{} (init)", container.name)
+            } else {
+                container.name.to_string()
+            };
+
+            entries.push(
+                row(format!("container-{}", container.name), selected, label, cx)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.pick_container(Some(Arc::clone(&picked)), cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .id("container-backdrop")
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_container_menu(cx)))
+                .child(
+                    v_flex()
+                        .absolute()
+                        .top(px(96.))
+                        // The detail pane is the right-hand 560 pixels of the
+                        // window, and the button that opens this is in it.
+                        .right(px(24.))
+                        .w(px(240.))
+                        .max_h(px(320.))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().background)
+                        .p_1()
+                        .id("container-menu")
+                        .overflow_y_scroll()
+                        .children(entries),
+                ),
+        )
+    }
+
     /// The fuzzy jump palette, drawn over everything else.
     fn palette_overlay(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.palette_open {
@@ -3512,6 +3857,20 @@ impl Render for Workspace {
         if let Some(Detail::Ready { object, .. }) = self.state.detail() {
             if self.yaml_showing.as_ref() != Some(&object.key) {
                 let yaml = object.yaml.to_string();
+
+                // Which containers a pod has is already known: it is in the
+                // object the detail pane fetched, so the selector next to Run
+                // needs no request of its own. Reading them means parsing the
+                // YAML back, which is what holding the object as text costs;
+                // it happens once per object opened, not once per frame.
+                self.exec_containers = periscope_cluster::yaml::parse(&yaml)
+                    .map(|value| periscope_cluster::pods::containers(&value))
+                    .unwrap_or_default();
+                // A container named in the pod before this one means nothing
+                // here, and running a command in the wrong one is not a
+                // mistake worth making possible.
+                self.exec_container = None;
+
                 self.yaml_showing = Some(object.key.clone());
                 self.yaml_view.update(cx, |input, cx| {
                     input.set_value(yaml, window, cx);
@@ -3519,6 +3878,8 @@ impl Render for Workspace {
             }
         } else if self.yaml_showing.is_some() {
             self.yaml_showing = None;
+            self.exec_containers = Vec::new();
+            self.exec_container = None;
         }
 
         // Following means the newest line stays on screen. Scrolling only when
@@ -3615,6 +3976,7 @@ impl Render for Workspace {
                     .child(self.footer(cx)),
             )
             .children(self.namespace_menu(cx))
+            .children(self.container_menu(cx))
             .children(self.confirmation(cx))
             .children(self.palette_overlay(cx));
 
@@ -3650,6 +4012,30 @@ fn section(title: &'static str, cx: &App) -> impl IntoElement {
         .text_xs()
         .text_color(cx.theme().muted_foreground)
         .child(title)
+}
+
+/// How many characters of a pane's label an export file name keeps.
+///
+/// A command line is part of the command pane's label and has no length limit;
+/// a file name does, and on most filesystems it is 255 bytes.
+const EXPORT_LABEL_LIMIT: usize = 80;
+
+/// The file an export goes to, derived from what the pane is showing.
+///
+/// `exports` counts within the session so two exports of the same pane do not
+/// overwrite each other. Everything a shell or a path would read as structure
+/// becomes a dash, because the point of the name is to say what is in the file.
+fn export_name(label: &str, exports: u32) -> String {
+    let sanitized: String = label
+        .replace(
+            ['/', ' ', '[', ']', '(', ')', '$', '*', '"', '\'', '\\'],
+            "-",
+        )
+        .chars()
+        .take(EXPORT_LABEL_LIMIT)
+        .collect();
+
+    format!("periscope-{sanitized}-{exports}.log")
 }
 
 /// The kind an owner reference points at.
@@ -5094,6 +5480,68 @@ mod tests {
         });
     }
 
+    /// The YAML of a pod with two containers and one init container.
+    fn pod_yaml(name: &str) -> String {
+        format!(
+            "apiVersion: v1\n\
+             kind: Pod\n\
+             metadata:\n  \
+               name: {name}\n  \
+               namespace: default\n\
+             spec:\n  \
+               initContainers:\n  \
+               - name: migrate\n  \
+               containers:\n  \
+               - name: api\n  \
+               - name: envoy\n"
+        )
+    }
+
+    /// Answers the detail fetch, which is where the container list comes from.
+    ///
+    /// The frame matters: the selector reads the object at render time, the
+    /// same place the YAML editor is filled in.
+    fn deliver_pod(harness: &Harness, cx: &mut TestAppContext, name: &str) {
+        apply(
+            harness,
+            cx,
+            vec![ClusterEvent::Object {
+                cluster: "prod".into(),
+                kind: pods(),
+                detail: Arc::new(periscope_bridge::ObjectDetail {
+                    key: ResourceKey::new("default", name),
+                    yaml: Arc::from(pod_yaml(name).as_str()),
+                    maskable: false,
+                    revealed: true,
+                    events: Arc::from([] as [periscope_bridge::EventLine; 0]),
+                    owners: Arc::from([] as [periscope_bridge::OwnerRef; 0]),
+                }),
+            }],
+        );
+        harness.draw(cx);
+    }
+
+    /// A connected cluster with a pod open and its object delivered.
+    fn workspace_with_pod(cx: &mut TestAppContext, name: &str) -> (Harness, CommandReceiver) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::Status {
+                cluster: "prod".into(),
+                state: ConnectionState::Connected,
+            }],
+        );
+        open_pod_detail(&harness, cx, name);
+        deliver_pod(&harness, cx, name);
+        (harness, rx)
+    }
+
     #[gpui::test]
     fn tailing_a_pod_starts_a_session_for_that_pod(cx: &mut TestAppContext) {
         let (harness, rx) = workspace(cx);
@@ -5205,7 +5653,7 @@ mod tests {
         );
 
         harness.update(cx, |workspace, _window, cx| {
-            workspace.apply_log_filter("error".to_owned(), cx);
+            workspace.apply_filter(Lines::Logs, "error".to_owned(), cx);
         });
 
         harness.read(cx, |workspace| {
@@ -5880,6 +6328,280 @@ mod tests {
             // The detail pane behind it stayed.
             assert!(workspace.state().detail().is_some());
         });
+    }
+
+    #[gpui::test]
+    fn the_containers_offered_come_from_the_object_the_pane_already_fetched(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        drain(&rx);
+
+        deliver_pod(&harness, cx, "api-0");
+
+        harness.read(cx, |workspace| {
+            let names: Vec<_> = workspace
+                .exec_containers
+                .iter()
+                .map(|container| &*container.name)
+                .collect();
+            // The pod's own containers first, then the init container, which is
+            // the order the apiserver's default makes sense in.
+            assert_eq!(names, ["api", "envoy", "migrate"]);
+            assert!(workspace.exec_containers[2].init);
+            // Nothing is chosen until somebody chooses.
+            assert!(workspace.exec_container.is_none());
+        });
+        // And it cost no request: the object was already here.
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_picked_container_is_named_in_the_confirmation_and_in_what_is_sent(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, rx) = workspace_with_pod(cx, "api-0");
+        drain(&rx);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace.pick_container(Some(Arc::from("envoy")), cx);
+            workspace
+                .exec_input
+                .update(cx, |input, cx| input.set_value("ps", window, cx));
+            workspace.run_command(cx);
+        });
+
+        // Which container a command runs in changes what is being run, so the
+        // sentence the user agrees to has to say it.
+        harness.read(cx, |workspace| {
+            let sentence = workspace
+                .pending
+                .as_ref()
+                .expect("a command is waiting")
+                .confirmation(&ClusterId::new("prod"));
+            assert!(sentence.contains("container envoy"), "{sentence}");
+        });
+
+        harness.update(cx, |workspace, _window, cx| workspace.confirm_mutation(cx));
+
+        match drain(&rx).as_slice() {
+            [ClusterCommand::Exec { target, .. }] => {
+                assert_eq!(target.container.as_deref(), Some("envoy"));
+            }
+            other => panic!("expected one exec, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    fn no_container_picked_leaves_the_choice_to_the_apiserver(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace_with_pod(cx, "api-0");
+        drain(&rx);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace
+                .exec_input
+                .update(cx, |input, cx| input.set_value("ps", window, cx));
+            workspace.run_command(cx);
+            workspace.confirm_mutation(cx);
+        });
+
+        match drain(&rx).as_slice() {
+            [ClusterCommand::Exec { target, .. }] => assert!(target.container.is_none()),
+            other => panic!("expected one exec, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    fn opening_another_pod_forgets_the_container_that_was_picked(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace_with_pod(cx, "api-0");
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.pick_container(Some(Arc::from("envoy")), cx);
+        });
+        open_pod_detail(&harness, cx, "api-1");
+        // Before the new object has even arrived: Run is on screen throughout,
+        // and a name that meant a sidecar in the last pod is a way to run a
+        // command in the wrong place in this one.
+        harness.read(cx, |workspace| {
+            assert!(workspace.exec_container.is_none());
+            assert!(workspace.exec_containers.is_empty());
+        });
+
+        deliver_pod(&harness, cx, "api-1");
+        harness.read(cx, |workspace| assert!(workspace.exec_container.is_none()));
+    }
+
+    #[gpui::test]
+    fn escape_puts_the_container_list_away_before_anything_else(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace_with_pod(cx, "api-0");
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.toggle_container_menu(cx);
+        });
+        // Painted, so the list is an element tree that really builds and not
+        // just a bool nobody looked at.
+        harness.draw(cx);
+
+        harness.keys(cx, "escape");
+
+        harness.read(cx, |workspace| {
+            assert!(!workspace.container_menu_open);
+            // The pane the button belongs to stayed.
+            assert!(workspace.state().detail().is_some());
+        });
+    }
+
+    /// A session with three lines of output in it.
+    fn command_with_output(cx: &mut TestAppContext) -> (Harness, CommandReceiver) {
+        let (harness, rx) = workspace_with_pod(cx, "api-0");
+        harness.update(cx, |workspace, window, cx| {
+            workspace
+                .exec_input
+                .update(cx, |input, cx| input.set_value("dmesg", window, cx));
+            workspace.run_command(cx);
+            workspace.confirm_mutation(cx);
+        });
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::ExecOutput {
+                cluster: "prod".into(),
+                lines: ["starting", "an error", "done"]
+                    .iter()
+                    .map(|text| periscope_bridge::LogLine {
+                        source: periscope_bridge::LogSource::new("api-0", "stdout"),
+                        timestamp: None,
+                        text: Arc::from(*text),
+                    })
+                    .collect(),
+            }],
+        );
+        // The pane with its toolbar is painted, not merely computed.
+        harness.draw(cx);
+        drain(&rx);
+        (harness, rx)
+    }
+
+    #[gpui::test]
+    fn filtering_command_output_narrows_it_without_re_running_anything(cx: &mut TestAppContext) {
+        let (harness, rx) = command_with_output(cx);
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.apply_filter(Lines::Command, "error".to_owned(), cx);
+        });
+
+        harness.read(cx, |workspace| {
+            let buffer = &workspace.state().exec().expect("a session").buffer;
+            assert_eq!(buffer.visible_len(), 1);
+            assert_eq!(buffer.len(), 3);
+        });
+        // The output is held here; narrowing it is not a reason to run the
+        // command again.
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_filter_that_will_not_compile_says_so_rather_than_showing_nothing(cx: &mut TestAppContext) {
+        let (harness, _rx) = command_with_output(cx);
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.toggle_filter_mode(Lines::Command, true, cx);
+            workspace.apply_filter(Lines::Command, "err(".to_owned(), cx);
+        });
+
+        harness.read(cx, |workspace| {
+            let buffer = &workspace.state().exec().expect("a session").buffer;
+            assert!(buffer.filter_error().is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn copying_command_output_takes_what_is_on_screen_and_says_how_much(cx: &mut TestAppContext) {
+        let (harness, _rx) = command_with_output(cx);
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.apply_filter(Lines::Command, "error".to_owned(), cx);
+            workspace.copy_lines(Lines::Command, cx);
+        });
+
+        harness.read(cx, |workspace| {
+            let said = workspace.exec_notice.as_ref().expect("it says what it did");
+            // The filtered lines, not the whole buffer: what is copied is what
+            // is being read.
+            assert!(said.contains("Copied 1 lines"), "{said}");
+            // And the log view, which has its own notice, said nothing.
+            assert!(workspace.log_notice.is_none());
+        });
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("something reached the clipboard");
+        assert!(copied.contains("an error"), "{copied}");
+        assert!(!copied.contains("starting"), "{copied}");
+    }
+
+    #[gpui::test]
+    fn closing_the_command_pane_empties_its_filter_box(cx: &mut TestAppContext) {
+        let (harness, _rx) = command_with_output(cx);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace
+                .exec_filter_input
+                .update(cx, |input, cx| input.set_value("error", window, cx));
+        });
+        harness.update(cx, |workspace, window, cx| {
+            workspace.close_command(window, cx);
+        });
+
+        // A box still holding a pattern nothing is applying is a lie about
+        // what the next command's output has been narrowed to.
+        harness.update(cx, |workspace, _window, cx| {
+            assert!(workspace.state().exec().is_none());
+            assert!(workspace.exec_filter_input.read(cx).value().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn running_a_second_command_keeps_the_filter_the_first_was_read_through(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, rx) = command_with_output(cx);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace
+                .exec_filter_input
+                .update(cx, |input, cx| input.set_value("error", window, cx));
+            workspace
+                .exec_input
+                .update(cx, |input, cx| input.set_value("dmesg", window, cx));
+            workspace.run_command(cx);
+            workspace.confirm_mutation(cx);
+        });
+        drain(&rx);
+
+        harness.read(cx, |workspace| {
+            let buffer = &workspace.state().exec().expect("a session").buffer;
+            assert_eq!(buffer.filter().pattern, "error");
+        });
+    }
+
+    #[test]
+    fn an_export_name_survives_a_command_line_longer_than_a_file_name() {
+        let label = format!("default/api-0 $ sh -c {}", "x".repeat(400));
+        let name = export_name(&label, 3);
+
+        assert!(name.len() < 120, "{name}");
+        assert!(name.starts_with("periscope-default-api-0-"), "{name}");
+        assert!(name.ends_with("-3.log"), "{name}");
+        // Nothing a path or a shell would read as structure survives.
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains('$'), "{name}");
     }
 
     #[gpui::test]

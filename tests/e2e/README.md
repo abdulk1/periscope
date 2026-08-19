@@ -27,7 +27,7 @@ for the same one-node cluster.
 | `tests/multicluster.rs` | Five clusters at once, the row budget, warm switching, and one unreachable cluster |
 | `tests/mutations.rs` | Delete, scale, restart, cordon, drain, apply and dry run — plus a read-only cluster refusing, and the audit log |
 | `tests/forwards.rs` | Real HTTP traffic through a forward, several connections, teardown closing the port, a dead port reported, and recovery after a broken connection |
-| `tests/exec.rs` | Running a command, its exit code, stdout and stderr kept apart, a command that does not exist, cancellation, and the audit log |
+| `tests/exec.rs` | Running a command, its exit code, stdout and stderr kept apart, a command that does not exist, cancellation, the container it runs in, and the audit log |
 | `tests/faults.rs` | The apiserver going away mid-watch: the break is reported with a reason, the rows are kept, and the watch recovers by itself when it comes back |
 
 `tests/mutations.rs` **changes the cluster**: each test creates the deployment it
@@ -35,9 +35,9 @@ acts on and deletes it afterwards, the cordon test always uncordons, and the
 drain test drains the one `kind` node and uncordons it again — the node's pods
 are evicted and rescheduled, which takes a minute or so to settle.
 
-`tests/exec.rs` runs commands inside the `webby` fixture's container. They are
-all reads (`cat`, `ls`, `seq`, `id`); the one command that would write anything
-is in the read-only test, which asserts it never ran.
+`tests/exec.rs` runs commands inside the `webby` and `sidecars` fixtures'
+containers. They are all reads (`cat`, `ls`, `seq`, `id`); the one command that
+would write anything is in the read-only test, which asserts it never ran.
 
 The auth tests write a throwaway kubeconfig into the temp directory and point the
 app at it with `--kubeconfig`'s programmatic equivalent, so the developer's own
@@ -60,11 +60,16 @@ kubectl apply -f tests/e2e/fixtures/chatty.yaml     # three pods, five lines a s
 kubectl apply -f tests/e2e/fixtures/firehose.yaml   # four pods writing as fast as they can
 kubectl delete -f tests/e2e/fixtures/firehose.yaml  # it burns CPU; delete it when done
 kubectl apply -f tests/e2e/fixtures/webby.yaml      # one busybox pod serving a fixed string on 8080
+kubectl apply -f tests/e2e/fixtures/sidecars.yaml   # one pod, two containers and an init container
 ```
 
 `webby` is what the forward and exec suites use: it answers on a port, and its
 busybox container has the handful of commands the exec tests run. Both suites
 skip themselves, with instructions, when it is missing.
+
+`sidecars` is what proves the container selector: its `alpha` and `beta`
+containers each write their own name into their own filesystem, so `cat
+/identity` says which container the command actually ran in.
 
 Skipping is right on a laptop — nobody wants `firehose` burning a core all day —
 and wrong in CI, where a suite that skips itself is indistinguishable from one

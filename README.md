@@ -303,11 +303,22 @@ connection does not take the forward down; a port nothing is listening on is
 reported rather than accepted silently. Forwards outlive the pane that started
 them, which is why the panel is always reachable from the header.
 
-Next to it is a command field and **Run**. It runs one command in the pod's
-default container and streams stdout and stderr into the output pane, labelled
-by stream, ending with the exit code. It is **not** a terminal: no interactive
-input, no `vi`, no `top`. The command line is split on whitespace and is not a
-shell — `sh -c "ls | wc -l"` is how you get one, and it runs in the container.
+Next to it is a command field and **Run**. It runs one command in the pod and
+streams stdout and stderr into the output pane, labelled by stream, ending with
+the exit code. It is **not** a terminal: no interactive input, no `vi`, no
+`top`. The command line is split on whitespace and is not a shell — `sh -c "ls |
+wc -l"` is how you get one, and it runs in the container.
+
+A pod with more than one container also gets a container button, listing its
+containers and its init containers with **Default container** — the one the
+apiserver would pick, which is what `kubectl exec` uses without `-c` — at the
+top. The names come from the object the pane already fetched, so opening the
+list costs nothing. Whichever is chosen is named in the confirmation, because
+the same command in a sidecar and in the app are different acts.
+
+The output pane has the log view's filter box, its `.*` and `Aa` toggles, and
+its **Copy** and **Export** buttons, over the same bounded buffer: copying and
+exporting take what the filter left on screen, in the order it is on screen.
 
 Running a command is treated as a change, because it is: it needs the same
 confirmation, is refused on read-only clusters, and is written to the audit log

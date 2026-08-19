@@ -1,10 +1,12 @@
 //! Running commands in a container, against a real cluster.
 //!
 //! Needs the `webby` fixture, whose container is busybox and therefore has the
-//! handful of commands these tests run:
+//! handful of commands these tests run, and — for the container selector —
+//! `sidecars`, whose pod has two containers and an init container:
 //!
 //! ```text
 //! kubectl apply -f tests/e2e/fixtures/webby.yaml
+//! kubectl apply -f tests/e2e/fixtures/sidecars.yaml
 //! ```
 
 use std::sync::Arc;
@@ -22,6 +24,9 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The label the fixture's pod carries.
 const FIXTURE: &str = "app=webby";
+
+/// The label the multi-container fixture's pod carries.
+const SIDECARS: &str = "app=sidecars";
 
 /// A connected runtime, with a policy and an audit log of the test's choosing.
 fn connected_with(
@@ -63,6 +68,27 @@ fn run(
     command: &str,
 ) -> (Vec<LogLine>, ExecStatus) {
     let target = ExecTarget::parse("default", pod, None, command).expect("a command to run");
+    runtime
+        .send(ClusterCommand::Exec {
+            cluster: cluster.clone(),
+            target: Arc::new(target),
+        })
+        .expect("the command is queued");
+
+    collect(stream)
+}
+
+/// Runs a command in one named container of a pod.
+fn run_in(
+    runtime: &ClusterRuntime,
+    stream: &EventStream,
+    cluster: &ClusterId,
+    pod: &str,
+    container: &str,
+    command: &str,
+) -> (Vec<LogLine>, ExecStatus) {
+    let target = ExecTarget::parse("default", pod, Some(Arc::from(container)), command)
+        .expect("a command to run");
     runtime
         .send(ClusterCommand::Exec {
             cluster: cluster.clone(),
@@ -354,6 +380,84 @@ fn every_command_is_written_to_the_audit_log() {
     // The command itself is the point of the record.
     assert_eq!(entries[0].detail, "id -u");
     assert_eq!(entries[0].cluster, cluster.as_str());
+}
+
+#[test]
+#[ignore = "needs the sidecars fixture"]
+fn a_command_runs_in_the_container_it_was_given() {
+    let Some(pod) = periscope_e2e::fixture("sidecars", SIDECARS) else {
+        return;
+    };
+    let (runtime, stream, cluster) = connected();
+
+    // Each container wrote its own name into its own filesystem, so the file
+    // says which one the command actually ran in.
+    let (alpha, status) = run_in(&runtime, &stream, &cluster, &pod, "alpha", "cat /identity");
+    assert!(!status.is_problem(), "{status:?}");
+    assert_eq!(text(&alpha).trim(), "alpha", "{:?}", text(&alpha));
+
+    let (beta, status) = run_in(&runtime, &stream, &cluster, &pod, "beta", "cat /identity");
+    assert!(!status.is_problem(), "{status:?}");
+    assert_eq!(text(&beta).trim(), "beta", "{:?}", text(&beta));
+}
+
+#[test]
+#[ignore = "needs the sidecars fixture"]
+fn a_container_the_pod_does_not_have_is_refused_by_name() {
+    let Some(pod) = periscope_e2e::fixture("sidecars", SIDECARS) else {
+        return;
+    };
+    let (runtime, stream, cluster) = connected();
+
+    let (_, status) = run_in(&runtime, &stream, &cluster, &pod, "gamma", "cat /identity");
+
+    assert!(status.is_problem(), "{status:?}");
+    let message = status.message();
+    assert!(
+        message.contains("gamma"),
+        "the apiserver's reason must name the container: {message}"
+    );
+}
+
+#[test]
+#[ignore = "needs the sidecars fixture"]
+fn the_containers_a_selector_can_offer_are_in_the_object_the_detail_pane_fetches() {
+    let Some(pod) = periscope_e2e::fixture("sidecars", SIDECARS) else {
+        return;
+    };
+    let (runtime, stream, cluster) = connected();
+
+    runtime
+        .send(ClusterCommand::FetchObject {
+            cluster,
+            kind: periscope_bridge::KindId::new("", "v1", "Pod", "pods"),
+            key: periscope_bridge::ResourceKey::new("default", &pod),
+            reveal: false,
+        })
+        .expect("fetch is queued");
+
+    let (event, _) = wait_for(&stream, TIMEOUT, |event| {
+        matches!(
+            event,
+            ClusterEvent::Object { .. } | ClusterEvent::ObjectFailed { .. }
+        )
+    })
+    .unwrap_or_else(|seen| panic!("no object came back; saw: {}", describe(&seen)));
+    let ClusterEvent::Object { detail, .. } = event else {
+        panic!("the fetch failed: {event:?}")
+    };
+
+    // This is what the UI does with it: the container selector reads the object
+    // the pane already has rather than asking the apiserver a second time.
+    let object = periscope_cluster::yaml::parse(&detail.yaml).expect("the pane's YAML parses");
+    let containers = periscope_cluster::pods::containers(&object);
+    let names: Vec<_> = containers
+        .iter()
+        .map(|container| &*container.name)
+        .collect();
+
+    assert_eq!(names, ["alpha", "beta", "migrate"], "{names:?}");
+    assert!(containers[2].init, "migrate is an init container");
 }
 
 #[test]

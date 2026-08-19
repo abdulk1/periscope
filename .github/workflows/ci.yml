@@ -125,8 +125,9 @@ jobs:
         run: |
           kubectl apply -f tests/e2e/fixtures/chatty.yaml
           kubectl apply -f tests/e2e/fixtures/webby.yaml
+          kubectl apply -f tests/e2e/fixtures/sidecars.yaml
           kubectl wait --for=condition=Available --timeout=300s \
-            deployment/chatty deployment/webby
+            deployment/chatty deployment/webby deployment/sidecars
 
       # PERISCOPE_E2E_REQUIRE_FIXTURES turns "the fixture is missing, skipping"
       # into a failure. Without it an apply that quietly did nothing would leave
