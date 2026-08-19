@@ -51,9 +51,15 @@ fn main() -> Result<()> {
     // written a read-only rule would be the worst possible failure here.
     let settings = periscope_config::Settings::read().context("could not read settings")?;
     let audit = periscope_config::AuditLog::open().context("could not open the audit log")?;
+    // Logged in full because "the setting had no effect" is otherwise
+    // indistinguishable from "the file was never read".
     tracing::info!(
         read_only = settings.access.read_only.len(),
         read_only_by_default = settings.access.read_only_by_default,
+        theme = settings.theme.label(),
+        idle_timeout_s = settings.limits.idle_timeout.get().as_secs(),
+        row_budget = settings.limits.row_budget,
+        log_buffer = settings.limits.log_buffer,
         audit = %audit.path().display(),
         "settings loaded"
     );
