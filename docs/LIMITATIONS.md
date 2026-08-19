@@ -366,18 +366,33 @@ build_p50_us=198 over_budget=57 hitches=0 rows=10009
 ```
 
 The 60fps floor is met with nothing to spare *because the panel is 60Hz*: every
-frame is vsync-locked at 16.67ms and the app is not the limiting factor —
-building the whole view costs ~200µs of that budget. `over_budget` counts
-intervals over 16.67ms and hovers near half the frames purely from vsync jitter;
-`hitches` (over 33ms, i.e. a frame genuinely skipped) stayed at 0.
+frame is vsync-locked at 16.67ms and the app is not the limiting factor.
+`over_budget` counts intervals over 16.67ms and hovers near half the frames
+purely from vsync jitter; `hitches` (over 33ms, i.e. a frame genuinely skipped)
+stayed at 0.
 
-Two honest caveats:
+Three honest caveats:
 
-- **120fps is unverified.** No 120Hz display was available. What can be said is
-  that the app spends ~1.2% of a 60Hz frame building its element tree.
+- **`build_p50_us=198` understates the frame, and is not comparable to what the
+  binary prints today.** The timer used to start partway through `render`, after
+  the changed-row map had been pruned and a newly-opened object's YAML reparsed,
+  so that work was measured as free. It starts at the first statement now. The
+  figure above has not been re-measured since; the number the current build
+  prints should be larger and is the honest one. What has *not* changed is the
+  conclusion — `p50_ms` and `hitches` are end-to-end measurements and they are
+  what says the app holds 60fps.
+- **120fps is unverified.** No 120Hz display was available.
 - **This measures redraw, not scrolling.** Continuous full redraw is strictly
   more work per frame than scrolling a `uniform_list`, so it is a reasonable
   floor — but nobody has driven a scroll gesture under instrumentation.
+
+Three per-frame costs that scaled with the size of the cluster were removed
+after those numbers were taken, and all three were invisible in them because the
+measurement above ran with no log pane open and one pane: the log buffer was
+copied whole (100,000 `Arc` clones and an 800KB allocation) every frame, the
+toolbar walked every row to render a namespace count, and sorting by a column
+allocated two lowercased strings per comparison. They would have shown up on a
+busier screen than the one that was measured.
 
 ## Testing
 
@@ -388,9 +403,13 @@ a timeout rather than hanging, but they are wall-clock sensitive and could be
 flaky on a heavily loaded machine.
 
 The `kind`-based suite lives in `tests/e2e` and is `#[ignore]`d, because it needs
-a real cluster. It is not run by `cargo test` and has never run in CI; every
-end-to-end result quoted here was produced locally with
-`cargo test -p periscope-e2e -- --ignored --test-threads 1`.
+a real cluster, so `cargo test` does not run it. CI does: a `kind` job creates a
+cluster, seeds 10,000 pods, installs cert-manager, Argo CD and our own `widgets`
+CRD, and runs the suite with `PERISCOPE_E2E_REQUIRE_FIXTURES=1` so that a
+missing fixture fails the build instead of silently skipping fifteen tests. The
+timing figures quoted here were produced locally with
+`cargo test -p periscope-e2e -- --ignored --test-threads 1`; a two-core runner
+is not a machine to quote latencies from.
 
 ## The five-cluster measurement is five contexts, one apiserver
 
