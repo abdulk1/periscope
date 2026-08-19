@@ -191,6 +191,10 @@ log-buffer = 100000         # lines a log or command buffer keeps
 pods = ["READY", "STATUS", "NODE"]
 "deployments.apps" = ["READY", "UP-TO-DATE"]
 
+[updates]
+check = false               # the only non-cluster network call, off unless asked for
+endpoint = "https://api.github.com/repos/abdul/periscope/releases/latest"
+
 [keys]
 palette = ["cmd-k", "ctrl-k", ":"]
 dismiss = ["escape", "q"]
@@ -243,7 +247,13 @@ with the command line as its detail.
 ## Security posture
 
 No credentials are ever written to disk. No telemetry, no phone-home, no crash
-reporting. The only network calls are to the clusters you configure.
+reporting. The only network calls are to the clusters you configure — plus, if
+you switch it on, one request to the update endpoint at startup.
+
+That check is off by default. When enabled it makes a single HTTPS GET, sends
+nothing but a `periscope/<version>` User-Agent, downloads nothing, installs
+nothing, and shows one line with a link if there is something newer. The
+endpoint must be `https`, and a redirect off it is refused.
 
 Secrets are masked: the table shows how many keys a Secret has and never a
 value, and its YAML shows `<hidden, N bytes>` until you press **Reveal values**,

@@ -2,6 +2,7 @@
 //! window, and connect the two through the bridge.
 
 mod cli;
+mod update;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -74,6 +75,18 @@ fn main() -> Result<()> {
         .context("could not start the cluster runtime")?;
     let commands = runtime.commands();
 
+    // The one network call that is not to a cluster, and only when asked for.
+    // It runs on the cluster runtime because `reqwest` needs a tokio reactor,
+    // and it answers through a channel the window awaits below.
+    if let Some(problem) = settings.updates.problem() {
+        tracing::warn!(%problem, "the update check is switched on but will not run");
+    }
+    let update = update::start(
+        runtime.handle(),
+        &settings.updates,
+        periscope_config::Version::current(),
+    );
+
     let perf = cli.perf;
     // `--tail app=web -n prod` opens the log view on the pods it names as soon
     // as the cluster connects.
@@ -137,6 +150,26 @@ fn main() -> Result<()> {
                     .borrow_mut()
                     .take()
                     .context("the window closed before it finished opening")?;
+
+                // A newer version, if the check found one and the user asked
+                // for it. Never a download and never a prompt: one line in the
+                // place every other notice appears.
+                if let Some(update) = update {
+                    let workspace = workspace.clone();
+                    cx.spawn(async move |cx| {
+                        let Ok(release) = update.await else {
+                            return;
+                        };
+                        let _ = cx.update(|cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .report(release.notice(periscope_config::Version::current()));
+                                cx.notify();
+                            });
+                        });
+                    })
+                    .detach();
+                }
 
                 cx.update(|cx| {
                     let pump = spawn_event_pump(

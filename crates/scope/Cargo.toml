@@ -51,6 +51,7 @@ assets = [
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
 clap.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
@@ -60,6 +61,8 @@ periscope-cluster.workspace = true
 periscope-config.workspace = true
 periscope-store.workspace = true
 periscope-ui.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [lints]

@@ -369,6 +369,8 @@ pub struct Settings {
     pub keys: Keys,
     /// Which columns each kind shows.
     pub columns: Columns,
+    /// Whether to look for a newer Periscope.
+    pub updates: crate::updates::Updates,
 }
 
 /// Why settings could not be read.

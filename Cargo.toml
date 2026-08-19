@@ -68,6 +68,14 @@ clap = { version = "4.6", features = ["derive"] }
 directories = "6.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The HTTP client for the opt-in update check, and only for that. This is the
+# fork GPUI already pulls in: depending on upstream `reqwest` instead would put
+# a second HTTP stack, hyper and TLS chain into the tree for one GET a session.
+reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features = false, features = [
+    "charset",
+    "http2",
+    "rustls-tls-native-roots",
+] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

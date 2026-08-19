@@ -5962,6 +5962,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
@@ -5970,7 +5971,9 @@ dependencies = [
  "periscope-config",
  "periscope-store",
  "periscope-ui",
+ "tokio",
  "tracing",
+ "zed-reqwest",
 ]
 
 [[package]]
