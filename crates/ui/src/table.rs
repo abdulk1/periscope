@@ -18,6 +18,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme as _, h_flex, v_flex};
 use periscope_bridge::{ColumnSpec, ResourceKey, ResourceRow, RowState};
+use periscope_store::app::{Sort, SortKey};
 
 use crate::format;
 use crate::workspace::Workspace;
@@ -57,7 +58,18 @@ fn cell(width: Option<f32>) -> gpui::Div {
 /// Columns arrive paired with their position in the kind's full set, because
 /// the user may have chosen a subset and cells are still indexed by the
 /// original position.
-pub fn header(columns: &[(usize, ColumnSpec)], namespaced: bool, cx: &App) -> impl IntoElement {
+///
+/// Every heading is a button: clicking one sorts by it, clicking again reverses,
+/// and a third click puts the natural order back. The one being sorted by wears
+/// an arrow.
+pub fn header(
+    workspace: Entity<Workspace>,
+    pane: usize,
+    columns: &[(usize, ColumnSpec)],
+    namespaced: bool,
+    sort: Sort,
+    cx: &App,
+) -> impl IntoElement {
     let mut row = h_flex()
         .w_full()
         .h(px(ROW_HEIGHT))
@@ -72,17 +84,65 @@ pub fn header(columns: &[(usize, ColumnSpec)], namespaced: bool, cx: &App) -> im
     // Matches the marker stripe on every row, so the columns line up.
     row = row.child(div().w(px(2.)).flex_none());
 
+    /// One clickable heading.
+    fn heading(
+        workspace: &Entity<Workspace>,
+        pane: usize,
+        label: String,
+        key: SortKey,
+        width: Option<f32>,
+        sort: Sort,
+    ) -> gpui::Stateful<gpui::Div> {
+        let workspace = workspace.clone();
+        let marker = sort.marker(key).unwrap_or_default();
+
+        cell(width)
+            .id(SharedString::from(format!("heading-{pane}-{label}")))
+            .cursor_pointer()
+            .on_click(move |_, _, cx| {
+                workspace.update(cx, |workspace, cx| workspace.sort_by(pane, key, cx));
+            })
+            .child(format!("{label}{marker}"))
+    }
+
     if namespaced {
-        row = row.child(cell(Some(NAMESPACE_WIDTH)).child("NAMESPACE"));
+        row = row.child(heading(
+            &workspace,
+            pane,
+            "NAMESPACE".to_owned(),
+            SortKey::Namespace,
+            Some(NAMESPACE_WIDTH),
+            sort,
+        ));
     }
-    row = row.child(cell(None).child("NAME"));
+    row = row.child(heading(
+        &workspace,
+        pane,
+        "NAME".to_owned(),
+        SortKey::Name,
+        None,
+        sort,
+    ));
 
-    for (_, column) in columns {
-        row =
-            row.child(cell(column.width.map(|width| width as f32)).child(column.name.to_string()));
+    for (index, column) in columns {
+        row = row.child(heading(
+            &workspace,
+            pane,
+            column.name.to_string(),
+            SortKey::Cell(*index),
+            column.width.map(|width| width as f32),
+            sort,
+        ));
     }
 
-    row.child(cell(Some(AGE_WIDTH)).child("AGE"))
+    row.child(heading(
+        &workspace,
+        pane,
+        "AGE".to_owned(),
+        SortKey::Age,
+        Some(AGE_WIDTH),
+        sort,
+    ))
 }
 
 /// One rendered row.

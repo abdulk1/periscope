@@ -130,6 +130,10 @@ cert-manager's `certificates` sit under `CERT-MANAGER.IO`. Only workloads is
 open at first; a section opens by itself when it holds whatever you have
 selected, and the filter box above them narrows across all of them at once.
 
+Click a column heading to sort by it, again to reverse, and a third time to put
+the natural order back — numbers sort as numbers, so RESTARTS does not put 10
+before 2.
+
 Moving through a table is `j`/`k` or the arrows, `g`/`G` for the ends, and
 `enter` to open what you are on. The **All namespaces** button beside the
 namespace field lists the namespaces the loaded rows are in, so narrowing to one

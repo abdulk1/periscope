@@ -1517,6 +1517,19 @@ impl Workspace {
         self.apply_server_filters(cx);
     }
 
+    /// Sorts a pane by one of its columns.
+    pub fn sort_by(
+        &mut self,
+        pane: usize,
+        key: periscope_store::app::SortKey,
+        cx: &mut Context<Self>,
+    ) {
+        // Clicking a heading also focuses its pane, as clicking a row does.
+        self.focus_pane(pane, cx);
+        self.state.sort_by(key);
+        cx.notify();
+    }
+
     /// Puts the cursor on a row, without opening it.
     pub fn set_cursor(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.state.set_cursor(index) {
@@ -2212,7 +2225,14 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, _, cx| this.focus_pane(index, cx)))
             .children(header)
             .children((index == self.state.focus()).then(|| self.toolbar(cx)))
-            .child(table::header(&columns, namespaced, cx))
+            .child(table::header(
+                cx.entity(),
+                index,
+                &columns,
+                namespaced,
+                pane.sort(),
+                cx,
+            ))
             .child(body)
     }
 
@@ -3877,6 +3897,58 @@ mod tests {
                 kind("cert-manager.io", "certificates", true),
             ]),
         }
+    }
+
+    #[gpui::test]
+    fn clicking_a_column_sorts_the_pane_it_was_clicked_in(cx: &mut TestAppContext) {
+        use periscope_store::app::SortKey;
+
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod", "staging"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![reset("prod", pods(), &["c-api", "a-api", "b-api"])],
+        );
+        drain(&rx);
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.sort_by(0, SortKey::Name, cx);
+        });
+
+        harness.read(cx, |workspace| {
+            let names: Vec<String> = workspace
+                .state()
+                .rows()
+                .iter()
+                .map(|row| row.key.name.to_string())
+                .collect();
+            // Rows already arrive sorted by name, so clicking NAME reverses
+            // rather than doing nothing — which is what every table does.
+            assert_eq!(names, ["c-api", "b-api", "a-api"]);
+            assert!(workspace.state().sort().descending);
+        });
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.sort_by(0, SortKey::Name, cx);
+        });
+        harness.read(cx, |workspace| {
+            let names: Vec<String> = workspace
+                .state()
+                .rows()
+                .iter()
+                .map(|row| row.key.name.to_string())
+                .collect();
+            assert_eq!(names, ["a-api", "b-api", "c-api"]);
+            assert_eq!(
+                workspace.state().sort(),
+                periscope_store::app::Sort::default()
+            );
+        });
     }
 
     #[gpui::test]

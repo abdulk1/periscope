@@ -143,6 +143,109 @@ impl Filters {
     }
 }
 
+/// What a table is sorted by.
+///
+/// The structural columns are named rather than indexed because they are not
+/// cells: a row's namespace, name and age come from its key and its creation
+/// time, and only the kind-specific columns are cells.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortKey {
+    /// Namespace, then name.
+    Namespace,
+    /// Name. The order rows arrive in, and the one to return to.
+    #[default]
+    Name,
+    /// Age, youngest or oldest first.
+    Age,
+    /// One of the kind's own columns.
+    Cell(usize),
+}
+
+/// How a table is sorted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sort {
+    /// What it is sorted by.
+    pub key: SortKey,
+    /// Whether the order is reversed.
+    pub descending: bool,
+}
+
+impl Sort {
+    /// The order a click on a column produces.
+    ///
+    /// A new column starts ascending; the same column reverses; a third click
+    /// puts it back to name order, so there is always a way out of a sort
+    /// rather than only ever a different one.
+    pub fn clicked(self, key: SortKey) -> Self {
+        match (self.key == key, self.descending) {
+            (false, _) => Self {
+                key,
+                descending: false,
+            },
+            (true, false) => Self {
+                key,
+                descending: true,
+            },
+            (true, true) => Self::default(),
+        }
+    }
+
+    /// The arrow a column header shows, if it is the one being sorted by.
+    pub fn marker(self, key: SortKey) -> Option<&'static str> {
+        (self.key == key).then_some(if self.descending { "▾" } else { "▴" })
+    }
+}
+
+/// Compares two cells, numerically when both are numbers.
+///
+/// Sorting `RESTARTS` as text puts 10 before 2, which is the kind of wrong that
+/// makes people stop trusting the column.
+fn compare_cells(left: &str, right: &str) -> std::cmp::Ordering {
+    match (left.parse::<f64>(), right.parse::<f64>()) {
+        (Ok(left), Ok(right)) => left.total_cmp(&right),
+        _ => left.to_lowercase().cmp(&right.to_lowercase()),
+    }
+}
+
+/// Sorts rows in place.
+///
+/// Rows arrive sorted by namespace and name — that is how the table holds them
+/// — so the name order is the natural one and needs no work. Every other order
+/// falls back to the name when the keys are equal, which keeps rows from
+/// jumping around each other as a watch stream updates them.
+fn sort_rows(rows: &mut [Arc<ResourceRow>], sort: Sort) {
+    match sort.key {
+        SortKey::Name if !sort.descending => return,
+        SortKey::Name => rows.reverse(),
+        SortKey::Namespace => rows.sort_by(|left, right| {
+            left.key
+                .namespace
+                .cmp(&right.key.namespace)
+                .then_with(|| left.key.name.cmp(&right.key.name))
+        }),
+        SortKey::Age => rows.sort_by(|left, right| {
+            // Missing creation times sort last whichever way the column goes:
+            // an unknown age is not older or younger, it is unknown.
+            match (left.created, right.created) {
+                (Some(left_at), Some(right_at)) => left_at
+                    .cmp(&right_at)
+                    .then_with(|| left.key.name.cmp(&right.key.name)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => left.key.name.cmp(&right.key.name),
+            }
+        }),
+        SortKey::Cell(column) => rows.sort_by(|left, right| {
+            compare_cells(left.cell(column), right.cell(column))
+                .then_with(|| left.key.name.cmp(&right.key.name))
+        }),
+    }
+
+    if sort.descending && !matches!(sort.key, SortKey::Name) {
+        rows.reverse();
+    }
+}
+
 /// One view onto one cluster.
 ///
 /// Two of these side by side is what "view two clusters at once" means; the
@@ -166,6 +269,8 @@ pub struct Pane {
     /// whenever the rows change, so a row vanishing under the cursor moves it
     /// rather than leaving it pointing past the end.
     cursor: usize,
+    /// What this pane's table is sorted by.
+    sort: Sort,
 }
 
 impl Pane {
@@ -187,6 +292,11 @@ impl Pane {
     /// Which row the keyboard is on.
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// What its table is sorted by.
+    pub fn sort(&self) -> Sort {
+        self.sort
     }
 
     /// The row the keyboard is on, if there is one.
@@ -1187,6 +1297,21 @@ impl AppState {
             .collect()
     }
 
+    /// What the focused pane is sorted by.
+    pub fn sort(&self) -> Sort {
+        self.panes[self.focus].sort
+    }
+
+    /// Sorts the focused pane by a column, cycling through the orders.
+    pub fn sort_by(&mut self, key: SortKey) {
+        self.panes[self.focus].sort = self.panes[self.focus].sort.clicked(key);
+        // A sort is a different order, not a different row: the cursor goes
+        // back to the top rather than staying on an index that now means
+        // something else.
+        self.panes[self.focus].cursor = 0;
+        self.refresh_pane(self.focus);
+    }
+
     fn refresh_pane(&mut self, index: usize) {
         let Some((_, table)) = self.pane_table(index) else {
             if let Some(pane) = self.panes.get_mut(index) {
@@ -1212,6 +1337,10 @@ impl AppState {
             .filter(|row| filters.matches(row))
             .cloned()
             .collect();
+
+        let mut rows = rows;
+        let sort = self.panes[index].sort;
+        sort_rows(&mut rows, sort);
 
         let pane = &mut self.panes[index];
         pane.columns = columns;
@@ -1943,6 +2072,147 @@ mod tests {
         assert_eq!(configured.row_budget, DEFAULT_ROW_BUDGET);
         assert_eq!(configured.idle_timeout.get(), DEFAULT_IDLE_TIMEOUT);
         assert_eq!(configured.log_buffer, crate::logs::DEFAULT_CAPACITY);
+    }
+
+    /// A row carrying a cell value and an age.
+    fn row_with(name: &str, cell: &str, created: Option<std::time::SystemTime>) -> ResourceRow {
+        ResourceRow {
+            key: ResourceKey::new("default", name),
+            uid: None,
+            cells: Arc::from([Arc::from(cell)]),
+            state: RowState::Healthy,
+            created,
+        }
+    }
+
+    fn names(state: &AppState) -> Vec<String> {
+        state
+            .rows()
+            .iter()
+            .map(|row| row.key.name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_column_sorts_numerically_when_it_holds_numbers() {
+        // Sorting RESTARTS as text puts 10 before 2, which is the kind of wrong
+        // that makes people stop trusting a column.
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[
+                    row_with("a", "2", None),
+                    row_with("b", "10", None),
+                    row_with("c", "1", None),
+                ],
+            )],
+            Instant::now(),
+        );
+
+        state.sort_by(SortKey::Cell(0));
+        assert_eq!(names(&state), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn clicking_a_column_cycles_ascending_descending_and_back() {
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[
+                    row_with("a", "2", None),
+                    row_with("b", "10", None),
+                    row_with("c", "1", None),
+                ],
+            )],
+            Instant::now(),
+        );
+
+        state.sort_by(SortKey::Cell(0));
+        assert_eq!(names(&state), ["c", "a", "b"]);
+
+        state.sort_by(SortKey::Cell(0));
+        assert!(state.sort().descending);
+        assert_eq!(names(&state), ["b", "a", "c"]);
+
+        // A third click is the way out, back to the order rows arrive in.
+        state.sort_by(SortKey::Cell(0));
+        assert_eq!(state.sort(), Sort::default());
+        assert_eq!(names(&state), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn sorting_by_age_puts_unknown_ages_last_either_way() {
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let new = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9_000);
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[
+                    row_with("young", "0", Some(new)),
+                    row_with("unknown", "0", None),
+                    row_with("old", "0", Some(old)),
+                ],
+            )],
+            Instant::now(),
+        );
+
+        state.sort_by(SortKey::Age);
+        assert_eq!(names(&state), ["old", "young", "unknown"]);
+
+        state.sort_by(SortKey::Age);
+        // Reversed among the known ones; the unknown is still not claiming to
+        // be the oldest or the youngest.
+        assert_eq!(names(&state), ["unknown", "young", "old"]);
+    }
+
+    #[test]
+    fn a_sort_survives_new_rows_arriving() {
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[row_with("a", "2", None), row_with("b", "1", None)],
+            )],
+            Instant::now(),
+        );
+        state.sort_by(SortKey::Cell(0));
+        assert_eq!(names(&state), ["b", "a"]);
+
+        state.apply_batch(
+            &[ClusterEvent::ResourceApplied {
+                cluster: "prod".into(),
+                kind: pods(),
+                row: Arc::new(row_with("c", "0", None)),
+            }],
+            Instant::now(),
+        );
+
+        assert_eq!(names(&state), ["c", "b", "a"]);
+    }
+
+    #[test]
+    fn sorting_puts_the_cursor_back_at_the_top() {
+        // The row under it means something different once the order changes.
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[row_with("a", "2", None), row_with("b", "1", None)],
+            )],
+            Instant::now(),
+        );
+        state.cursor_to_end();
+
+        state.sort_by(SortKey::Cell(0));
+        assert_eq!(state.cursor(), 0);
     }
 
     #[test]
