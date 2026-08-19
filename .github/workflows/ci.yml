@@ -230,3 +230,23 @@ jobs:
             target/debian/*.deb
             target/generate-rpm/*.rpm
           if-no-files-found: error
+
+  windows:
+    name: windows (not a launch blocker)
+    runs-on: windows-latest
+    # `IMPLEMENTATION.md` Phase 6 asks for a Windows build and basic
+    # verification while saying explicitly that it must not gate a release. So
+    # this runs and reports, and a failure does not turn the run red. It has
+    # never been run anywhere before now: whether GPUI and the TLS stack build
+    # on Windows is a question this job exists to answer, not one it assumes.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bin scope
+
+      - name: Test the layers that do not need a window
+        run: cargo test -p periscope-store -p periscope-config -p periscope-bridge
