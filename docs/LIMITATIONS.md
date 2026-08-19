@@ -197,23 +197,63 @@ Filtering (substring or regex, case toggle) applies without restarting the
 stream. Follow/pause, copy, export, previous-container and init/sidecar
 container selection are all there.
 
-What is **not** there:
+Three gaps listed here through Phase 6 are now closed, each with a cost worth
+knowing:
+
+- **Jump to timestamp.** The toolbar has a time field. It accepts `14:32`,
+  `14:32:10`, `-5m` (`s`/`m`/`h`/`d`), and an RFC3339 stamp — with a `+01:00`
+  offset, or a space in place of the `T`, because that is how log files write
+  it. Enter, or the Jump button, scrolls to the first line at or after that
+  time, pauses following, and says which line it landed on; a time nothing has
+  reached yet says so rather than moving. Parsing is
+  `periscope_store::parse_time`, with its own tests.
+
+  **Everything in that field is UTC**, including the bare `14:32`, and so is
+  the timestamp column beside it. There is no local-time display anywhere in
+  Periscope. `14:32` also always means today's `14:32` in UTC: it is never
+  rolled back a day, so shortly after midnight UTC a wall-clock time from
+  "earlier this evening" is in the future and reports that nothing is at or
+  after it. Type `-2h` instead.
+- **Wrapping.** A Wrap toggle. Wrapping and virtualisation cannot both be had:
+  `uniform_list` requires every row to be exactly one line tall, so the wrapped
+  body is an ordinary scrolling column in which every line on screen is an
+  element that exists. It is therefore capped at 500 lines
+  (`logview::WRAP_LIMIT`), showing the newest 500 by default and 500 from the
+  jump point after a jump, and it says on screen which slice of the buffer that
+  is. Reaching the rest means filtering or jumping, not scrolling: **wrapped
+  mode cannot scroll through a 100,000-line buffer, and that is deliberate** —
+  building 100,000 elements a frame would take seconds each.
+
+  Measured with `--perf` against `chatty`, wrap on and a full window of wrapped
+  rows: 60.0fps sustained, 0 hitches, element build p50 ~900µs against ~200µs
+  for the virtualised table. About 5% of a 60Hz frame, paid only while wrap is
+  on.
+- **Sorting by timestamp.** A By time / By arrival toggle. Arrival order is
+  still the default and still what `kubectl logs` shows — each pod's backlog as
+  a block, then the live streams interleaved. **Lines the apiserver gave no
+  timestamp for are listed last, in arrival order**, and the pane says how many
+  those are whenever there are any; a container writing a partial line is the
+  usual cause. Sorting is a second index over the arrival order, rebuilt once
+  per batch rather than once per line, and it costs a near-sorted sort of the
+  visible set on every batch while it is on.
+
+The order and the wrap window follow the filter and the export: exported text
+is what is on screen, in the order it is on screen.
+
+What is still **not** there:
 
 - **Multi-cluster.** One cluster is watched at a time, and a tail belongs to the
   cluster it was opened on (Phase 4).
 - **Mutations.** Still read-only until Phase 5: no delete, scale, edit, exec or
   port-forward.
-- **Jump to timestamp.** `LogBuffer::seek` finds the first line at or after a
-  time and is tested, but nothing in the UI calls it yet — there is no
-  time-input control. Follow/pause and scrolling are wired; jumping is not.
 - **Selecting text with the mouse.** "Copy" copies the visible (filtered)
   buffer; there is no drag-select over lines. GPUI gives no text selection over
   a virtualised list, and building one was out of proportion to the phase.
-- **Wrapping.** Long lines are clipped, not wrapped. A wrapped line would break
-  the fixed row height virtualisation depends on.
-- **Sorting by timestamp.** Lines appear in the order they were read. With
-  history (`--tail`-style backlog) each pod's backlog arrives as a block before
-  the live streams interleave, exactly as `kubectl logs` behaves.
+- **Wrapped mode has no key binding, and neither does the jump field.** The new
+  controls are buttons and a text field in the log toolbar, like the regex,
+  case, previous, copy and export controls beside them. Only tailing (`l`,
+  `cmd-l`) and follow (`cmd-shift-f`) are bound, and the toolbar now wraps onto
+  a second row rather than pushing buttons off a narrow window.
 - **A log search across pods that are not running.** Only live pods are
   attached; `previous` reads one container's last run, not the whole history.
 
@@ -367,7 +407,16 @@ Doing better needs an EKS or GKE cluster, which costs money to run — see
   text — but only as the strip of the window that was not covered by another
   application. The window could not be raised reliably in this environment, so
   the toolbar, the source legend and the filter box have not been looked at,
-  only tested.
+  only tested. That now includes the time field and the Jump, Wrap and By time
+  buttons: none of them has been *clicked*.
+
+  The wrapped body was run for real — the app was built with wrap and timestamp
+  order forced on, pointed at `chatty`, and held 60fps with no panic — and the
+  wrapping itself is asserted rather than assumed: a `#[gpui::test]` paints a
+  frame and reads the painted row heights back out of the scroll handle, so a
+  long line being *taller* than a short one is a test, not a screenshot. That
+  test fails if the `overflow_hidden` on the text column is removed, which is
+  the whole mechanism. What no one has seen is what it looks like.
 - **A visible frame drop when opening a large object.** The 17ms figure above is
   fetch-to-YAML, not frame timing: the frame the YAML lands in was not measured.
 - **Light theme.** The theme toggle is wired and unit-covered; only the dark

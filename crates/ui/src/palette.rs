@@ -419,11 +419,21 @@ mod tests {
         let found = palette.search("wk9");
         let elapsed = started.elapsed();
 
+        // The budget is about the shipped binary, as it is for the log filter
+        // in `periscope_store::logs`, and this test never got the same
+        // allowance: it measured 125ms and failed roughly one run in five when
+        // `cargo test` ran the rest of the suite alongside it on the same
+        // cores. An unoptimised, contended build is not what the budget is
+        // claiming, and a test that fails at random is one people learn to
+        // re-run rather than read.
+        let budget = if cfg!(debug_assertions) {
+            std::time::Duration::from_millis(500)
+        } else {
+            std::time::Duration::from_millis(50)
+        };
+
         assert!(!found.is_empty());
-        assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "searching 10k objects took {elapsed:?}"
-        );
+        assert!(elapsed < budget, "searching 10k objects took {elapsed:?}");
     }
 
     #[test]

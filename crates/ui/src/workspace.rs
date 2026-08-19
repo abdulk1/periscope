@@ -357,9 +357,20 @@ pub struct Workspace {
     log_filter_input: Entity<InputState>,
     log_selector_input: Entity<InputState>,
     log_container_input: Entity<InputState>,
+    /// The time to jump to, as typed. See [`periscope_store::parse_time`].
+    log_time_input: Entity<InputState>,
+    /// Whether long lines wrap. Off by default: wrapping costs virtualisation,
+    /// so the view can only show a window of the buffer while it is on.
+    log_wrap: bool,
+    /// Where a jump left the view, as an index into the visible lines. This is
+    /// what moves the wrapped window; `None` means "the newest lines".
+    log_anchor: Option<usize>,
     /// One per pane, so moving the cursor can bring its row into view.
     table_scroll: [gpui::UniformListScrollHandle; 2],
     log_scroll: gpui::UniformListScrollHandle,
+    /// The wrapped body is an ordinary scrolling column, not a `uniform_list`,
+    /// so it needs a scroll handle of the other kind.
+    log_wrap_scroll: gpui::ScrollHandle,
     /// The command output's scroll position, kept apart from the log view's so
     /// the two panes do not fight over it.
     exec_scroll: gpui::UniformListScrollHandle,
@@ -472,6 +483,7 @@ impl Workspace {
         let log_selector_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("label selector (all pods)"));
         let log_container_input = cx.new(|cx| InputState::new(window, cx).placeholder("container"));
+        let log_time_input = cx.new(|cx| InputState::new(window, cx).placeholder("14:32 or -5m"));
         let yaml_view = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -526,6 +538,13 @@ impl Workspace {
                     this.retarget_logs(cx);
                 }
             }),
+            // A jump is a deliberate act, and half a typed time is a different
+            // time, so it happens on Enter and never as it is typed.
+            cx.subscribe(&log_time_input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.jump_to_time(cx);
+                }
+            }),
             cx.subscribe(&palette_input, |this, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     let query = input.read(cx).value().to_string();
@@ -561,11 +580,15 @@ impl Workspace {
             log_filter_input,
             log_selector_input,
             log_container_input,
+            log_time_input,
+            log_wrap: false,
+            log_anchor: None,
             table_scroll: [
                 gpui::UniformListScrollHandle::new(),
                 gpui::UniformListScrollHandle::new(),
             ],
             log_scroll: gpui::UniformListScrollHandle::new(),
+            log_wrap_scroll: gpui::ScrollHandle::new(),
             exec_scroll: gpui::UniformListScrollHandle::new(),
             log_visible: 0,
             exec_visible: 0,
@@ -1119,6 +1142,7 @@ impl Workspace {
         };
 
         self.log_notice = None;
+        self.log_anchor = None;
         self.log_selector_input.update(cx, |input, cx| {
             let value = match &target.selector {
                 periscope_bridge::LogSelector::Labels(selector) => selector.to_string(),
@@ -1201,6 +1225,7 @@ impl Workspace {
         };
 
         let target = Arc::new(target.container(container).previous(previous));
+        self.log_anchor = None;
         self.state
             .open_logs(cluster.clone(), Arc::clone(&target), self.log_capacity);
         self.send(ClusterCommand::StartLogs { cluster, target });
@@ -1230,6 +1255,7 @@ impl Workspace {
         }
         self.state.close_logs();
         self.log_notice = None;
+        self.log_anchor = None;
         cx.notify();
     }
 
@@ -1244,6 +1270,9 @@ impl Workspace {
             case_sensitive: session.buffer.filter().case_sensitive,
         };
         if self.state.set_log_filter(spec) {
+            // A narrower filter renumbers every line, so the index a jump left
+            // behind no longer names the line it landed on.
+            self.log_anchor = None;
             cx.notify();
         }
     }
@@ -1266,6 +1295,7 @@ impl Workspace {
             }
         };
         if self.state.set_log_filter(spec) {
+            self.log_anchor = None;
             cx.notify();
         }
     }
@@ -1277,7 +1307,81 @@ impl Workspace {
             .map(|session| !session.following)
             .unwrap_or(true);
         self.state.set_following(following);
+        // Following means "show me the newest line", which is the opposite of
+        // sitting where a jump put the view.
+        if following {
+            self.log_anchor = None;
+        }
         cx.notify();
+    }
+
+    /// Scrolls the view to the first line at or after the time in the field.
+    ///
+    /// Jumping stops the view following: sticking to the newest line would
+    /// scroll away from what was just asked for on the next batch.
+    fn jump_to_time(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.state.logs() else {
+            return;
+        };
+
+        let typed = self.log_time_input.read(cx).value().to_string();
+        let at = match periscope_store::parse_time(&typed, SystemTime::now()) {
+            Ok(at) => at,
+            Err(error) => {
+                self.log_notice = Some(SharedString::from(error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+
+        let found = session.buffer.seek(at);
+        let held = session.buffer.visible_len();
+
+        match found {
+            Some(index) => {
+                self.state.set_following(false);
+                self.log_anchor = Some(index);
+                self.log_scroll
+                    .scroll_to_item(index, gpui::ScrollStrategy::Top);
+                // The wrapped body rebuilds around the anchor, so the line is
+                // the first one in it; the leftover offset is not.
+                self.log_wrap_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                self.log_notice = Some(SharedString::from(format!(
+                    "Jumped to {} — line {} of {held}",
+                    logview::format_time(at),
+                    index + 1,
+                )));
+            }
+            // Distinguishing "nothing that late" from "nothing at all" is the
+            // difference between a filter to widen and a wait to do.
+            None => {
+                self.log_notice = Some(SharedString::from(format!(
+                    "No line at or after {} in the {held} lines held",
+                    logview::format_time(at),
+                )));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Wraps long lines, or clips them again.
+    fn toggle_wrap(&mut self, cx: &mut Context<Self>) {
+        self.log_wrap = !self.log_wrap;
+        cx.notify();
+    }
+
+    /// Orders the lines by timestamp, or puts them back in arrival order.
+    fn toggle_order(&mut self, cx: &mut Context<Self>) {
+        let order = match self.state.logs().map(|session| session.buffer.order()) {
+            Some(periscope_store::LogOrder::Timestamp) => periscope_store::LogOrder::Arrival,
+            _ => periscope_store::LogOrder::Timestamp,
+        };
+        if self.state.set_log_order(order) {
+            // Every index the view was holding meant a different line a moment
+            // ago, the jump anchor included.
+            self.log_anchor = None;
+            cx.notify();
+        }
     }
 
     /// Copies the visible lines to the clipboard.
@@ -2271,6 +2375,8 @@ impl Workspace {
         };
         let dropped = (buffer.dropped() > 0).then(|| format!("· {} dropped", buffer.dropped()));
         let streaming = format!("· {} streaming", buffer.streaming());
+        let sorted = buffer.order() == periscope_store::LogOrder::Timestamp;
+        let window = logview::wrap_window(buffer.visible_len(), self.log_anchor);
 
         let toolbar = h_flex()
             .w_full()
@@ -2279,6 +2385,9 @@ impl Workspace {
             .gap_2()
             .px_3()
             .py_2()
+            // There are more controls here than fit a narrow window, and a
+            // button that has fallen off the right edge might as well not exist.
+            .flex_wrap()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
@@ -2335,6 +2444,32 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_previous(cx))),
             )
             .child(
+                div()
+                    .w(px(120.))
+                    .child(Input::new(&self.log_time_input).small()),
+            )
+            .child(
+                Button::new("jump")
+                    .outline()
+                    .small()
+                    .label("Jump")
+                    .on_click(cx.listener(|this, _, _, cx| this.jump_to_time(cx))),
+            )
+            .child(
+                Button::new("wrap")
+                    .outline()
+                    .small()
+                    .label(if self.log_wrap { "Wrap on" } else { "Wrap off" })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_wrap(cx))),
+            )
+            .child(
+                Button::new("order")
+                    .outline()
+                    .small()
+                    .label(if sorted { "By time" } else { "By arrival" })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_order(cx))),
+            )
+            .child(
                 Button::new("copy-logs")
                     .outline()
                     .small()
@@ -2357,7 +2492,11 @@ impl Workspace {
             );
 
         // Anything the session wants to say — a failure, a bad pattern, where
-        // an export went — goes on one line rather than into a dialog.
+        // an export went — goes on one line rather than into a dialog. A
+        // failure replaces the rest of it, because a session that is broken has
+        // nothing else worth reading; the standing notes about the two modes
+        // that change what is on screen share the line with each other and with
+        // whatever the last action said.
         let notice = buffer
             .error()
             .map(|reason| (reason.to_owned(), true))
@@ -2367,12 +2506,32 @@ impl Workspace {
                     .map(|reason| (format!("filter: {reason}"), true))
             })
             .or_else(|| {
-                self.log_notice
-                    .as_ref()
-                    .map(|notice| (notice.to_string(), false))
+                let mut notes: Vec<String> = Vec::new();
+                if let Some(said) = &self.log_notice {
+                    notes.push(said.to_string());
+                }
+                // Where the lines with no timestamp went is not something
+                // anyone should have to guess at, or read the docs for.
+                if sorted && buffer.untimestamped() > 0 {
+                    notes.push(format!(
+                        "No timestamp on {} of these lines; they are listed last, in arrival order.",
+                        buffer.untimestamped()
+                    ));
+                }
+                // Wrapping is the one mode that cannot show the whole buffer,
+                // so it says which part of it is on screen while it is on.
+                if self.log_wrap && window.len() < buffer.visible_len() {
+                    notes.push(format!(
+                        "Wrapped: showing lines {}–{} of {}. Filter or jump to reach the rest.",
+                        window.start + 1,
+                        window.end,
+                        buffer.visible_len()
+                    ));
+                }
+                (!notes.is_empty()).then(|| (notes.join(" · "), false))
             });
 
-        let lines = Arc::<[Arc<periscope_bridge::LogLine>]>::from(buffer.visible_lines());
+        let lines = buffer.visible_lines();
         let body = if lines.is_empty() {
             let message = if !buffer.is_empty() {
                 "Nothing matches the current filter.".to_owned()
@@ -2382,7 +2541,11 @@ impl Workspace {
                 "Attaching…".to_owned()
             };
             logview::placeholder(message, cx).into_any_element()
+        } else if self.log_wrap {
+            logview::wrapped(&lines[window], show_source, &self.log_wrap_scroll, cx)
+                .into_any_element()
         } else {
+            let lines = Arc::<[Arc<periscope_bridge::LogLine>]>::from(lines);
             logview::body(lines, show_source, self.log_scroll.clone()).into_any_element()
         };
 
@@ -3365,6 +3528,9 @@ impl Render for Workspace {
             if session.following && visible > 0 && visible != self.log_visible {
                 self.log_scroll
                     .scroll_to_item(visible - 1, gpui::ScrollStrategy::Top);
+                // The wrapped body is rebuilt around the newest lines while it
+                // is following, so the bottom of it is the newest line.
+                self.log_wrap_scroll.scroll_to_bottom();
             }
             self.log_visible = visible;
         } else if self.log_visible != 0 {
@@ -3579,6 +3745,14 @@ mod tests {
         fn keys(&self, cx: &mut TestAppContext, keystrokes: &str) {
             let mut window = gpui::VisualTestContext::from_window(self.window.into(), cx);
             window.simulate_keystrokes(keystrokes);
+        }
+
+        /// Paints a frame, which is what fills in the element bounds a layout
+        /// assertion reads back.
+        fn draw(&self, cx: &mut TestAppContext) {
+            let mut window = gpui::VisualTestContext::from_window(self.window.into(), cx);
+            window.refresh().expect("the window is open");
+            window.run_until_parked();
         }
     }
 
@@ -5105,6 +5279,253 @@ mod tests {
             }
             other => panic!("expected a restarted session, got {other:?}"),
         }
+    }
+
+    /// Opens a tail on `api-0` and feeds it lines with the given ages, in
+    /// seconds before now, in the order they are listed.
+    fn tail_with_ages(
+        harness: &Harness,
+        cx: &mut TestAppContext,
+        ages: &[(&str, u64)],
+    ) -> SystemTime {
+        use periscope_bridge::{LogLine, LogSource};
+
+        apply(
+            harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(harness, cx, "api-0");
+        harness.keys(cx, "cmd-l");
+
+        let now = SystemTime::now();
+        apply(
+            harness,
+            cx,
+            vec![ClusterEvent::LogBatch {
+                cluster: "prod".into(),
+                lines: ages
+                    .iter()
+                    .map(|(pod, age)| LogLine {
+                        source: LogSource::new(*pod, "api"),
+                        timestamp: now.checked_sub(Duration::from_secs(*age)),
+                        text: Arc::from(format!("{pod} at -{age}s").as_str()),
+                    })
+                    .collect(),
+            }],
+        );
+        now
+    }
+
+    fn type_time(harness: &Harness, cx: &mut TestAppContext, typed: &str) {
+        let typed = typed.to_owned();
+        harness.update(cx, |workspace, window, cx| {
+            workspace
+                .log_time_input
+                .update(cx, |input, cx| input.set_value(typed, window, cx));
+            workspace.jump_to_time(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn a_relative_time_scrolls_to_five_minutes_ago(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        // Ten minutes back, four minutes back, one minute back. "-5m" lands on
+        // the four-minute line: the first one at or after the time asked for.
+        tail_with_ages(
+            &harness,
+            cx,
+            &[("api-0", 600), ("api-0", 240), ("api-0", 60)],
+        );
+
+        type_time(&harness, cx, "-5m");
+
+        harness.read(cx, |workspace| {
+            assert_eq!(workspace.log_anchor, Some(1));
+            // Following would scroll straight back to the newest line on the
+            // next batch, undoing the jump the user just asked for.
+            assert!(!workspace.state().logs().expect("a tail").following);
+            let notice = workspace.log_notice.as_ref().expect("a notice");
+            assert!(notice.contains("line 2 of 3"), "{notice}");
+        });
+    }
+
+    #[gpui::test]
+    fn a_time_after_everything_held_says_so_rather_than_moving(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        tail_with_ages(&harness, cx, &[("api-0", 600), ("api-0", 300)]);
+
+        type_time(&harness, cx, "-1s");
+
+        harness.read(cx, |workspace| {
+            assert_eq!(workspace.log_anchor, None);
+            // A jump that found nothing must not pause a tail that was running.
+            assert!(workspace.state().logs().expect("a tail").following);
+            let notice = workspace.log_notice.as_ref().expect("a notice");
+            assert!(notice.contains("No line at or after"), "{notice}");
+        });
+    }
+
+    #[gpui::test]
+    fn a_time_that_is_not_a_time_is_reported_in_the_pane(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        tail_with_ages(&harness, cx, &[("api-0", 60)]);
+
+        type_time(&harness, cx, "half past four");
+
+        harness.read(cx, |workspace| {
+            assert_eq!(workspace.log_anchor, None);
+            let notice = workspace.log_notice.as_ref().expect("a notice");
+            assert!(notice.contains("not a time"), "{notice}");
+        });
+    }
+
+    #[gpui::test]
+    fn ordering_by_timestamp_interleaves_two_pods_backlogs(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        // One pod's backlog, then the other's: what `kubectl logs` gives, and
+        // what makes a merged tail hard to read.
+        tail_with_ages(
+            &harness,
+            cx,
+            &[
+                ("api-0", 300),
+                ("api-0", 100),
+                ("api-1", 200),
+                ("api-1", 50),
+            ],
+        );
+
+        harness.update(cx, |workspace, _window, cx| workspace.toggle_order(cx));
+
+        harness.read(cx, |workspace| {
+            let buffer = &workspace.state().logs().expect("a tail").buffer;
+            assert_eq!(buffer.order(), periscope_store::LogOrder::Timestamp);
+            let texts: Vec<_> = buffer.visible().map(|line| line.text.to_string()).collect();
+            assert_eq!(
+                texts,
+                [
+                    "api-0 at -300s",
+                    "api-1 at -200s",
+                    "api-0 at -100s",
+                    "api-1 at -50s"
+                ]
+            );
+        });
+
+        harness.update(cx, |workspace, _window, cx| workspace.toggle_order(cx));
+        assert_eq!(
+            harness.read(cx, |workspace| workspace
+                .state()
+                .logs()
+                .expect("a tail")
+                .buffer
+                .order()),
+            periscope_store::LogOrder::Arrival
+        );
+    }
+
+    #[gpui::test]
+    fn wrapping_shows_a_window_of_the_buffer_rather_than_all_of_it(cx: &mut TestAppContext) {
+        use periscope_bridge::{LogLine, LogSource};
+
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        harness.keys(cx, "cmd-l");
+
+        let count = logview::WRAP_LIMIT * 4;
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::LogBatch {
+                cluster: "prod".into(),
+                lines: (0..count)
+                    .map(|index| LogLine {
+                        source: LogSource::new("api-0", "api"),
+                        timestamp: None,
+                        text: Arc::from(format!("line-{index}").as_str()),
+                    })
+                    .collect(),
+            }],
+        );
+
+        harness.update(cx, |workspace, _window, cx| workspace.toggle_wrap(cx));
+
+        harness.read(cx, |workspace| {
+            assert!(workspace.log_wrap);
+            let visible = workspace
+                .state()
+                .logs()
+                .expect("a tail")
+                .buffer
+                .visible_len();
+            assert_eq!(visible, count);
+            // The whole point of the cap: an unvirtualised body must never be
+            // handed the whole buffer, however many lines that is.
+            let window = logview::wrap_window(visible, workspace.log_anchor);
+            assert_eq!(window, (count - logview::WRAP_LIMIT)..count);
+        });
+    }
+
+    #[gpui::test]
+    fn a_wrapped_line_is_taller_than_one_that_fits(cx: &mut TestAppContext) {
+        use periscope_bridge::{LogLine, LogSource};
+
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        harness.keys(cx, "cmd-l");
+
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::LogBatch {
+                cluster: "prod".into(),
+                lines: vec![
+                    LogLine {
+                        source: LogSource::new("api-0", "api"),
+                        timestamp: None,
+                        text: Arc::from("short"),
+                    },
+                    LogLine {
+                        source: LogSource::new("api-0", "api"),
+                        timestamp: None,
+                        text: Arc::from("word ".repeat(400).as_str()),
+                    },
+                ]
+                .into(),
+            }],
+        );
+        harness.update(cx, |workspace, _window, cx| workspace.toggle_wrap(cx));
+        harness.draw(cx);
+
+        harness.read(cx, |workspace| {
+            let scroll = &workspace.log_wrap_scroll;
+            let short = scroll
+                .bounds_for_item(0)
+                .expect("the short line was painted");
+            let long = scroll
+                .bounds_for_item(1)
+                .expect("the long line was painted");
+            // Wrapping is a layout property, and the only way to know it
+            // actually happened — rather than the row scrolling sideways out of
+            // sight — is that the row got taller.
+            assert!(
+                long.size.height > short.size.height * 2.,
+                "the long line was {} tall and the short one {}",
+                long.size.height,
+                short.size.height
+            );
+        });
     }
 
     #[gpui::test]

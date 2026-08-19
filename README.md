@@ -167,6 +167,22 @@ applies to what is already held, so it never restarts the stream. **Copy** puts
 the visible lines on the clipboard; **Export** writes them to a file and tells
 you where.
 
+The time field jumps to a point in the buffer. It takes `14:32`, `14:32:10`,
+`-5m` (also `s`, `h`, `d`) and an RFC3339 stamp pasted from anywhere; Enter
+scrolls to the first line at or after it and pauses following. **Everything on
+screen is UTC**, the timestamp column included.
+
+**By time** orders the lines by their timestamps instead of by the order they
+were read, which is what un-blocks a merged tail whose pods each delivered a
+backlog before the live streams interleaved. Lines the apiserver gave no
+timestamp for go last, in arrival order, and the pane says how many there are.
+
+**Wrap** shows long lines whole. Wrapping and virtualisation cannot both be had,
+so wrapped mode shows a window of 500 lines — the newest, or 500 from wherever
+you last jumped — and says which lines those are. Use the filter or the time
+field to move the window; scrolling will not take you through 100,000 wrapped
+lines, by design.
+
 ## Changing things
 
 The detail pane is tabbed — **YAML**, **Events**, **Related** — with counts on

@@ -16,7 +16,7 @@ use periscope_bridge::{
 };
 
 use crate::connections::{Connection, ConnectionRegistry};
-use crate::logs::{FilterSpec, LogBuffer};
+use crate::logs::{FilterSpec, LogBuffer, LogOrder};
 use crate::permissions::{Authorized, AuthorizedExec, Permissions, Refusal};
 use crate::table::ResourceTable;
 
@@ -1051,6 +1051,13 @@ impl AppState {
         self.logs
             .as_mut()
             .is_some_and(|session| session.buffer.set_filter(spec))
+    }
+
+    /// Orders the open session's lines, reporting whether it changed.
+    pub fn set_log_order(&mut self, order: LogOrder) -> bool {
+        self.logs
+            .as_mut()
+            .is_some_and(|session| session.buffer.set_order(order))
     }
 
     /// Sticks the view to the bottom, or lets it stay put.

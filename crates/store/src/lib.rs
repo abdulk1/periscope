@@ -16,6 +16,6 @@ pub use app::{AppState, Detail, ExecSession, Filters};
 pub use catalog::{Category, sections};
 pub use columns::Layout;
 pub use connections::{Connection, ConnectionRegistry};
-pub use logs::{FilterSpec, LogBuffer};
+pub use logs::{FilterSpec, LogBuffer, LogOrder, TimeError, parse_time};
 pub use permissions::{Authorized, AuthorizedExec, Permissions, Refusal};
 pub use table::ResourceTable;
