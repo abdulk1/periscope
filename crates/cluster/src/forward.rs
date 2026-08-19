@@ -229,9 +229,12 @@ mod tests {
     async fn a_read_only_cluster_forwards_nothing_and_records_the_refusal() {
         // `pods/portforward` is the same `create` verb `pods/exec` is, and a
         // tunnel to a production database is not something a cluster somebody
-        // marked read-only should hand out. This runs with a client that would
-        // fail if it were ever used, so a gate that stopped refusing fails here
-        // rather than reaching the network.
+        // marked read-only should hand out. The client points at a port
+        // nothing listens on, so a gate that stopped refusing fails here
+        // rather than reaching a cluster — and it is built from an explicit
+        // `Config` rather than from kubeconfig, because a test that passes on
+        // a developer's machine and fails on a runner with no kubeconfig is
+        // testing the machine.
         let (sink, stream) = periscope_bridge::event_channel(16);
         let scratch = std::env::temp_dir().join(format!(
             "periscope-forward-audit-{}-{:?}",
@@ -247,9 +250,10 @@ mod tests {
         forward::run(
             "prod".into(),
             ForwardId(1),
-            Client::try_default()
-                .await
-                .unwrap_or_else(|_| unreachable!("a client is only built, never used")),
+            Client::try_from(kube::Config::new(
+                "http://127.0.0.1:1/".parse().expect("a valid URL"),
+            ))
+            .expect("a client that needs no kubeconfig"),
             Arc::new(ForwardTarget::new("payments", "db-0", 5432)),
             &policy,
             Some(&audit),

@@ -105,6 +105,11 @@ cargo audit                          # RUSTSEC advisories against Cargo.lock
 cargo deny check                     # licences, unmaintained crates, duplicates
 ```
 
+`cargo audit` and `cargo deny` are not installed by default. Install them
+(`cargo install cargo-audit cargo-deny --locked`) and run them, rather than
+pushing a `deny.toml` you have never executed — CI will run it either way, and
+finding out there means a red build and a twenty-five minute round trip.
+
 `tests/guardrails` reads the source and fails the build when a shape that has
 already leaked reappears — a `tracing::` call carrying a cluster URL or a token,
 an audit entry written without `redact::text`, a file written without
@@ -128,6 +133,29 @@ Before you commit anything that touches a cluster, a credential, or a file:
 
 If a guardrail fails, the fix is almost never to relax it. If it is genuinely
 wrong, fix the rule and say why in the commit message.
+
+## The runner has no kubeconfig, and no cluster
+
+A green `cargo test` on this machine is not the same claim as a green CI. The
+runners have no `~/.kube/config`, no cluster, and no keychain, so anything that
+reaches for one passes here and fails there. A refusal test that built its
+client with `Client::try_default()` did exactly that: the gate it was checking
+worked perfectly, and the test still failed on both runners.
+
+Build such a client from an explicit `kube::Config` pointed at a port nothing
+listens on. Before pushing anything that touches credentials, kubeconfig or the
+cluster layer, prove it:
+
+```sh
+mkdir -p /tmp/no-kubeconfig-home
+env -u KUBECONFIG HOME=/tmp/no-kubeconfig-home \
+    CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup \
+    cargo test --workspace
+```
+
+Tests that genuinely need a cluster are `#[ignore]`d and live in `tests/e2e`,
+where `PERISCOPE_E2E_REQUIRE_FIXTURES` decides whether a missing fixture is a
+skip or a failure.
 
 ## When you finish something
 
