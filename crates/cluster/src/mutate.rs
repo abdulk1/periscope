@@ -558,4 +558,214 @@ mod tests {
         assert!(!is_scalable(&pods));
         assert!(!is_restartable(&pods));
     }
+
+    // --- the gate and the audit log ------------------------------------------
+    //
+    // Everything below runs without a cluster, because a refused mutation never
+    // reaches the apiserver — which is the point of the gate and also what lets
+    // it be tested here rather than only in `tests/e2e`. Before these existed,
+    // `cargo test --workspace` passed with `run`'s policy check and its call to
+    // `record` both deleted.
+
+    /// A path that removes itself, file or directory.
+    struct TempPath(std::path::PathBuf);
+
+    impl TempPath {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "periscope-mutate-{}-{:?}-{name}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A client that is never used.
+    ///
+    /// `run` takes one, and a refused mutation never builds a request with it,
+    /// so this points at a port nothing is listening on: if the gate ever stops
+    /// refusing, the test fails rather than quietly talking to something.
+    fn unused_client() -> Client {
+        let config = kube::Config::new("https://127.0.0.1:1/".parse().expect("a URL"));
+        Client::try_from(config).expect("a client can be built without connecting")
+    }
+
+    fn delete_api() -> Arc<Mutation> {
+        Arc::new(Mutation::Delete {
+            kind: KindId::new("apps", "v1", "Deployment", "deployments"),
+            key: ResourceKey::new("payments", "api"),
+            grace_period: Some(30),
+        })
+    }
+
+    #[tokio::test]
+    async fn the_last_gate_refuses_a_read_only_cluster_before_it_builds_a_request() {
+        // ADR-0028: the store refuses first, and this refuses again. A bug in
+        // the view must not be enough to change a protected cluster, so the
+        // check is asserted here and not only where the UI asks.
+        let mut policy = WritePolicy::permissive();
+        policy.deny(prod());
+
+        let outcome = run(prod(), unused_client(), delete_api(), true, &policy, None).await;
+
+        match outcome {
+            MutationOutcome::Refused { reason } => {
+                assert!(
+                    reason.contains("prod"),
+                    "a refusal names the cluster: {reason}"
+                );
+                assert!(reason.contains("read-only"), "{reason}");
+            }
+            other => panic!("a read-only cluster must refuse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_reaches_the_audit_log_with_what_was_asked_for() {
+        // "Every attempt is written to the audit log — applied, dry-run,
+        // refused or failed." A refusal is the one worth being able to prove
+        // afterwards, and the only one no request leaves a trace of anywhere
+        // else.
+        let file = TempPath::new("refusal");
+        let audit = AuditLog::at(&file.0);
+        let mut policy = WritePolicy::permissive();
+        policy.deny(prod());
+
+        run(
+            prod(),
+            unused_client(),
+            delete_api(),
+            true,
+            &policy,
+            Some(&audit),
+        )
+        .await;
+
+        let entries = audit.read().expect("the log reads back");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = &entries[0];
+        assert_eq!(entry.outcome, AuditOutcome::Refused);
+        assert_eq!(entry.cluster, "prod");
+        assert_eq!(entry.namespace, "payments");
+        assert_eq!(entry.kind, "deployments.apps");
+        assert_eq!(entry.name, "api");
+        assert_eq!(entry.action, "delete");
+        assert_eq!(entry.detail, "grace=30s");
+        assert!(entry.reason.contains("read-only"), "{}", entry.reason);
+    }
+
+    #[test]
+    fn every_outcome_a_mutation_can_have_is_recorded() {
+        // The four are recorded by one `match`, and a fifth added to
+        // `MutationOutcome` without a line here would be an attempt nobody
+        // could account for afterwards.
+        let file = TempPath::new("outcomes");
+        let audit = AuditLog::at(&file.0);
+        let mutation = delete_api();
+
+        for outcome in [
+            MutationOutcome::Applied {
+                detail: "api deleted".to_owned(),
+            },
+            MutationOutcome::DryRun {
+                preview: Arc::from("kind: Deployment"),
+            },
+            MutationOutcome::Refused {
+                reason: "prod is read-only".to_owned(),
+            },
+            MutationOutcome::Failed {
+                reason: "404 Not Found".to_owned(),
+            },
+        ] {
+            record(&prod(), &mutation, &outcome, Some(&audit));
+        }
+
+        let recorded: Vec<AuditOutcome> = audit
+            .read()
+            .expect("the log reads back")
+            .into_iter()
+            .map(|entry| entry.outcome)
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                AuditOutcome::Applied,
+                AuditOutcome::DryRun,
+                AuditOutcome::Refused,
+                AuditOutcome::Failed,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_audit_log_that_cannot_be_written_does_not_swallow_the_mutation() {
+        // Failing to write the log is never fatal. The alternative — refusing
+        // to act because the record could not be kept — would make a full disk
+        // look like a permissions problem on the cluster.
+        let file = TempPath::new("unwritable");
+        std::fs::write(&file.0, "not a directory").expect("fixture written");
+        let audit = AuditLog::at(file.0.join("audit.log"));
+        assert!(
+            audit
+                .append(&AuditEntry::new("prod", "", "pods", "api-0", "delete"))
+                .is_err(),
+            "the fixture has to be a log that really cannot be written"
+        );
+
+        let mut policy = WritePolicy::permissive();
+        policy.deny(prod());
+
+        let outcome = run(
+            prod(),
+            unused_client(),
+            delete_api(),
+            true,
+            &policy,
+            Some(&audit),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, MutationOutcome::Refused { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_cordon_is_audited_against_the_node_it_names() {
+        // A cordon carries a node rather than a key, so the audit line is built
+        // from `Mutation::key`; taking the table's selection instead would file
+        // it under whatever kind happened to be on screen.
+        let file = TempPath::new("cordon");
+        let audit = AuditLog::at(&file.0);
+        let mutation = Arc::new(Mutation::Cordon {
+            node: Arc::from("worker-0"),
+            cordon: true,
+        });
+
+        record(
+            &prod(),
+            &mutation,
+            &MutationOutcome::Applied {
+                detail: "worker-0 cordoned".to_owned(),
+            },
+            Some(&audit),
+        );
+
+        let entries = audit.read().expect("the log reads back");
+        assert_eq!(entries[0].kind, "nodes");
+        assert_eq!(entries[0].name, "worker-0");
+        assert_eq!(entries[0].namespace, "");
+        assert_eq!(entries[0].action, "cordon");
+    }
 }

@@ -412,3 +412,30 @@ pub fn placeholder(message: impl Into<SharedString>, cx: &App) -> impl IntoEleme
         .text_color(style::text_faint(cx))
         .child(message.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cell_that_is_a_count_is_read_down_its_right_edge() {
+        // Most kinds arrive from the cluster layer without a declared
+        // alignment, so this is what decides it. `1/1` and `0/3` are the ones
+        // that matter: a READY column aligned left beside a RESTARTS column
+        // aligned right is the sort of thing nobody reports and everybody
+        // notices.
+        for text in ["3", "1/1", "0/3", "1.5", "10", "-1"] {
+            assert!(is_numeric(text), "{text} should read as a number");
+        }
+    }
+
+    #[test]
+    fn anything_that_is_not_a_count_is_read_from_the_left() {
+        // An age is not a number for this purpose — `5m` is a word, and the AGE
+        // column sets its own alignment — and neither is an empty cell, which
+        // aligned right would drag the cell beside it across for no reason.
+        for text in ["", "Running", "CrashLoopBackOff", "5m", "<none>", "10Gi"] {
+            assert!(!is_numeric(text), "{text} should not read as a number");
+        }
+    }
+}

@@ -119,7 +119,13 @@ impl Span {
             .trim()
             .parse()
             .map_err(|_| format!("`{text}` is not a duration, e.g. `5m`, `30s`, `1h`"))?;
-        Ok(Self(Duration::from_secs(seconds * multiplier)))
+        // Checked, because a settings file is written by hand and the suffix
+        // multiplies: `1000000000000000000m` overflows a `u64` of seconds,
+        // which panicked the app before it had a window to report it in.
+        let seconds = seconds
+            .checked_mul(multiplier)
+            .ok_or_else(|| format!("`{text}` is longer than any duration this can hold"))?;
+        Ok(Self(Duration::from_secs(seconds)))
     }
 
     /// How it is written back out.
@@ -643,6 +649,35 @@ writable = []
             let error = Span::parse(text).expect_err("{text} is not a duration");
             assert!(error.contains("5m"), "{text}: {error}");
         }
+    }
+
+    #[test]
+    fn a_duration_too_large_to_hold_is_refused_rather_than_overflowing() {
+        // The defect this prevents: the suffix is a multiplier, so a number
+        // that parses perfectly well as seconds overflows once it is minutes.
+        // `Span::parse` used to compute it unchecked, which panicked in a debug
+        // build and silently wrapped to some unrelated span in a release one —
+        // from a file the user is invited to write anything in, before there is
+        // a window to report anything in.
+        for text in ["1000000000000000000m", "18446744073709551615h"] {
+            let error = Span::parse(text).expect_err("{text} does not fit");
+            assert!(error.contains(text), "the error names the value: {error}");
+        }
+
+        // Seconds have no multiplier, so the largest thing anybody can write is
+        // still a duration.
+        assert!(Span::parse("18446744073709551615s").is_ok());
+    }
+
+    #[test]
+    fn a_settings_file_with_an_impossible_duration_is_an_error_not_a_crash() {
+        let (_dir, path) = write("[limits]\nidle-timeout = \"9999999999999999999h\"\n");
+
+        let error = Settings::read_from(&path).expect_err("an impossible duration is refused");
+        assert!(
+            matches!(error, SettingsError::Parse { .. }),
+            "{error:?}: a bad value in the file is a parse failure, not a panic"
+        );
     }
 
     #[test]

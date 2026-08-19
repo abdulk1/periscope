@@ -2243,6 +2243,71 @@ mod tests {
     }
 
     #[test]
+    fn sorting_by_a_column_the_next_kind_does_not_have_falls_back_to_the_name() {
+        // The sort belongs to the pane, not to the kind, so switching kinds
+        // carries `Cell(3)` onto a table whose rows have one cell. Every cell
+        // reads empty, every comparison ties, and the tie-break is the name —
+        // the only order left that means anything.
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[
+                reset(
+                    "prod",
+                    pods(),
+                    &[row_with("a", "1", None), row_with("b", "2", None)],
+                ),
+                reset(
+                    "prod",
+                    deployments(),
+                    &[
+                        row_with("zebra", "x", None),
+                        row_with("aardvark", "y", None),
+                    ],
+                ),
+            ],
+            Instant::now(),
+        );
+
+        state.sort_by(SortKey::Cell(3));
+        state.select_kind(deployments());
+
+        assert_eq!(state.sort().key, SortKey::Cell(3));
+        assert_eq!(names(&state), ["aardvark", "zebra"]);
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_empties_the_table_and_takes_the_cursor_with_it() {
+        // A cursor left pointing at row 2 of a list with no rows is how
+        // `current_row` starts handing out something that is not on screen.
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[
+                    row("default", "api-0"),
+                    row("default", "api-1"),
+                    row("default", "api-2"),
+                ],
+            )],
+            Instant::now(),
+        );
+        state.cursor_to_end();
+        assert_eq!(state.cursor(), 2);
+
+        state.set_search(Some(Arc::from("nothing-is-called-this")));
+        assert!(state.rows().is_empty());
+        assert_eq!(state.cursor(), 0);
+        assert!(state.current_row().is_none());
+
+        // Clearing it brings the rows back; the cursor stays where the empty
+        // table left it rather than pretending to remember.
+        state.set_search(None);
+        assert_eq!(row_names(&state).len(), 3);
+        assert_eq!(state.cursor(), 0);
+    }
+
+    #[test]
     fn sorting_puts_the_cursor_back_at_the_top() {
         // The row under it means something different once the order changes.
         let mut state = state_with_contexts();

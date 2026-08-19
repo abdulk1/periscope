@@ -153,4 +153,44 @@ mod tests {
             assert_ne!(healthy, failing);
         });
     }
+
+    #[gpui::test]
+    fn no_two_row_states_are_the_same_colour(cx: &mut TestAppContext) {
+        // Colour is the only thing a table uses to say what a row is doing, so
+        // two states sharing one is the same as not saying it. `Transient` has
+        // to be told from both of its neighbours in particular: it is the one
+        // that means "wait, this is still moving".
+        use periscope_bridge::RowState;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+
+            let all = [
+                RowState::Healthy,
+                RowState::Transient,
+                RowState::Failing,
+                RowState::Neutral,
+            ];
+            for (index, left) in all.iter().enumerate() {
+                for right in &all[index + 1..] {
+                    assert_ne!(
+                        state(*left, cx),
+                        state(*right, cx),
+                        "{left:?} and {right:?} render identically"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn nothing_in_the_vocabulary_animates_for_zero_time() {
+        // A zero-length animation divides by zero inside GPUI and panics, so a
+        // duration here reaching zero would take every table in the app down
+        // rather than merely looking wrong.
+        assert!(!TRANSITION.is_zero());
+        assert!(!FLASH.is_zero());
+        // And the flash has to outlast a frame, or the row it marks is
+        // repainted before anybody could have seen it.
+        assert!(FLASH > std::time::Duration::from_millis(16), "{FLASH:?}");
+    }
 }

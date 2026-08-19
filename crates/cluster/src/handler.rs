@@ -913,6 +913,119 @@ mod tests {
         }
     }
 
+    /// Every command that acts on a cluster has to answer when there is no
+    /// session for it. A watch may say nothing — nothing was ever on screen —
+    /// but anything somebody pressed a button for must come back, or the button
+    /// reads as broken. Three of those branches had no test at all.
+    #[test]
+    fn mutating_a_cluster_that_is_not_connected_is_refused_rather_than_dropped() {
+        let (runtime, stream) =
+            ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
+
+        runtime
+            .send(ClusterCommand::Mutate {
+                cluster: "not-connected".into(),
+                mutation: Arc::new(periscope_bridge::Mutation::Delete {
+                    kind: default_kind(),
+                    key: ResourceKey::new("default", "api-0"),
+                    grace_period: None,
+                }),
+            })
+            .unwrap();
+
+        match recv_timeout(&stream, Duration::from_secs(5)) {
+            Some(ClusterEvent::MutationDone { outcome, .. }) => {
+                assert!(outcome.is_problem(), "{outcome:?}");
+                assert!(outcome.message().contains("not connected"), "{outcome:?}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn running_a_command_without_a_connection_ends_the_session_with_a_reason() {
+        let (runtime, stream) =
+            ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
+
+        runtime
+            .send(ClusterCommand::Exec {
+                cluster: "not-connected".into(),
+                target: Arc::new(
+                    periscope_bridge::ExecTarget::parse("default", "api-0", None, "sh -c true")
+                        .expect("a command"),
+                ),
+            })
+            .unwrap();
+
+        match recv_timeout(&stream, Duration::from_secs(5)) {
+            Some(ClusterEvent::ExecFinished { status, .. }) => {
+                // A command pane that never finishes is a spinner without a
+                // reason, which this project does not have.
+                assert!(status.is_problem(), "{status:?}");
+                assert!(status.message().contains("not connected"), "{status:?}");
+            }
+            other => panic!("expected the command to end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_forward_on_a_cluster_that_is_not_connected_fails_instead_of_listening() {
+        let (runtime, stream) =
+            ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
+
+        runtime
+            .send(ClusterCommand::StartForward {
+                cluster: "not-connected".into(),
+                id: periscope_bridge::ForwardId(1),
+                target: Arc::new(periscope_bridge::ForwardTarget::new(
+                    "default", "api-0", 8080,
+                )),
+            })
+            .unwrap();
+
+        match recv_timeout(&stream, Duration::from_secs(5)) {
+            Some(ClusterEvent::ForwardChanged { forward, .. }) => {
+                assert!(forward.state.is_problem(), "{:?}", forward.state);
+                // No address, because nothing is listening on one: an address
+                // here would be an invitation to connect to a dead socket.
+                assert!(forward.address().is_none(), "{:?}", forward.state);
+            }
+            other => panic!("expected a failed forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelling_a_command_that_is_not_running_says_nothing() {
+        // The opposite rule to the three above, and the reason it is written
+        // down: an `ExecFinished` here would close a pane somebody is still
+        // reading, and report a cancellation that never happened.
+        let (runtime, stream) =
+            ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
+
+        runtime
+            .send(ClusterCommand::CancelExec {
+                cluster: "prod".into(),
+            })
+            .unwrap();
+
+        assert!(recv_timeout(&stream, Duration::from_millis(300)).is_none());
+    }
+
+    #[test]
+    fn stopping_a_forward_nobody_started_says_nothing() {
+        let (runtime, stream) =
+            ClusterRuntime::start(KubeHandler::new(), RuntimeConfig::default()).unwrap();
+
+        runtime
+            .send(ClusterCommand::StopForward {
+                cluster: "prod".into(),
+                id: periscope_bridge::ForwardId(7),
+            })
+            .unwrap();
+
+        assert!(recv_timeout(&stream, Duration::from_millis(300)).is_none());
+    }
+
     #[test]
     fn listing_contexts_answers_even_when_kubeconfig_is_missing() {
         let (runtime, stream) =
