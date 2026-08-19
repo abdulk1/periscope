@@ -26,11 +26,32 @@ fn mode_of(path: &Path) -> u32 {
 }
 
 /// Runs a stub plugin the way a kubectl-compatible client would.
+///
+/// Retries `ETXTBSY`, which is not a problem with the plugin. `cargo test` runs
+/// these in parallel threads, and on Linux a `fork` in one thread inherits
+/// every write file descriptor open in another — so a sibling test that is
+/// spawning a process while this one is still writing its plugin leaves the
+/// child holding the file open for writing, and the kernel refuses to execute
+/// it until that child reaches its own `exec`. The window is microseconds and
+/// macOS does not enforce it at all, which is why this only ever failed on CI.
 fn run(plugin: &Path, directory: &Path) -> Output {
-    std::process::Command::new(plugin)
-        .current_dir(directory)
-        .output()
-        .unwrap_or_else(|error| panic!("the stub plugin runs: {error}"))
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    loop {
+        match std::process::Command::new(plugin)
+            .current_dir(directory)
+            .output()
+        {
+            Ok(output) => return output,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("the stub plugin runs: {error}"),
+        }
+    }
 }
 
 #[test]
