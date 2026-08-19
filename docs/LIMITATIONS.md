@@ -448,6 +448,28 @@ Two honest caveats remain:
   more work per frame than scrolling a `uniform_list`, so it is a reasonable
   floor — but nobody has driven a scroll gesture under instrumentation.
 
+## What a read-only cluster looks like
+
+Every mutating control is still rendered — Scale, Restart, Drain, Cordon, Apply,
+Dry run, Delete, and the Run button that executes a command in a container. They
+are disabled, and each carries the reason: "`prod` is read-only. Change
+`[access]` in `settings.toml` to allow writes."
+
+They used to be absent, which was worse in a way that took competitive research
+to see: an absent button is indistinguishable from a button the program does not
+have, so the rule protecting you disappeared exactly when it applied. ADR-0043
+has the reasoning and `docs/COMPETITORS.md` has the evidence.
+
+What this is **not** is a security boundary. Disabling a control is a courtesy
+to the reader. The store still refuses, the cluster layer still checks the
+`WritePolicy` independently, and a refusal is still written to the audit log —
+so a bug in the button logic cannot mutate a cluster somebody marked read-only.
+
+The same applies to a masked Secret: Apply and Dry run render disabled with
+"Reveal the values first", because applying a masked Secret would send the mask.
+On a read-only cluster the cluster's reason wins, since revealing the values
+would not make the apply land.
+
 ## Testing
 
 Bridge tests that involve the tokio thread poll with a deadline rather than

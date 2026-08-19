@@ -157,6 +157,23 @@ Tests that genuinely need a cluster are `#[ignore]`d and live in `tests/e2e`,
 where `PERISCOPE_E2E_REQUIRE_FIXTURES` decides whether a missing fixture is a
 skip or a failure.
 
+## Do not hide what the user may not do
+
+An action somebody is not allowed to take is **rendered, disabled, and carries
+the reason**. It is never removed. An absent button is indistinguishable from a
+button this program does not have, so a person on a read-only cluster cannot
+tell "you are not allowed" from "this tool cannot" — and the safety rule that
+stopped them becomes invisible at the exact moment it applies.
+
+`gated()` in `crates/ui/src/workspace.rs` is the only place this happens and
+`write_refusal()` is the only place the reason is decided. ADR-0043 has the
+reasoning, and `docs/COMPETITORS.md` has the evidence: it is the most-criticised
+thing about the one competitor that does it the other way.
+
+This is a courtesy to the reader, not a security control. The store's gate stays
+exactly where it is — the palette and the keyboard still reach `authorize()`,
+which still refuses and still audits.
+
 ## When you finish something
 
 1. `docs/LIMITATIONS.md` — rewrite what your change made true or false. This

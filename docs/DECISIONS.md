@@ -1277,3 +1277,52 @@ as `DynamicObject`. Paying to parse bytes we immediately drop is the price of
 one code path that works for every kind, including CRDs nobody has compiled a
 type for.
 
+## ADR-0043 — An action you may not take is disabled, never absent
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+Every mutating control used to disappear on a read-only cluster: `detail_pane`
+built an empty action list and the pane rendered without Scale, Restart, Drain,
+Cordon, Apply or Delete. Apply and Dry-run disappeared the same way while a
+Secret was masked. It looked tidy and it was wrong.
+
+An absent button is indistinguishable from a button the product does not have.
+Somebody looking at a read-only cluster could not tell "you are not allowed to
+do this" from "this tool cannot do this" — so the read-only rule, which is the
+single most important safety property in the settings file, became invisible at
+exactly the moment it applied. The user goes looking for a missing feature, or
+files a bug about it, and learns nothing about the guard that was protecting
+them.
+
+Competitive research made this concrete rather than theoretical. Headlamp leads
+with RBAC-derived UI that hides what your role forbids, and it is the most
+criticised thing about it — consistently, since its 2020 launch: *"Hiding UI
+based on permissions creates an infuriating UX, because there's no way for the
+operator to tell what actions are possible-but-forbidden"*; *"I strongly
+recommend disabling buttons instead of hiding them… hiding buttons gaslights
+people"*; *"There should be some explanatory text like 'you need role foo.bar.baz
+to run this command'."*
+
+So: **render the control, disable it, and attach the reason as a tooltip.**
+`gated()` is the one place that happens, and `write_refusal()` is the one place
+the reason is decided. The reason names the cluster and says what to change —
+"`prod` is read-only. Change `[access]` in `settings.toml` to allow writes." —
+because "Forbidden" alone would send people to the apiserver's RBAC, which is
+not the gate that stopped them.
+
+Two consequences worth stating:
+
+* **The store's gate is untouched.** Disabling a button is a courtesy to the
+  reader, not a security control; the palette and the keyboard still reach
+  `authorize()`, which still refuses and still writes an audit entry. The UI
+  must not be the only thing standing between a read-only cluster and a write,
+  and it still isn't.
+* **A masked Secret gets its own reason**, and the cluster's reason outranks it.
+  "Reveal the values first" is useful advice on a writable cluster and a
+  pointless errand on a read-only one.
+
+The same rule explains why `pods/exec`'s Run button now renders disabled rather
+than vanishing: running a command is a `create` on `pods/exec`, which surprises
+people, and the disabled button is the only place that fact ever surfaces.
+

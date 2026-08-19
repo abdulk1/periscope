@@ -17,6 +17,7 @@ use gpui::{
     IntoElement, KeyBinding, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, actions, div, px,
 };
+use gpui_component::Disableable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::resizable::{h_resizable, resizable_panel};
@@ -988,6 +989,21 @@ impl Workspace {
                     })
             })
             .count()
+    }
+
+    /// Why a mutation would be refused on the focused cluster, if it would.
+    ///
+    /// `None` means the cluster accepts writes. Every mutating control renders
+    /// disabled and carries this as its tooltip — never absent. See
+    /// [`gated`] and ADR-0043.
+    fn write_refusal(&self) -> Option<SharedString> {
+        match self.state.active() {
+            Some(cluster) if !self.state.may_mutate(cluster) => Some(SharedString::from(format!(
+                "{cluster} is read-only. Change [access] in settings.toml to allow writes."
+            ))),
+            None => Some(SharedString::from("No cluster is selected.")),
+            Some(_) => None,
+        }
     }
 
     /// The state being rendered.
@@ -3427,22 +3443,23 @@ impl Workspace {
         let is_node = detail.kind().is_core() && &*detail.kind().kind == "Node";
         let kind = detail.kind().clone();
         let key = detail.key().clone();
-        let writable = self
-            .state
-            .active()
-            .is_some_and(|cluster| self.state.may_mutate(cluster));
+        // Why writes are refused here, if they are.
+        //
+        // Note what this is *not*: the actions used to be dropped from the pane
+        // entirely on a read-only cluster. An absent button is indistinguishable
+        // from a button the product does not have, so the user could not tell
+        // "you may not do this" from "this cannot be done" — and the read-only
+        // rule, which is the whole point, became invisible at the exact moment
+        // it applied. See ADR-0043.
+        let refusal = self.write_refusal();
 
-        // Actions are offered only where they mean something, and only where
-        // the cluster allows changes at all.
-        let actions: Vec<_> = if !writable {
-            Vec::new()
-        } else {
+        let actions: Vec<_> = {
             let mut actions = Vec::new();
 
             if periscope_cluster_actions::is_scalable(&kind) {
                 let (scale_kind, scale_key) = (kind.clone(), key.clone());
                 actions.push(
-                    Button::new("scale")
+                    gated(Button::new("scale"), refusal.as_ref())
                         .outline()
                         .small()
                         .label("Scale")
@@ -3471,7 +3488,7 @@ impl Workspace {
             if periscope_cluster_actions::is_restartable(&kind) {
                 let (restart_kind, restart_key) = (kind.clone(), key.clone());
                 actions.push(
-                    Button::new("restart")
+                    gated(Button::new("restart"), refusal.as_ref())
                         .outline()
                         .small()
                         .label("Restart")
@@ -3497,7 +3514,7 @@ impl Workspace {
                     .is_some_and(|row| row.cell(0).contains("SchedulingDisabled"));
                 let drain_node = key.name.clone();
                 actions.push(
-                    Button::new("drain")
+                    gated(Button::new("drain"), refusal.as_ref())
                         .outline()
                         .small()
                         .label("Drain")
@@ -3512,7 +3529,7 @@ impl Workspace {
                         })),
                 );
                 actions.push(
-                    Button::new("cordon")
+                    gated(Button::new("cordon"), refusal.as_ref())
                         .outline()
                         .small()
                         .label(if cordoned { "Uncordon" } else { "Cordon" })
@@ -3531,15 +3548,18 @@ impl Workspace {
             // Applying a masked Secret would send `<hidden, 7 bytes>` as the
             // value. The apiserver rejects it — it is not base64 — so this is a
             // confusing failure rather than a destroyed secret, but offering a
-            // button whose only outcome is an error is its own defect.
-            let editable = !matches!(
+            // button whose only outcome is an error is its own defect. Saying
+            // so is better than removing it: "Reveal values" is right there,
+            // and a button that vanished explains nothing.
+            let masked = matches!(
                 detail,
                 Detail::Ready { object, .. } if object.maskable && !object.revealed
             );
+            let edit_refusal = edit_refusal(refusal.clone(), masked);
 
             let (dry_kind, dry_key) = (kind.clone(), key.clone());
-            actions.extend(editable.then(|| {
-                Button::new("dry-run")
+            actions.push(
+                gated(Button::new("dry-run"), edit_refusal.as_ref())
                     .outline()
                     .small()
                     .label("Dry run")
@@ -3554,12 +3574,12 @@ impl Workspace {
                             },
                             cx,
                         );
-                    }))
-            }));
+                    })),
+            );
 
             let (apply_kind, apply_key) = (kind.clone(), key.clone());
-            actions.extend(editable.then(|| {
-                Button::new("apply")
+            actions.push(
+                gated(Button::new("apply"), edit_refusal.as_ref())
                     .outline()
                     .small()
                     .label("Apply")
@@ -3574,12 +3594,12 @@ impl Workspace {
                             },
                             cx,
                         );
-                    }))
-            }));
+                    })),
+            );
 
             let (delete_kind, delete_key) = (kind.clone(), key.clone());
             actions.push(
-                Button::new("delete")
+                gated(Button::new("delete"), refusal.as_ref())
                     .danger()
                     .small()
                     .label("Delete")
@@ -3806,29 +3826,28 @@ impl Workspace {
                         // Only where there is something to choose between: a pod
                         // with one container has no choice to offer, and one
                         // whose object has not arrived yet does not know.
-                        .children((is_pod && writable && self.exec_containers.len() > 1).then(
-                            || {
-                                Button::new("exec-container")
-                                    .outline()
-                                    .small()
-                                    .label(match &self.exec_container {
-                                        Some(container) => container.to_string(),
-                                        None => "Default container".to_owned(),
-                                    })
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| {
-                                            this.toggle_container_menu(cx)
-                                        }),
-                                    )
-                            },
-                        ))
-                        .children((is_pod && writable).then(|| {
+                        .children((is_pod && self.exec_containers.len() > 1).then(|| {
+                            Button::new("exec-container")
+                                .outline()
+                                .small()
+                                .label(match &self.exec_container {
+                                    Some(container) => container.to_string(),
+                                    None => "Default container".to_owned(),
+                                })
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.toggle_container_menu(cx)),
+                                )
+                        }))
+                        .children(is_pod.then(|| {
                             div()
                                 .w(px(150.))
                                 .child(Input::new(&self.exec_input).small())
                         }))
-                        .children((is_pod && writable).then(|| {
-                            Button::new("run-command")
+                        // `pods/exec` is a `create` verb — running a command is
+                        // a write, which surprises people. Saying so on the
+                        // button is the only place that fact ever surfaces.
+                        .children(is_pod.then(|| {
+                            gated(Button::new("run-command"), refusal.as_ref())
                                 .outline()
                                 .small()
                                 .label("Run")
@@ -4516,6 +4535,36 @@ impl Render for Workspace {
         }
 
         rendered
+    }
+}
+
+/// Why editing this object is refused, if it is.
+///
+/// The cluster-level reason wins when there is one: "prod is read-only" is the
+/// more fundamental fact, and revealing the Secret would not help.
+fn edit_refusal(write: Option<SharedString>, masked: bool) -> Option<SharedString> {
+    write.or_else(|| {
+        masked.then(|| {
+            SharedString::from(
+                "Reveal the values first — applying a masked Secret would send the mask.",
+            )
+        })
+    })
+}
+
+/// Renders a control as unavailable, with the reason attached, or leaves it be.
+///
+/// The rule this exists to enforce: **an action the user may not take is shown
+/// and disabled, never removed.** A button that is absent is indistinguishable
+/// from a button the product does not have, so a person looking at a read-only
+/// cluster cannot tell "you are not allowed" from "this tool cannot do that" —
+/// and goes looking for the feature, or files a bug about it. The reason is a
+/// tooltip on the disabled control, which is where somebody who has just
+/// noticed they cannot click will look. See ADR-0043.
+fn gated(button: Button, reason: Option<&SharedString>) -> Button {
+    match reason {
+        Some(reason) => button.disabled(true).tooltip(reason.clone()),
+        None => button,
     }
 }
 
@@ -7241,6 +7290,62 @@ mod tests {
             assert!(!session.is_running());
             assert_eq!(session.summary(), "cancelled");
         });
+    }
+
+    #[gpui::test]
+    fn a_read_only_cluster_says_so_instead_of_hiding_what_it_refuses(cx: &mut TestAppContext) {
+        // The actions used to be dropped from the pane entirely. An absent
+        // button is indistinguishable from a button the product does not have,
+        // so the read-only rule became invisible at exactly the moment it
+        // applied — and the user goes looking for a feature that is right
+        // there, refusing them on purpose.
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+
+        harness.read(cx, |workspace| {
+            assert_eq!(
+                workspace.write_refusal(),
+                None,
+                "a permissive cluster refuses nothing"
+            );
+        });
+
+        harness.update(cx, |workspace, _window, _cx| {
+            let mut permissions = periscope_store::Permissions::permissive();
+            permissions.deny(ClusterId::new("prod"));
+            workspace.state.set_permissions(permissions);
+        });
+
+        harness.read(cx, |workspace| {
+            let said = workspace
+                .write_refusal()
+                .expect("a read-only cluster gives a reason");
+            // Names the cluster, and says what to change. "Forbidden" alone
+            // sends people to the apiserver's RBAC, which is not the gate here.
+            assert!(said.contains("prod"), "{said}");
+            assert!(said.contains("read-only"), "{said}");
+            assert!(said.contains("settings.toml"), "{said}");
+        });
+    }
+
+    #[test]
+    fn a_masked_secret_explains_itself_but_never_outranks_the_cluster() {
+        // Reveal-then-apply is a real path, so the reason has to point at it.
+        let masked = edit_refusal(None, true).expect("a masked secret is not editable");
+        assert!(masked.contains("Reveal"), "{masked}");
+
+        // A revealed one on a writable cluster is simply editable.
+        assert_eq!(edit_refusal(None, false), None);
+
+        // And on a read-only cluster the cluster's reason wins: revealing the
+        // values would not make the apply land, so saying "reveal first" would
+        // send the user to do something pointless.
+        let read_only = SharedString::from("prod is read-only. …");
+        assert_eq!(edit_refusal(Some(read_only.clone()), true), Some(read_only));
     }
 
     #[gpui::test]
