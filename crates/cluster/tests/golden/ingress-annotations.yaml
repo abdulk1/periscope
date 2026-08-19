@@ -1,0 +1,43 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Validate=false
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    field.cattle.io/description: "the team calls this \"the front door\": do not delete"
+    meta.helm.sh/release-namespace: payments
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "X-Request-Id: $request_id";
+    nginx.ingress.kubernetes.io/proxy-body-size: 8m
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location = /metrics {
+        deny all;
+        return 403;
+      }
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/whitelist-source-range: 10.0.0.0/8,192.168.0.0/16
+  creationTimestamp: 2026-03-04T11:45:02Z
+  name: api
+  namespace: payments
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api
+            port:
+              number: 8080
+status:
+  loadBalancer:
+    ingress:
+    - hostname: a1b2c3.elb.eu-west-1.amazonaws.com

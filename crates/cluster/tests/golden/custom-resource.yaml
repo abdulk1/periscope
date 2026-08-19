@@ -1,0 +1,76 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  creationTimestamp: 2026-01-08T07:00:00Z
+  finalizers:
+  - resources-finalizer.argocd.argoproj.io
+  name: payments
+  namespace: argocd
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: payments
+  source:
+    repoURL: https://github.com/example/charts.git
+    targetRevision: HEAD
+    path: charts/api
+    helm:
+      releaseName: api
+      valueFiles:
+      - values.yaml
+      - values-prod.yaml
+      parameters:
+      - name: image.tag
+        value: "1.20"
+      - name: replicaCount
+        value: "3"
+      values: |
+        replicaCount: 3
+        image:
+          repository: ghcr.io/example/api
+          tag: "1.20"
+        ingress:
+          enabled: true
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  ignoreDifferences: []
+status:
+  sync:
+    status: OutOfSync
+    revision: a1b2c3d4e5f60718293a4b5c6d7e8f9012345678
+  health:
+    status: Degraded
+    message: "pod api-7d4f9c6b8-x2ktp: back-off restarting failed container"
+  operationState:
+    phase: Succeeded
+    startedAt: 2026-08-17T09:12:40Z
+    finishedAt: 2026-08-17T09:12:47Z
+    message: successfully synced (all tasks run)
+  resources:
+  - group: apps
+    version: v1
+    kind: Deployment
+    namespace: payments
+    name: api
+    status: OutOfSync
+    health:
+      status: Degraded
+  - version: v1
+    kind: Service
+    namespace: payments
+    name: api
+    status: Synced
+    health:
+      status: Healthy
+  summary: {}

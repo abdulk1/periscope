@@ -1,0 +1,149 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    kubectl.kubernetes.io/restartedAt: 2026-08-17T09:12:40Z
+    prometheus.io/port: "9102"
+    prometheus.io/scrape: "true"
+  creationTimestamp: 2026-08-17T09:12:44Z
+  labels:
+    app: api
+    pod-template-hash: 7d4f9c6b8
+  name: api-7d4f9c6b8-x2ktp
+  namespace: payments
+  ownerReferences:
+  - apiVersion: apps/v1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ReplicaSet
+    name: api-7d4f9c6b8
+    uid: 1c2d3e4f-5a6b-7c8d-9e0f-1a2b3c4d5e6f
+  uid: 0d6b0f6a-2b1e-4f0a-9d3c-8f6c1a2b3c4d
+spec:
+  serviceAccountName: api
+  nodeName: ip-10-0-3-17.eu-west-1.compute.internal
+  restartPolicy: Always
+  terminationGracePeriodSeconds: 30
+  containers:
+  - name: api
+    image: ghcr.io/example/api:1.20
+    args:
+    - serve
+    - --port=8080
+    ports:
+    - name: http
+      containerPort: 8080
+      protocol: TCP
+    - name: metrics
+      containerPort: 9102
+      protocol: TCP
+    env:
+    - name: LOG_LEVEL
+      value: info
+    - name: REPLICAS
+      value: "3"
+    - name: FEATURE_FLAGS
+      value: ""
+    - name: DATABASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: db
+          key: url
+    - name: POD_IP
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: status.podIP
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+    volumeMounts:
+    - name: config
+      mountPath: /etc/api
+      readOnly: true
+    - name: cache
+      mountPath: /var/cache/api
+    readinessProbe:
+      httpGet:
+        path: /healthz
+        port: http
+        scheme: HTTP
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    imagePullPolicy: IfNotPresent
+  - name: envoy
+    image: envoyproxy/envoy:v1.31.0
+    command:
+    - /usr/local/bin/envoy
+    args:
+    - -c
+    - /etc/envoy/envoy.yaml
+    - --log-level
+    - warn
+    resources: {}
+    volumeMounts:
+    - name: envoy-config
+      mountPath: /etc/envoy
+      readOnly: true
+  volumes:
+  - name: config
+    configMap:
+      name: api
+      defaultMode: 420
+  - name: cache
+    emptyDir: {}
+  - name: envoy-config
+    configMap:
+      name: envoy
+  tolerations:
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 300
+  imagePullSecrets: []
+status:
+  phase: Running
+  hostIP: 10.0.3.17
+  podIP: 10.244.2.31
+  startTime: 2026-08-17T09:12:45Z
+  conditions:
+  - type: Initialized
+    status: "True"
+    lastTransitionTime: 2026-08-17T09:12:45Z
+  - type: Ready
+    status: "False"
+    reason: ContainersNotReady
+    message: "containers with unready status: [envoy]"
+    lastTransitionTime: 2026-08-17T09:13:02Z
+  containerStatuses:
+  - name: api
+    image: ghcr.io/example/api:1.20
+    imageID: ghcr.io/example/api@sha256:2f1a9c0b
+    containerID: containerd://9a8b7c6d
+    ready: true
+    restartCount: 0
+    started: true
+    state:
+      running:
+        startedAt: 2026-08-17T09:12:50Z
+  - name: envoy
+    image: envoyproxy/envoy:v1.31.0
+    ready: false
+    restartCount: 4
+    started: false
+    state:
+      waiting:
+        reason: CrashLoopBackOff
+        message: back-off 2m40s restarting failed container=envoy pod=api-7d4f9c6b8-x2ktp_payments(0d6b0f6a)
+    lastState:
+      terminated:
+        exitCode: 1
+        reason: Error
+        startedAt: 2026-08-17T09:12:50Z
+        finishedAt: 2026-08-17T09:12:51Z
+  qosClass: Burstable

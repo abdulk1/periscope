@@ -25,11 +25,18 @@ const LAST_APPLIED: &str = "kubectl.kubernetes.io/last-applied-configuration";
 /// What a masked secret value is replaced with.
 ///
 /// The length is kept: "this is a 40-character token" is useful, and it is not
-/// the secret.
-fn masked(value: &str) -> String {
-    // Secret values are base64; report the decoded size, which is what the user
-    // would have got.
-    let bytes = value.len() * 3 / 4;
+/// the secret. `base64` says which encoding the value arrived in, because the
+/// two fields a Secret carries do not agree on one.
+fn masked(value: &str, base64: bool) -> String {
+    // Report the decoded size, which is what the user would have got: four
+    // base64 characters carry three bytes, less one for every byte of padding.
+    // `stringData` is the plain text itself and needs none of that.
+    let bytes = if base64 {
+        let padding = value.chars().rev().take_while(|byte| *byte == '=').count();
+        (value.len() * 3 / 4).saturating_sub(padding)
+    } else {
+        value.len()
+    };
     format!("<hidden, {bytes} bytes>")
 }
 
@@ -79,26 +86,26 @@ pub async fn fetch(
     })
 }
 
-/// Renders any object as YAML, for the dry-run preview.
-pub fn to_yaml_public(object: &DynamicObject) -> Result<String, kube::Error> {
-    to_yaml(object, false)
-}
-
 /// Renders an object as YAML, with the noise removed.
 ///
 /// `managedFields` is usually longer than the object itself and is never what
 /// the reader wants; `last-applied-configuration` is a second copy of the
 /// object hidden in an annotation.
-fn to_yaml(object: &DynamicObject, mask: bool) -> Result<String, kube::Error> {
+///
+/// `mask` replaces the values under `data` and `stringData` with their sizes,
+/// and is what the detail view passes for an unrevealed Secret. Callers that
+/// are showing an object the user just asked to see in full — the dry-run
+/// preview — pass `false`.
+pub fn to_yaml(object: &DynamicObject, mask: bool) -> Result<String, kube::Error> {
     let mut value = serde_json::to_value(object).map_err(kube::Error::SerdeError)?;
 
     if mask {
         // A Secret's YAML is where its values would otherwise be printed in
         // full, which is exactly what "masked by default" has to prevent.
-        for field in ["data", "stringData"] {
+        for (field, base64) in [("data", true), ("stringData", false)] {
             if let Some(data) = value.get_mut(field).and_then(Value::as_object_mut) {
                 for entry in data.values_mut() {
-                    let hidden = entry.as_str().map(masked).unwrap_or_else(|| masked(""));
+                    let hidden = masked(entry.as_str().unwrap_or_default(), base64);
                     *entry = Value::String(hidden);
                 }
             }
@@ -106,16 +113,19 @@ fn to_yaml(object: &DynamicObject, mask: bool) -> Result<String, kube::Error> {
     }
 
     if let Some(metadata) = value.get_mut("metadata").and_then(Value::as_object_mut) {
+        // `shift_remove`, not `remove`: with `preserve_order` the latter fills
+        // the hole with whichever key happened to be last, so dropping the
+        // noise would shuffle everything the reader came to look at.
         for key in NOISY_METADATA {
-            metadata.remove(key);
+            metadata.shift_remove(key);
         }
         if let Some(annotations) = metadata
             .get_mut("annotations")
             .and_then(Value::as_object_mut)
         {
-            annotations.remove(LAST_APPLIED);
+            annotations.shift_remove(LAST_APPLIED);
             if annotations.is_empty() {
-                metadata.remove("annotations");
+                metadata.shift_remove("annotations");
             }
         }
     }
@@ -213,8 +223,10 @@ fn to_system_time(timestamp: k8s_openapi::jiff::Timestamp) -> std::time::SystemT
 ///
 /// Kubernetes objects are JSON-shaped — maps, arrays, strings, numbers, bools,
 /// null — so the general problem does not arise, and this avoids a dependency
-/// whose output we would have to post-process anyway. It quotes anything that
-/// could be misread as another type, which is the only part that is subtle.
+/// whose output we would have to post-process anyway. Two parts are subtle:
+/// quoting anything that could be misread as another type, and giving a block
+/// scalar a margin its own content cannot climb out of. `tests/golden/` pins
+/// both against real objects.
 mod yaml {
     use serde_json::Value;
 
@@ -233,7 +245,8 @@ mod yaml {
                     if index > 0 || indent > 0 {
                         pad(indent, out);
                     }
-                    out.push_str(&scalar(&Value::String(key.clone())));
+                    // A key is always one line, however the value is written.
+                    out.push_str(&plain_or_quoted(key));
                     out.push(':');
                     write_child(value, indent, out);
                 }
@@ -253,14 +266,14 @@ mod yaml {
                             out.push_str(nested.trim_start());
                         }
                         scalar_value => {
-                            out.push_str(&scalar(scalar_value));
+                            out.push_str(&scalar(scalar_value, indent + 1));
                             out.push('\n');
                         }
                     }
                 }
             }
             other => {
-                out.push_str(&scalar(other));
+                out.push_str(&scalar(other, indent));
                 out.push('\n');
             }
         }
@@ -282,7 +295,11 @@ mod yaml {
             }
             _ => {
                 out.push(' ');
-                write(value, 0, out);
+                // Empty collections and scalars finish the key's own line, but
+                // a block scalar's body still runs on below it — one level in
+                // from the key, which is why the depth is carried through
+                // rather than reset.
+                write(value, indent + 1, out);
             }
         }
     }
@@ -292,43 +309,119 @@ mod yaml {
     }
 
     /// Renders a scalar, quoting when leaving it bare would change its meaning.
-    fn scalar(value: &Value) -> String {
+    ///
+    /// `indent` is the depth the value's *body* would sit at, which only a
+    /// block scalar spends.
+    fn scalar(value: &Value, indent: usize) -> String {
         match value {
             Value::Null => "null".to_owned(),
             Value::Bool(flag) => flag.to_string(),
             Value::Number(number) => number.to_string(),
-            Value::String(text) => string(text),
+            Value::String(text) => block(text, indent).unwrap_or_else(|| plain_or_quoted(text)),
             _ => unreachable!("collections are written by `write`"),
         }
     }
 
-    fn string(text: &str) -> String {
-        if text.contains('\n') {
-            // Block scalars keep certificates and scripts readable.
-            let body: String = text
-                .lines()
-                .map(|line| format!("\n  {line}"))
-                .collect::<Vec<_>>()
-                .join("");
-            return format!("|-{body}");
+    /// A literal block scalar, when the text can survive being written as one.
+    ///
+    /// Block scalars keep certificates and scripts readable, but YAML infers
+    /// their margin from the first non-empty line: text whose first line is
+    /// empty or itself indented would be read back with the wrong one. Nor can
+    /// a block hold a carriage return or any other control character, since
+    /// the reader would take it for a line break or reject it outright. Those
+    /// go back as a quoted scalar, which is uglier and always correct.
+    fn block(text: &str, indent: usize) -> Option<String> {
+        // At the top of a document there is no margin to indent into.
+        if indent == 0 || !text.contains('\n') {
+            return None;
+        }
+        if text.starts_with(['\n', ' ', '\t'])
+            || text
+                .chars()
+                .any(|character| character != '\n' && character.is_control())
+        {
+            return None;
         }
 
-        let needs_quotes = text.is_empty()
+        // How the reader is told to treat the newlines the text ends with:
+        // strip them, keep the one that terminates the last line, or keep the
+        // lot. Without this a value ending in a newline would lose it.
+        let chomp = match text.strip_suffix('\n') {
+            None => "-",
+            Some(rest) if rest.ends_with('\n') => "+",
+            Some(_) => "",
+        };
+
+        // The newline that ends the final line is written by the caller, so it
+        // is not one of the lines here.
+        let mut rendered = format!("|{chomp}");
+        for line in text.strip_suffix('\n').unwrap_or(text).split('\n') {
+            rendered.push('\n');
+            if !line.is_empty() {
+                pad(indent, &mut rendered);
+                rendered.push_str(line);
+            }
+        }
+        Some(rendered)
+    }
+
+    /// A one-line scalar, quoted when leaving it bare would change its meaning.
+    fn plain_or_quoted(text: &str) -> String {
+        if needs_quotes(text) {
+            quoted(text)
+        } else {
+            text.to_owned()
+        }
+    }
+
+    /// Whether a plain scalar would be read back as something other than this
+    /// exact string.
+    fn needs_quotes(text: &str) -> bool {
+        text.is_empty()
             || text.parse::<f64>().is_ok()
             || matches!(
                 text.to_ascii_lowercase().as_str(),
                 "true" | "false" | "null" | "yes" | "no" | "on" | "off" | "~"
             )
-            || text.starts_with([' ', '"', '\'', '&', '*', '!', '|', '>', '%', '@', '`', '#'])
-            || text.ends_with(' ')
+            // A leading indicator makes the reader expect a collection, an
+            // alias, a tag or a comment instead of a string.
+            || text.starts_with([
+                ' ', '\t', '"', '\'', '&', '*', '!', '|', '>', '%', '@', '`', '#', '{', '}', '[',
+                ']', ',',
+            ])
+            // `-`, `?` and `:` only introduce something else when a space
+            // follows, or when they are the whole scalar.
+            || matches!(text, "-" | "?" | ":")
+            || text.starts_with("- ")
+            || text.starts_with("? ")
+            || text.starts_with(": ")
             || text.contains(": ")
-            || text.contains(" #");
+            // A trailing colon opens a mapping; trailing space is eaten.
+            || text.ends_with(':')
+            || text.ends_with([' ', '\t'])
+            || text.contains(" #")
+            || text.chars().any(char::is_control)
+    }
 
-        if needs_quotes {
-            format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
-        } else {
-            text.to_owned()
+    /// A double-quoted scalar, with the escapes YAML defines for it.
+    fn quoted(text: &str) -> String {
+        let mut out = String::with_capacity(text.len() + 2);
+        out.push('"');
+        for character in text.chars() {
+            match character {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                // Everything else `char::is_control` matches is below U+00A0,
+                // so two hex digits always suffice.
+                other if other.is_control() => out.push_str(&format!("\\x{:02x}", other as u32)),
+                other => out.push(other),
+            }
         }
+        out.push('"');
+        out
     }
 }
 
@@ -390,6 +483,110 @@ mod tests {
     fn multi_line_strings_become_block_scalars() {
         let rendered = yaml::render(&json!({ "ca.crt": "-----BEGIN\nMIIC\n-----END" }));
         assert_eq!(rendered, "ca.crt: |-\n  -----BEGIN\n  MIIC\n  -----END\n");
+    }
+
+    #[test]
+    fn a_block_scalar_is_indented_below_the_key_it_belongs_to() {
+        // Written at a fixed margin, a ConfigMap's script would sit level with
+        // its own key and the document would no longer parse at all.
+        let rendered = yaml::render(&json!({ "data": { "run.sh": "set -e\necho hi" } }));
+        assert_eq!(rendered, "data:\n  run.sh: |-\n    set -e\n    echo hi\n");
+        assert_eq!(
+            parsed(&rendered)["data"]["run.sh"],
+            json!("set -e\necho hi")
+        );
+    }
+
+    #[test]
+    fn a_block_scalar_inside_a_list_clears_the_dash() {
+        let rendered = yaml::render(&json!({ "command": ["set -e\necho hi"] }));
+        assert_eq!(rendered, "command:\n- |-\n  set -e\n  echo hi\n");
+        assert_eq!(parsed(&rendered)["command"][0], json!("set -e\necho hi"));
+    }
+
+    #[test]
+    fn a_value_that_ends_in_a_newline_keeps_it() {
+        // `|-` would silently drop it, so a file read out of a ConfigMap would
+        // come back one byte shorter than it went in.
+        let one = yaml::render(&json!({ "data": { "a": "hello\n" } }));
+        assert_eq!(one, "data:\n  a: |\n    hello\n");
+        assert_eq!(parsed(&one)["data"]["a"], json!("hello\n"));
+
+        let several = yaml::render(&json!({ "data": { "a": "hello\n\n" } }));
+        assert_eq!(several, "data:\n  a: |+\n    hello\n\n");
+        assert_eq!(parsed(&several)["data"]["a"], json!("hello\n\n"));
+    }
+
+    #[test]
+    fn text_no_block_scalar_can_hold_is_quoted_and_escaped() {
+        // A block infers its margin from the first line, so one that is itself
+        // indented cannot be written as a block at all; nor can a carriage
+        // return, which the reader would take for a line break.
+        let indented = yaml::render(&json!({ "data": { "a": "  first\nsecond" } }));
+        assert_eq!(indented, "data:\n  a: \"  first\\nsecond\"\n");
+        assert_eq!(parsed(&indented)["data"]["a"], json!("  first\nsecond"));
+
+        let carriage = yaml::render(&json!({ "data": { "a": "one\r\ntwo" } }));
+        assert_eq!(parsed(&carriage)["data"]["a"], json!("one\r\ntwo"));
+    }
+
+    #[test]
+    fn strings_that_would_open_something_else_are_quoted() {
+        let rendered = yaml::render(&json!({
+            "trailing": "note:",
+            "flow": "[1, 2]",
+            "dash": "- item",
+            "tab": "\tindented",
+            "alone": "-"
+        }));
+
+        assert!(rendered.contains("trailing: \"note:\""), "{rendered}");
+        assert!(rendered.contains("flow: \"[1, 2]\""), "{rendered}");
+        assert!(rendered.contains("dash: \"- item\""), "{rendered}");
+        assert!(rendered.contains("tab: \"\\tindented\""), "{rendered}");
+        assert!(rendered.contains("alone: \"-\""), "{rendered}");
+        assert_eq!(parsed(&rendered)["flow"], json!("[1, 2]"));
+        assert_eq!(parsed(&rendered)["dash"], json!("- item"));
+    }
+
+    #[test]
+    fn a_masked_secret_reports_the_size_the_user_would_have_got() {
+        // `hunter2` is seven bytes; its base64 is twelve characters, two of
+        // them padding. `stringData` is not base64 at all.
+        assert_eq!(masked("aHVudGVyMg==", true), "<hidden, 7 bytes>");
+        assert_eq!(masked("hunter2", false), "<hidden, 7 bytes>");
+    }
+
+    #[test]
+    fn dropping_the_noisy_metadata_leaves_the_rest_in_order() {
+        // `serde_json::Map::remove` fills the hole with the last entry, which
+        // would shuffle the annotations every time one was dropped.
+        let object = object(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "api-0",
+                "annotations": {
+                    "a": "1",
+                    "kubectl.kubernetes.io/last-applied-configuration": "{}",
+                    "y": "2",
+                    "z": "3"
+                }
+            }
+        }));
+
+        let rendered = to_yaml(&object, false).expect("renders");
+        let annotations = rendered
+            .lines()
+            .filter_map(|line| line.trim().split(':').next())
+            .filter(|key| matches!(*key, "a" | "y" | "z"))
+            .collect::<Vec<_>>();
+        assert_eq!(annotations, ["a", "y", "z"]);
+    }
+
+    /// Reads a rendering back, which is the only proof it was ever YAML.
+    fn parsed(rendered: &str) -> Value {
+        crate::yaml::parse(rendered).unwrap_or_else(|error| panic!("{error}\n{rendered}"))
     }
 
     #[test]

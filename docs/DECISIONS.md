@@ -518,6 +518,21 @@ reader has to scroll past.
 If a case turns up that this cannot render, the fallback is a maintained crate
 plus a post-processing pass — but that is a worse trade than it looks.
 
+**Update, 2026-08-18:** golden files in `crates/cluster/tests/golden/` now pin
+the output for a Pod, a Deployment, two ConfigMaps, a Secret both masked and
+revealed, an Ingress full of hostile annotations and a custom resource; every
+rendering is also read back with a real parser and compared with the object it
+came from. Writing them found three ways this was wrong, each fixed rather than
+recorded: a block scalar's body was written at a fixed two-column margin, so
+every multi-line value below the top level — every ConfigMap holding a config
+file — produced YAML that did not parse at all; a value ending in a newline
+lost it; and dropping the noisy metadata used `Map::remove`, which under
+`preserve_order` fills the hole with the last key and so shuffled the
+annotations of every object kubectl had ever touched. The writer is nearer 170
+lines for it. The decision stands, but its reasoning was too comfortable: what
+makes a hand-written writer tractable is not that the awkward cases are few, it
+is that they are enumerable — and they were not enumerated until now.
+
 ---
 
 ## ADR-0021 — Log lines are merged and batched before they cross the bridge
