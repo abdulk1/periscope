@@ -5,8 +5,7 @@ affordances: live resource streams, multi-cluster, and log tailing across pods.
 
 **Binary:** `scope` · **Language:** Rust · **UI:** GPUI
 
-> **Status: Phase 5 (actions), with one deliberate deviation — exec runs a
-> command, it is not a terminal.** Connects to kubeconfig contexts on
+> **Status: Phase 6 (ship it), in progress.** Connects to kubeconfig contexts on
 > demand, discovers every kind each serves — CRDs included — streams any of them
 > into a virtualised table, tails logs from one pod or from every pod matching a
 > label selector, and shows two clusters side by side. Clusters you have visited
@@ -19,6 +18,11 @@ affordances: live resource streams, multi-cluster, and log tailing across pods.
 > the cluster, passes two independent read-only gates, and is written to a local
 > audit log. Exec runs a command and streams its output; the spec asked for
 > terminal emulation and that is not built — see ADR-0033.
+>
+> Phase 6 so far: a `settings.toml` covering theme, access, limits, columns and
+> a fully remappable k9s-style keymap; a macOS `.app` and `.dmg`; Debian and RPM
+> packages; an opt-in update check. Not there yet: code signing (no Developer
+> ID), a Homebrew cask, an AppImage, Windows, and screenshots.
 > See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap and
 > [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not work.
 
