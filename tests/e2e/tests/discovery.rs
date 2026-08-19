@@ -116,6 +116,17 @@ fn a_custom_resource_lists_through_the_same_path_as_pods() {
         return;
     }
 
+    // The CRD is the fixture; the object is this test's, because an instance
+    // cannot be applied in the same pass that creates its type.
+    assert!(
+        periscope_e2e::kubectl_apply(
+            "apiVersion: example.com/v1\nkind: Widget\n\
+             metadata: { name: sprocket, namespace: default }\n\
+             spec: { size: 3 }\n"
+        ),
+        "could not create the widget this test lists"
+    );
+
     let widgets = KindId::new("example.com", "v1", "Widget", "widgets");
     let (_runtime, stream, cluster) = watching(widgets.clone(), TIMEOUT);
 

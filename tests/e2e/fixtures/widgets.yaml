@@ -5,6 +5,10 @@
 #
 # This lived only in the author's cluster until CI ran the suite for the first
 # time and could not find it.
+#
+# The CRD only. An instance of it cannot be applied in the same pass — the type
+# does not exist until this has been established — so the test that needs one
+# creates it.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -35,13 +39,3 @@ spec:
               properties:
                 phase:
                   type: string
----
-apiVersion: example.com/v1
-kind: Widget
-metadata:
-  name: sprocket
-  namespace: default
-spec:
-  size: 3
-status:
-  phase: Ready

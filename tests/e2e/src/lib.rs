@@ -231,6 +231,29 @@ pub fn require(present: bool, name: &str, instructions: &str) -> bool {
     false
 }
 
+/// Applies a manifest through `kubectl`, whatever kind it is.
+///
+/// [`apply_yaml`] is typed to Deployments; this is for the fixtures that are
+/// not, including instances of custom resources whose Rust type does not exist.
+pub fn kubectl_apply(manifest: &str) -> bool {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let Ok(mut child) = Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(manifest.as_bytes());
+    }
+    child.wait().is_ok_and(|status| status.success())
+}
+
 /// Whether the cluster serves a kind, by the label `kubectl` prints.
 pub fn serves_kind(label: &str) -> bool {
     let output = std::process::Command::new("kubectl")
