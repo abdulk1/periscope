@@ -56,7 +56,7 @@ clap.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
-periscope-bridge.workspace = true
+periscope-bridge = { workspace = true, features = ["pump"] }
 periscope-cluster.workspace = true
 periscope-config.workspace = true
 periscope-store.workspace = true

@@ -1326,3 +1326,44 @@ The same rule explains why `pods/exec`'s Run button now renders disabled rather
 than vanishing: running a command is a `create` on `pods/exec`, which surprises
 people, and the disabled button is the only place that fact ever surfaces.
 
+## ADR-0044 — The GPUI event pump is a feature, not a fact of the bridge
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+`periscope-bridge` is the message vocabulary plus the tokio runtime host plus
+the GPUI event pump. The first two have nothing to do with GPUI; the third is
+one file. Because the dependency was unconditional, every crate that wanted a
+`ClusterEvent` also built GPUI — including `store`, `cluster`, and the
+end-to-end suite, none of which open a window.
+
+The cost was concentrated in CI. The `kind` job spent **225s installing a dozen
+graphics `-dev` packages** for a build that draws nothing, and **11m58s
+compiling** — 2m35s for the seeding binary and 9m23s for the eleven integration
+test binaries, each of which links the whole graph under `lto = "thin"` and
+`codegen-units = 1`. Actually running the tests took under a minute of that.
+
+`link.rs` is now behind a `pump` feature. The workspace dependency declares
+`default-features = false`, because a member cannot turn a workspace default
+off, and `ui` and `scope` ask for `pump` by name. The end-to-end dependency
+graph went from **1,738 crates to 592**, GPUI is not in it, and on Linux it now
+links no system library at all — so the apt step is gone.
+
+Measured: a completely cold `cargo test --release -p periscope-e2e --no-run`
+takes **308s** on the author's machine. The CI figure it replaces is 11m58s of
+compiling *with the dependency cache already warm*. Different machines, so the
+numbers are not directly comparable and CI is the real verdict — but the
+direction is not in doubt.
+
+One trap, recorded because it is invisible: `cargo test -p periscope-bridge`
+builds the package directly and therefore uses the package's own
+`default = ["pump"]`, so the pump's tests still run. They also run under
+`cargo test --workspace`, because `ui` and `scope` are in it and features unify.
+The tests do not silently disappear — but a future crate that depends on the
+bridge without `pump` and expects `spawn_event_pump` will get a confusing
+"no function" error rather than a missing-feature one. That is the price.
+
+The job was also reordered: fixtures are applied before anything is compiled and
+waited for afterwards, so cert-manager, Argo CD and three workload deployments
+pull their images while cargo works instead of after it. That was another 200s
+of a runner watching `kubectl wait`.

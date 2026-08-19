@@ -13,7 +13,11 @@ authors = ["Periscope contributors"]
 
 [workspace.dependencies]
 # Internal crates.
-periscope-bridge = { path = "crates/bridge", version = "0.1.0" }
+# `default-features = false` leaves out the GPUI event pump, because a member
+# cannot turn a workspace default off. Only `ui` and `scope` draw anything, and
+# they ask for `pump` explicitly; everything else — and the end-to-end suite —
+# builds without GPUI at all.
+periscope-bridge = { path = "crates/bridge", version = "0.1.0", default-features = false }
 periscope-cluster = { path = "crates/cluster", version = "0.1.0" }
 periscope-config = { path = "crates/config", version = "0.1.0" }
 periscope-store = { path = "crates/store", version = "0.1.0" }

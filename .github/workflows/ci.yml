@@ -72,23 +72,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The e2e crate needs no display, but it does link the same graphics
-      # dependencies through the workspace.
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libasound2-dev \
-            libfontconfig-dev \
-            libwayland-dev \
-            libxkbcommon-x11-dev \
-            libssl-dev \
-            libzstd-dev \
-            libvulkan-dev \
-            libgl1-mesa-dev \
-            libxcb-composite0-dev \
-            pkg-config
-
+      # No apt step. The e2e crate opens no window, and since `periscope-bridge`
+      # made the GPUI event pump an optional feature it no longer drags GPUI in
+      # through the workspace either — so nothing here links a system library.
+      # Installing the graphics -dev packages for it cost 225s a run.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -97,35 +84,49 @@ jobs:
         with:
           cluster_name: periscope
 
-      - name: Seed the load fixture
-        run: |
-          cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000
-          cargo run --release -p periscope-e2e --bin seed-pods -- --large-config-map
-
+      # Applied before anything is compiled and waited for afterwards, so the
+      # image pulls happen while cargo works. Waiting for them synchronously
+      # here cost 200s of a runner doing nothing.
+      #
       # The CRD tests exist to prove a cluster full of custom resources renders
       # like any other, so CI has to be one. cert-manager and Argo CD are the
       # two the suite names; `widgets` is our own, so the basic CRD path does
       # not depend on anyone else's release cadence.
-      - name: Install the custom resources
+      #
+      # Without the workloads, the log, port-forward and exec suites skip
+      # themselves and CI passes with fifteen tests silently absent. `firehose`
+      # is deliberately left out: it saturates the CPU by design, and this
+      # runner has two cores to share with every timing-sensitive test.
+      - name: Start the fixtures pulling
         run: |
           kubectl apply -f tests/e2e/fixtures/widgets.yaml
           kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
           kubectl create namespace argocd
           kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.13.2/manifests/install.yaml
+          kubectl apply -f tests/e2e/fixtures/chatty.yaml
+          kubectl apply -f tests/e2e/fixtures/webby.yaml
+          kubectl apply -f tests/e2e/fixtures/sidecars.yaml
+
+      # Both binaries are built here rather than on demand, so that the compile
+      # and the image pulls above overlap instead of queueing.
+      - name: Build the suite
+        run: |
+          cargo build --release -p periscope-e2e --bin seed-pods
+          cargo test --release -p periscope-e2e --no-run
+
+      - name: Seed the load fixture
+        run: |
+          cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000
+          cargo run --release -p periscope-e2e --bin seed-pods -- --large-config-map
+
+      # By now these have almost always finished pulling; the timeout is for the
+      # times they have not.
+      - name: Wait for the fixtures
+        run: |
           kubectl wait --for=condition=Established --timeout=300s \
             crd/certificates.cert-manager.io \
             crd/applications.argoproj.io \
             crd/widgets.example.com
-
-      # Without these, the log, port-forward and exec suites skip themselves and
-      # CI passes with fifteen tests silently absent. `firehose` is deliberately
-      # left out here: it saturates the CPU by design, and this runner has two
-      # cores to share with every timing-sensitive test in the suite.
-      - name: Install the workload fixtures
-        run: |
-          kubectl apply -f tests/e2e/fixtures/chatty.yaml
-          kubectl apply -f tests/e2e/fixtures/webby.yaml
-          kubectl apply -f tests/e2e/fixtures/sidecars.yaml
           kubectl wait --for=condition=Available --timeout=300s \
             deployment/chatty deployment/webby deployment/sidecars
 

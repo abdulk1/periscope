@@ -21,8 +21,11 @@ affordances: live resource streams, multi-cluster, and log tailing across pods.
 >
 > Phase 6 so far: a `settings.toml` covering theme, access, limits, columns and
 > a fully remappable k9s-style keymap; a macOS `.app` and `.dmg`; Debian and RPM
-> packages; an opt-in update check. Not there yet: code signing (no Developer
-> ID), a Homebrew cask, an AppImage, Windows, and screenshots.
+> packages; an opt-in update check. The security invariants are now held by code
+> rather than by discipline — see **Security posture** — and the end-to-end
+> suite runs against a real `kind` cluster on every push. Not there yet: code
+> signing (no Developer ID), a Homebrew cask, an AppImage, Windows, and
+> screenshots.
 > See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap and
 > [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not work.
 
@@ -92,12 +95,13 @@ crates/
 ├── ui/        GPUI views and components          (main thread only)
 ├── store/     state, indexes, filtering          (no GPUI, no kube)
 ├── cluster/   kube clients, watchers, logs       (tokio only)
-├── bridge/    tokio <-> GPUI plumbing
+├── bridge/    tokio <-> GPUI plumbing (the pump is an optional feature)
 └── config/    paths, settings, themes, logging   (no GPUI, no kube)
 ```
 
 The dependency edges are the architecture: `store`, `cluster` and `config` cannot
-reach GPUI, and `ui` cannot reach Kubernetes. Everything crossing between them
+reach GPUI — the one file in `bridge` that does is behind a feature only `ui` and
+`scope` enable — and `ui` cannot reach Kubernetes. Everything crossing between them
 goes through `bridge` as a bounded, coalesced message stream.
 
 ## Development
@@ -110,6 +114,25 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
 ```
 
+Anything touching a credential, a log line or a file on disk also has to leave
+these green. They are not installed by default:
+
+```sh
+cargo install cargo-audit cargo-deny --locked
+cargo test -p periscope-guardrails   # the invariants no type can express
+cargo audit                          # RUSTSEC advisories against Cargo.lock
+cargo deny check                     # licences, unmaintained crates, duplicates
+```
+
+The runners have no kubeconfig, no cluster and no keychain, so anything that
+reaches for one passes here and fails there. Prove it before pushing:
+
+```sh
+mkdir -p /tmp/no-kubeconfig-home
+env -u KUBECONFIG HOME=/tmp/no-kubeconfig-home \
+    CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup cargo test --workspace
+```
+
 The YAML the detail pane shows is pinned by golden files in
 `crates/cluster/tests/golden/`: a JSON object, and the exact text it must render
 as. After a deliberate change to the writer, rewrite them and read the diff —
@@ -120,13 +143,18 @@ it.
 PERISCOPE_UPDATE_GOLDEN=1 cargo test -p periscope-cluster --test golden
 ```
 
-The end-to-end suite needs a real cluster and is skipped unless asked for:
+The end-to-end suite needs a real cluster, so `cargo test` skips it:
 
 ```sh
 kind create cluster --name periscope
 cargo test -p periscope-e2e -- --ignored --test-threads 1
 cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fixture
 ```
+
+CI runs it on every push against a `kind` cluster seeded with 10,000 pods,
+cert-manager, Argo CD and our own `widgets` CRD, with
+`PERISCOPE_E2E_REQUIRE_FIXTURES=1` so that a missing fixture fails the build
+instead of silently skipping fifteen tests.
 
 ### Documentation
 
@@ -138,6 +166,7 @@ cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fi
 | [`docs/TESTING.md`](docs/TESTING.md) | The six kinds of test, and which one you need |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Why things are the way they are. Append, never rewrite |
 | [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | What does not work, measured and unhidden |
+| [`docs/COMPETITORS.md`](docs/COMPETITORS.md) | What the rest of the field does, what its users complain about, and which of this project's bets that evidence does *not* support |
 
 To look at what you changed, on macOS:
 
@@ -177,7 +206,10 @@ ages, and a CRD that declares nothing falls back to STATUS and READY.
 
 Click a column heading to sort by it, again to reverse, and a third time to put
 the natural order back — numbers sort as numbers, so RESTARTS does not put 10
-before 2.
+before 2. The natural order is namespace then name, which is what the table
+already holds and therefore the one order that costs nothing; NAME sorts by
+name, with the namespace only as the tie-break, because two objects in different
+namespaces routinely share a name.
 
 Moving through a table is `j`/`k` or the arrows, `ctrl-d`/`ctrl-u` for half a
 screen, `g`/`G` for the ends, and `enter` to open what you are on. Half a screen
@@ -262,7 +294,23 @@ writable = ["kind-local"]
 Those names are refused twice: once by the store, before anything is sent, and
 again by the cluster layer, immediately before the request. Every attempt —
 applied, dry-run, refused or failed — is appended to `audit.log` beside the
-application logs.
+application logs. Port-forwarding and running a command are refused by the same
+two gates, because both are `create` verbs: a tunnel to a production database is
+a change to production.
+
+On a read-only cluster the buttons are still **there**, disabled, each saying
+why: *"`prod` is read-only. Change `[access]` in `settings.toml` to allow
+writes."* They used to disappear, which was worse — an absent button is
+indistinguishable from a button this program does not have, so the rule
+protecting you became invisible at exactly the moment it applied. Disabling the
+control is a courtesy to the reader and nothing more; the two gates are
+untouched, and the keyboard and the palette still reach them (ADR-0043).
+
+A kind you are not allowed to list says so too. A `403` is about the request,
+not the credential, so it stops that one kind and leaves the rest of the cluster
+streaming — and the table reads *"Not allowed to list secrets here"* rather than
+"No secrets here.", which is a reassuring sentence and, for that user, a false
+one (ADR-0040).
 
 ## Settings
 
@@ -388,15 +436,42 @@ with the command line as its detail.
 
 ## Security posture
 
-No credentials are ever written to disk. No telemetry, no phone-home, no crash
-reporting. The only network calls are to the clusters you configure — plus, if
-you switch it on, one request to the update endpoint at startup.
+No credentials are ever written to disk. No account, no activation, no login.
+No telemetry, no phone-home, no crash reporting. The only network calls are to
+the clusters you configure — plus, if you switch it on, one request to the
+update endpoint at startup.
 
 That check is off by default. When enabled it makes a single HTTPS GET, sends
 nothing but a `periscope/<version>` User-Agent, downloads nothing, installs
 nothing, and shows one line with a link if there is something newer. The
-endpoint must be `https`, and a redirect off it is refused.
+endpoint must be `https`, a redirect off it is refused, and the answer is read
+in bounded chunks so a misconfigured endpoint cannot stream until the process
+dies.
+
+**Everything this program writes down is redacted and owner-only.** Log lines,
+audit entries and exported buffers outlive the session and get attached to bug
+reports, so hostnames and anything token-shaped are stripped on the way to disk
+— including a failed credential plugin's own output, which is where a live
+bearer token hides — while what is on screen keeps the apiserver's exact words,
+because the person at the keyboard already holds the credentials. Files are
+`0600` and directories `0700`. Panics are logged, redacted, and still printed in
+full to stderr, because a panic on a background task otherwise takes a watch
+down in silence.
+
+Four of these invariants were held by everybody remembering, and a review found
+two of them already broken. They are held by code now: `tests/guardrails` reads
+the shipped source and fails the build when a shape that has already leaked
+reappears — a `tracing::` call carrying a cluster URL or a token, an audit entry
+written without the redactor, a file written without being restricted. Each test
+names the incident it exists for. CI runs it beside `cargo audit`, `cargo deny`
+and `gitleaks`.
 
 Secrets are masked: the table shows how many keys a Secret has and never a
 value, and its YAML shows `<hidden, N bytes>` until you press **Reveal values**,
-which re-fetches it. Closing the pane masks it again.
+which re-fetches it. Closing the pane masks it again. While it is masked,
+**Apply** and **Dry run** are disabled rather than hidden, saying why — applying
+a masked Secret would send the mask.
+
+`docs/COMPETITORS.md` is blunt about which of these the evidence supports. The
+absence of an account is the best-supported decision in this project; masking by
+default is the one the market argues with.

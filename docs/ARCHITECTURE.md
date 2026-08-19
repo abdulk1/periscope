@@ -39,6 +39,11 @@ executors. Rather than reconcile them, `ClusterRuntime` builds a multi-threaded
 tokio runtime on a dedicated `std::thread` and holds it for the process
 lifetime. The two worlds meet only at `flume` channels.
 
+Only one file in the crate touches GPUI — `link.rs`, the event pump — and it
+sits behind the `pump` feature. `ui` and `scope` ask for it; `store`, `cluster`
+and the end-to-end suite do not, and so build without GPUI at all. See
+ADR-0044.
+
 Three properties matter:
 
 - **Events are coalesced by key.** A 10,000-object resync must not become 10,000

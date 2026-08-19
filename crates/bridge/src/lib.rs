@@ -28,6 +28,7 @@ pub mod coalesce;
 pub mod exec;
 pub mod format;
 pub mod forward;
+#[cfg(feature = "pump")]
 pub mod link;
 pub mod logs;
 pub mod mutation;
@@ -42,6 +43,7 @@ pub use channel::{
 pub use coalesce::{CoalesceKey, Coalescer};
 pub use exec::{ExecStatus, ExecTarget};
 pub use forward::{ForwardId, ForwardInfo, ForwardState, ForwardTarget};
+#[cfg(feature = "pump")]
 pub use link::{
     DEFAULT_FLUSH_INTERVAL, DEFAULT_MAX_BATCH, FlushStats, PumpConfig, spawn_event_pump,
 };

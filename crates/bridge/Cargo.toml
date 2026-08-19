@@ -8,10 +8,21 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# The event pump, which is the only part of this crate that touches GPUI.
+#
+# On by default, so `ui` and `scope` get it without asking. Everything else —
+# `store`, `cluster`, and the end-to-end suite — wants the message vocabulary
+# and the tokio runtime host and has no use for a GPUI executor, and building
+# GPUI for them costs minutes of link time and, on Linux, a dozen -dev packages
+# for a window nobody opens.
+default = ["pump"]
+pump = ["dep:gpui"]
+
 [dependencies]
 flume.workspace = true
 futures.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
