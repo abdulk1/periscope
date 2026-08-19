@@ -531,6 +531,17 @@ pub struct Workspace {
     /// Rows that changed recently, refreshed once per frame rather than looked
     /// up per row: the table is virtualised but the map is one allocation.
     changed: Arc<std::collections::BTreeMap<ResourceKey, Instant>>,
+    /// The namespaces the focused table's rows live in, refreshed once per
+    /// frame for the same reason `changed` is: the toolbar wants a count and
+    /// the menu wants the list, and neither should walk the rows to get one.
+    namespaces: Arc<[Arc<str>]>,
+    /// The visible log and command lines, taken once per frame.
+    ///
+    /// Both lists are virtualised, but the view indexes into the whole of
+    /// each, and a hundred thousand `Arc` clones per frame is what asking the
+    /// buffer for them each time used to cost.
+    log_lines: Arc<[Arc<periscope_bridge::LogLine>]>,
+    exec_lines: Arc<[Arc<periscope_bridge::LogLine>]>,
     /// Where refusals are written.
     ///
     /// The cluster layer records everything it is asked to do, but a refusal by
@@ -753,6 +764,9 @@ impl Workspace {
             log_capacity: periscope_store::logs::DEFAULT_CAPACITY,
             columns: periscope_store::Layout::default(),
             changed: Arc::default(),
+            namespaces: Arc::from([] as [Arc<str>; 0]),
+            log_lines: Arc::from([] as [Arc<periscope_bridge::LogLine>; 0]),
+            exec_lines: Arc::from([] as [Arc<periscope_bridge::LogLine>; 0]),
             audit: None,
             exports: 0,
             frames: FrameMeter::new(perf),
@@ -952,6 +966,12 @@ impl Workspace {
     /// The state being rendered.
     pub fn state(&self) -> &AppState {
         &self.state
+    }
+
+    /// The state being rendered, for the few reads that memoise as they go.
+    #[cfg(test)]
+    fn state_mut(&mut self) -> &mut AppState {
+        &mut self.state
     }
 
     /// Whether the palette is open.
@@ -2532,7 +2552,7 @@ impl Workspace {
     /// Namespace, selector and text filters.
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (total, shown) = self.state.counts();
-        let namespaces = self.state.namespaces().len();
+        let namespaces = self.namespaces.len();
 
         h_flex()
             .w_full()
@@ -3039,7 +3059,7 @@ impl Workspace {
                 (!notes.is_empty()).then(|| (notes.join(" · "), false))
             });
 
-        let lines = buffer.visible_lines();
+        let lines = Arc::clone(&self.log_lines);
         let body = if lines.is_empty() {
             let message = if !buffer.is_empty() {
                 "Nothing matches the current filter.".to_owned()
@@ -3053,7 +3073,6 @@ impl Workspace {
             logview::wrapped(&lines[window], show_source, &self.log_wrap_scroll, cx)
                 .into_any_element()
         } else {
-            let lines = Arc::<[Arc<periscope_bridge::LogLine>]>::from(lines);
             logview::body(lines, show_source, self.log_scroll.clone()).into_any_element()
         };
 
@@ -3202,7 +3221,7 @@ impl Workspace {
                     .map(|said| (said.to_string(), false))
             });
 
-        let lines = Arc::<[Arc<periscope_bridge::LogLine>]>::from(buffer.visible_lines());
+        let lines = Arc::clone(&self.exec_lines);
         let body = if lines.is_empty() {
             let message = if !buffer.is_empty() {
                 "Nothing matches the current filter.".to_owned()
@@ -3996,9 +4015,9 @@ impl Workspace {
                 .into_any_element(),
         );
 
-        for namespace in self.state.namespaces() {
-            let selected = current.as_deref() == Some(&*namespace);
-            let picked = Arc::clone(&namespace);
+        for namespace in self.namespaces.iter() {
+            let selected = current.as_deref() == Some(&**namespace);
+            let picked = Arc::clone(namespace);
 
             entries.push(
                 div()
@@ -4230,12 +4249,33 @@ impl Render for Workspace {
             tracing::info!(cold_start_ms = elapsed.as_millis() as u64, "first paint");
         }
 
+        // First thing in the frame, because everything below it — pruning the
+        // changed set, reparsing a newly-opened object's YAML, moving the log
+        // scroll — is work this frame does and used to be measured as free.
+        let frame = self.frames.start(Instant::now());
+        if frame.is_some() {
+            // Keep frames coming, so there is a continuous series to measure.
+            // Nothing else in the app redraws when nothing has changed.
+            window.request_animation_frame();
+        }
+
         // Which rows changed lately, read once for the frame. Reading it also
         // prunes it, which is why it happens here rather than per row.
         let focus = self.state.focus();
         self.changed = self
             .state
             .changed_recently(focus, Instant::now(), crate::style::FLASH);
+        self.namespaces = self.state.namespaces();
+        self.log_lines = self
+            .state
+            .logs_mut()
+            .map(|session| session.buffer.visible_lines())
+            .unwrap_or_else(|| Arc::from([] as [Arc<periscope_bridge::LogLine>; 0]));
+        self.exec_lines = self
+            .state
+            .exec_mut()
+            .map(|session| session.buffer.visible_lines())
+            .unwrap_or_else(|| Arc::from([] as [Arc<periscope_bridge::LogLine>; 0]));
 
         // The YAML editor is a separate entity that needs a `Window` to be
         // written to, which the event pump does not have; render time is where
@@ -4282,13 +4322,6 @@ impl Render for Workspace {
             self.log_visible = visible;
         } else if self.log_visible != 0 {
             self.log_visible = 0;
-        }
-
-        let frame = self.frames.start(Instant::now());
-        if frame.is_some() {
-            // Keep frames coming, so there is a continuous series to measure.
-            // Nothing else in the app redraws when nothing has changed.
-            window.request_animation_frame();
         }
 
         // The newest line of command output stays on screen the same way a
@@ -4925,10 +4958,9 @@ mod tests {
                 .iter()
                 .map(|row| row.key.name.to_string())
                 .collect();
-            // Rows already arrive sorted by name, so clicking NAME reverses
-            // rather than doing nothing — which is what every table does.
-            assert_eq!(names, ["c-api", "b-api", "a-api"]);
-            assert!(workspace.state().sort().descending);
+            // A column that was not being sorted by starts ascending.
+            assert_eq!(names, ["a-api", "b-api", "c-api"]);
+            assert!(!workspace.state().sort().descending);
         });
 
         harness.update(cx, |workspace, _window, cx| {
@@ -4941,7 +4973,16 @@ mod tests {
                 .iter()
                 .map(|row| row.key.name.to_string())
                 .collect();
-            assert_eq!(names, ["a-api", "b-api", "c-api"]);
+            // The same column again reverses it.
+            assert_eq!(names, ["c-api", "b-api", "a-api"]);
+            assert!(workspace.state().sort().descending);
+        });
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.sort_by(0, SortKey::Name, cx);
+        });
+        harness.read(cx, |workspace| {
+            // And a third click is the way back out to the default order.
             assert_eq!(
                 workspace.state().sort(),
                 periscope_store::app::Sort::default()
@@ -5024,9 +5065,9 @@ mod tests {
         );
         drain(&rx);
 
-        harness.read(cx, |workspace| {
+        harness.update(cx, |workspace, _window, _cx| {
             let namespaces: Vec<String> = workspace
-                .state()
+                .state_mut()
                 .namespaces()
                 .iter()
                 .map(ToString::to_string)

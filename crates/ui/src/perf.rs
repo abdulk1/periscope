@@ -39,7 +39,10 @@ pub struct FrameStats {
     pub p95: Duration,
     /// Worst interval.
     pub max: Duration,
-    /// Median time spent building the element tree.
+    /// Median time spent inside `render` — every frame's own work, from the
+    /// first statement to the finished element tree. It excludes GPUI's layout
+    /// and paint, which happen after `render` returns, so a healthy `build_p50`
+    /// beside a bad `p50` means the cost is not in this crate.
     pub build_p50: Duration,
     /// Intervals longer than the 60fps budget of 16.67ms.
     ///

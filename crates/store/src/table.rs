@@ -29,6 +29,15 @@ pub struct ResourceTable {
     snapshot: Arc<BTreeMap<ResourceKey, Instant>>,
     /// Whether `snapshot` is behind `changed`.
     restale: bool,
+    /// The namespaces the rows live in, shared with the view.
+    ///
+    /// Rebuilt only when the set of keys moves. The toolbar asks for this once
+    /// a frame — to render a count — and walking ten thousand keys sixty times
+    /// a second to learn that there are still four namespaces is the sort of
+    /// cost that only shows up on somebody else's cluster.
+    namespaces: Arc<[Arc<str>]>,
+    /// Whether `namespaces` is behind `rows`.
+    rekeyed: bool,
     /// Why this kind cannot be listed, if it cannot.
     ///
     /// An RBAC refusal and an empty namespace look identical in a table of no
@@ -67,6 +76,7 @@ impl ResourceTable {
         self.rows.clear();
         self.changed.clear();
         self.restale = true;
+        self.rekeyed = true;
         self.unavailable = Some(reason);
         true
     }
@@ -103,6 +113,7 @@ impl ResourceTable {
         // happened is that the watch reconnected.
         self.changed.clear();
         self.restale = true;
+        self.rekeyed = true;
         true
     }
 
@@ -120,7 +131,9 @@ impl ResourceTable {
             _ => {
                 self.changed.insert(row.key.clone(), now);
                 self.restale = true;
-                self.rows.insert(row.key.clone(), row);
+                // Only a key that was not there can add a namespace; an update
+                // to a row already held cannot.
+                self.rekeyed |= self.rows.insert(row.key.clone(), row).is_none();
                 true
             }
         }
@@ -150,7 +163,9 @@ impl ResourceTable {
 
     /// Removes a row, reporting whether it was there.
     pub fn remove(&mut self, key: &ResourceKey) -> bool {
-        self.rows.remove(key).is_some()
+        let removed = self.rows.remove(key).is_some();
+        self.rekeyed |= removed;
+        removed
     }
 
     /// Rows in table order: namespace, then name.
@@ -174,14 +189,21 @@ impl ResourceTable {
     }
 
     /// The namespaces these rows live in, in order and without duplicates.
-    pub fn namespaces(&self) -> Vec<Arc<str>> {
-        let mut seen: Vec<Arc<str>> = Vec::new();
-        for key in self.rows.keys() {
-            if key.is_namespaced() && seen.last() != Some(&key.namespace) {
-                seen.push(Arc::clone(&key.namespace));
+    ///
+    /// Takes `&mut self` because it memoises: the answer changes only when a
+    /// key is added or removed, and the caller is a render pass.
+    pub fn namespaces(&mut self) -> Arc<[Arc<str>]> {
+        if self.rekeyed {
+            let mut seen: Vec<Arc<str>> = Vec::new();
+            for key in self.rows.keys() {
+                if key.is_namespaced() && seen.last() != Some(&key.namespace) {
+                    seen.push(Arc::clone(&key.namespace));
+                }
             }
+            self.namespaces = Arc::from(seen);
+            self.rekeyed = false;
         }
-        seen
+        Arc::clone(&self.namespaces)
     }
 }
 
@@ -368,6 +390,34 @@ mod tests {
         assert!(table.remove(&ResourceKey::new("default", "api")));
         assert!(!table.remove(&ResourceKey::new("default", "api")));
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn the_namespace_list_follows_the_keys_and_not_the_rows() {
+        // The toolbar asks for this once a frame to render a count. Walking
+        // every key to answer it was fine on a laptop cluster and not fine on
+        // one with ten thousand pods, so the answer is cached — and a cache
+        // that misses a namespace appearing is worse than the walk.
+        let mut table = ResourceTable::new();
+        table.apply(Arc::new(row("default", "api", "Running")));
+        assert_eq!(&*table.namespaces(), [Arc::from("default")]);
+
+        // An update to a row already held cannot change the set.
+        let before = table.namespaces();
+        table.apply(Arc::new(row("default", "api", "CrashLoopBackOff")));
+        assert!(Arc::ptr_eq(&before, &table.namespaces()));
+
+        // A new key can, and does.
+        table.apply(Arc::new(row("kube-system", "coredns", "Running")));
+        assert_eq!(table.namespaces().len(), 2);
+
+        // So can the last row in a namespace going away.
+        table.remove(&ResourceKey::new("kube-system", "coredns"));
+        assert_eq!(&*table.namespaces(), [Arc::from("default")]);
+
+        // And a refusal, which empties the table outright.
+        table.refuse("forbidden");
+        assert!(table.namespaces().is_empty());
     }
 
     #[test]

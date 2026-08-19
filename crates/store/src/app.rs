@@ -172,10 +172,14 @@ impl Filters {
 /// time, and only the kind-specific columns are cells.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SortKey {
-    /// Namespace, then name.
-    Namespace,
-    /// Name. The order rows arrive in, and the one to return to.
+    /// Namespace, then name. The order rows arrive in, and the one to return
+    /// to: a `BTreeMap` keyed by `ResourceKey` is already in it, so this is the
+    /// one order that costs nothing.
     #[default]
+    Namespace,
+    /// Name, then namespace. Two objects in different namespaces routinely have
+    /// the same name, and which of them comes first should not depend on where
+    /// the watch happened to put them.
     Name,
     /// Age, youngest or oldest first.
     Age,
@@ -196,8 +200,8 @@ impl Sort {
     /// The order a click on a column produces.
     ///
     /// A new column starts ascending; the same column reverses; a third click
-    /// puts it back to name order, so there is always a way out of a sort
-    /// rather than only ever a different one.
+    /// puts it back to the default order, so there is always a way out of a
+    /// sort rather than only ever a different one.
     pub fn clicked(self, key: SortKey) -> Self {
         match (self.key == key, self.descending) {
             (false, _) => Self {
@@ -218,32 +222,79 @@ impl Sort {
     }
 }
 
-/// Compares two cells, numerically when both are numbers.
+/// A cell prepared for comparison.
 ///
-/// Sorting `RESTARTS` as text puts 10 before 2, which is the kind of wrong that
-/// makes people stop trusting the column.
-fn compare_cells(left: &str, right: &str) -> std::cmp::Ordering {
-    match (left.parse::<f64>(), right.parse::<f64>()) {
-        (Ok(left), Ok(right)) => left.total_cmp(&right),
-        _ => left.to_lowercase().cmp(&right.to_lowercase()),
+/// Numerically when both cells are numbers: sorting `RESTARTS` as text puts 10
+/// before 2, which is the kind of wrong that makes people stop trusting a
+/// column.
+///
+/// Sorting by a column used to lowercase both operands *inside* the comparator,
+/// which is two allocations per comparison — around a quarter of a million of
+/// them for one sort of ten thousand rows, repeated on every flush of the watch
+/// stream. The work is per-row, so it is done per row: once, up front.
+struct CellKey<'a> {
+    /// The cell read as a number, when it is one.
+    number: Option<f64>,
+    /// The cell folded for case-insensitive comparison. Borrowed while the cell
+    /// is already lowercase, which most of them are.
+    text: std::borrow::Cow<'a, str>,
+}
+
+impl<'a> CellKey<'a> {
+    fn of(cell: &'a str) -> Self {
+        Self {
+            number: cell.parse::<f64>().ok(),
+            text: if cell.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(cell.to_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(cell)
+            },
+        }
     }
 }
+
+impl Ord for CellKey<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.number, other.number) {
+            (Some(left), Some(right)) => left.total_cmp(&right),
+            // A column of mostly-numbers with a `<none>` in it compares as text
+            // for that pair, which is the only answer that is not a lie.
+            _ => self.text.cmp(&other.text),
+        }
+    }
+}
+
+impl PartialOrd for CellKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for CellKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for CellKey<'_> {}
 
 /// Sorts rows in place.
 ///
 /// Rows arrive sorted by namespace and name — that is how the table holds them
-/// — so the name order is the natural one and needs no work. Every other order
-/// falls back to the name when the keys are equal, which keeps rows from
-/// jumping around each other as a watch stream updates them.
+/// — so that order is the natural one and needs no work at all. Every other
+/// order falls back to the key when the sort keys are equal, which keeps rows
+/// from jumping around each other as a watch stream updates them.
 fn sort_rows(rows: &mut [Arc<ResourceRow>], sort: Sort) {
     match sort.key {
-        SortKey::Name if !sort.descending => return,
-        SortKey::Name => rows.reverse(),
-        SortKey::Namespace => rows.sort_by(|left, right| {
+        // Already in this order: `ResourceKey` sorts by namespace then name and
+        // the table is a `BTreeMap` of them.
+        SortKey::Namespace if !sort.descending => return,
+        SortKey::Namespace => rows.reverse(),
+        SortKey::Name => rows.sort_by(|left, right| {
             left.key
-                .namespace
-                .cmp(&right.key.namespace)
-                .then_with(|| left.key.name.cmp(&right.key.name))
+                .name
+                .cmp(&right.key.name)
+                .then_with(|| left.key.namespace.cmp(&right.key.namespace))
         }),
         SortKey::Age => rows.sort_by(|left, right| {
             // Missing creation times sort last whichever way the column goes:
@@ -257,13 +308,25 @@ fn sort_rows(rows: &mut [Arc<ResourceRow>], sort: Sort) {
                 (None, None) => left.key.name.cmp(&right.key.name),
             }
         }),
-        SortKey::Cell(column) => rows.sort_by(|left, right| {
-            compare_cells(left.cell(column), right.cell(column))
-                .then_with(|| left.key.name.cmp(&right.key.name))
-        }),
+        SortKey::Cell(column) => {
+            // Decorate, sort, undecorate: the expensive half of comparing two
+            // cells is reading them, and reading them here happens n times
+            // rather than n log n.
+            let mut decorated: Vec<_> = rows
+                .iter()
+                .map(|row| (CellKey::of(row.cell(column)), row))
+                .collect();
+            decorated.sort_by(|(left, left_row), (right, right_row)| {
+                left.cmp(right)
+                    .then_with(|| left_row.key.name.cmp(&right_row.key.name))
+            });
+
+            let sorted: Vec<_> = decorated.iter().map(|(_, row)| Arc::clone(row)).collect();
+            rows.clone_from_slice(&sorted);
+        }
     }
 
-    if sort.descending && !matches!(sort.key, SortKey::Name) {
+    if sort.descending && !matches!(sort.key, SortKey::Namespace) {
         rows.reverse();
     }
 }
@@ -1132,6 +1195,11 @@ impl AppState {
         self.logs.as_ref()
     }
 
+    /// The open log session, for the reads that memoise as they go.
+    pub fn logs_mut(&mut self) -> Option<&mut LogSession> {
+        self.logs.as_mut()
+    }
+
     /// Applies a filter to the open session, reporting whether it changed.
     pub fn set_log_filter(&mut self, spec: FilterSpec) -> bool {
         self.logs
@@ -1171,6 +1239,11 @@ impl AppState {
     /// The command session, if one is open.
     pub fn exec(&self) -> Option<&ExecSession> {
         self.exec.as_ref()
+    }
+
+    /// The command session, for the reads that memoise as they go.
+    pub fn exec_mut(&mut self) -> Option<&mut ExecSession> {
+        self.exec.as_mut()
     }
 
     /// Marks the running command as cancelled, if one is running.
@@ -1296,14 +1369,24 @@ impl AppState {
     }
 
     /// The namespaces present in the active table, for the namespace picker.
-    pub fn namespaces(&self) -> Vec<Arc<str>> {
-        self.active_table()
-            .map(|(_, table)| table.namespaces())
-            .unwrap_or_default()
+    pub fn namespaces(&mut self) -> Arc<[Arc<str>]> {
+        let focus = self.focus;
+        match self.pane_table_mut(focus) {
+            Some((_, table)) => table.namespaces(),
+            None => Arc::from([] as [Arc<str>; 0]),
+        }
     }
 
     fn active_table(&self) -> Option<(&KindId, &ResourceTable)> {
         self.pane_table(self.focus)
+    }
+
+    fn pane_table_mut(&mut self, index: usize) -> Option<(KindId, &mut ResourceTable)> {
+        let pane = self.panes.get(index)?;
+        let cluster = pane.cluster.as_ref()?.clone();
+        let kind = pane.kind.as_ref()?.clone();
+        let table = self.tables.get_mut(&(cluster, kind.clone()))?;
+        Some((kind, table))
     }
 
     fn pane_table(&self, index: usize) -> Option<(&KindId, &ResourceTable)> {
@@ -2263,6 +2346,64 @@ mod tests {
             .iter()
             .map(|row| row.key.name.to_string())
             .collect()
+    }
+
+    #[test]
+    fn sorting_by_name_sorts_by_name_and_not_by_namespace() {
+        // NAME used to be the default and the default was "whatever order the
+        // table holds", which is namespace-then-name. So clicking NAME grouped
+        // by namespace, and clicking NAMESPACE did a full sort to produce
+        // exactly the order the rows were already in.
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[
+                    row("zeta", "api"),
+                    row("alpha", "web"),
+                    row("zeta", "cache"),
+                ],
+            )],
+            Instant::now(),
+        );
+
+        // The default is the order the rows arrive in, which is by namespace.
+        assert_eq!(names(&state), ["web", "api", "cache"]);
+
+        state.sort_by(SortKey::Name);
+        assert_eq!(names(&state), ["api", "cache", "web"]);
+
+        state.sort_by(SortKey::Namespace);
+        assert_eq!(names(&state), ["web", "api", "cache"]);
+    }
+
+    #[test]
+    fn a_cell_sort_reads_each_cell_once_and_orders_the_same_way() {
+        // The comparator used to lowercase both operands on every comparison —
+        // a quarter of a million allocations for ten thousand rows, on every
+        // flush of the watch stream. Reading each cell once must not change the
+        // answer, including for a column that mixes numbers and words.
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[
+                    row_with("d", "Zebra", None),
+                    row_with("a", "10", None),
+                    row_with("c", "apple", None),
+                    row_with("b", "2", None),
+                ],
+            )],
+            Instant::now(),
+        );
+
+        state.sort_by(SortKey::Cell(0));
+
+        // Numbers numerically against each other, case-insensitively against
+        // words — "Zebra" after "apple" is the whole point of folding the case.
+        assert_eq!(names(&state), ["b", "a", "c", "d"]);
     }
 
     #[test]

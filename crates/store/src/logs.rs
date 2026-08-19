@@ -171,6 +171,16 @@ pub struct LogBuffer {
     sources: Vec<(LogSource, LogSourceState)>,
     /// Why the session failed, if it did.
     error: Option<String>,
+    /// The visible lines in display order, shared with the view.
+    ///
+    /// The list is virtualised — thirty lines are on screen — but the view
+    /// needs indexed access to the whole of it, and building that list per
+    /// frame meant a hundred thousand refcount bumps and an 800KB allocation
+    /// sixty times a second for as long as a log pane was open. Rebuilt only
+    /// when the lines or the order actually move.
+    snapshot: Arc<[Arc<LogLine>]>,
+    /// Whether `snapshot` is behind the buffer.
+    restale: bool,
 }
 
 impl Default for LogBuffer {
@@ -195,6 +205,8 @@ impl LogBuffer {
             matcher: Matcher::All,
             sources: Vec::new(),
             error: None,
+            snapshot: Arc::from([] as [Arc<LogLine>; 0]),
+            restale: false,
         }
     }
 
@@ -284,6 +296,10 @@ impl LogBuffer {
     /// nearly in timestamp order already, which is the case Rust's stable sort
     /// is fastest on.
     fn reorder(&mut self) {
+        // Every path that adds, evicts, refilters or reorders lines ends here,
+        // which makes this the one place the snapshot has to be given up.
+        self.restale = true;
+
         self.untimestamped = 0;
         if self.order == LogOrder::Arrival {
             // Not merely stale: holding a second copy of a 100,000-line index
@@ -347,8 +363,15 @@ impl LogBuffer {
     }
 
     /// A snapshot of the visible lines, for a virtualised list.
-    pub fn visible_lines(&self) -> Vec<Arc<LogLine>> {
-        self.visible().cloned().collect()
+    ///
+    /// Takes `&mut self` because it memoises; the caller is a render pass and
+    /// the answer only changes when the buffer does.
+    pub fn visible_lines(&mut self) -> Arc<[Arc<LogLine>]> {
+        if self.restale {
+            self.snapshot = self.visible().cloned().collect();
+            self.restale = false;
+        }
+        Arc::clone(&self.snapshot)
     }
 
     /// How many lines are visible under the current filter.
@@ -666,6 +689,36 @@ mod tests {
             pattern: pattern.to_owned(),
             ..FilterSpec::default()
         }
+    }
+
+    #[test]
+    fn the_visible_snapshot_is_rebuilt_only_when_the_lines_move() {
+        // The default buffer holds 100,000 lines. Rebuilding this list per
+        // frame was an 800KB allocation and a hundred thousand refcount bumps,
+        // sixty times a second, for as long as a log pane was open.
+        let mut buffer = LogBuffer::new(10);
+        buffer.extend(&[line("api", "one"), line("api", "two")]);
+
+        let first = buffer.visible_lines();
+        assert_eq!(first.len(), 2);
+        // Asking again with nothing changed hands back the same allocation.
+        assert!(Arc::ptr_eq(&first, &buffer.visible_lines()));
+
+        // A new line moves it.
+        buffer.extend(&[line("api", "three")]);
+        let grown = buffer.visible_lines();
+        assert!(!Arc::ptr_eq(&first, &grown));
+        assert_eq!(grown.len(), 3);
+
+        // So does a filter.
+        buffer.set_filter(filter("two"));
+        assert_eq!(buffer.visible_lines().len(), 1);
+
+        // And so does the order, which changes the list without changing the set.
+        buffer.set_filter(FilterSpec::default());
+        let arrival = buffer.visible_lines();
+        buffer.set_order(LogOrder::Timestamp);
+        assert!(!Arc::ptr_eq(&arrival, &buffer.visible_lines()));
     }
 
     #[test]
