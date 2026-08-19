@@ -43,6 +43,14 @@ kube = { version = "4.2", features = [
     "gzip",
 ] }
 k8s-openapi = { version = "0.28", features = ["v1_34"] }
+# A CRD's `additionalPrinterColumns` are JSONPath expressions, and this is
+# already in the tree — `kube-client` uses it — so depending on it directly
+# costs nothing to build. The alternative was hand-rolling a path walker, and
+# the expressions CRDs really write include filters
+# (`.status.conditions[?(@.type=="Ready")].status`); a parser for those is
+# exactly the kind of thing that is subtly wrong for a year. See
+# docs/DECISIONS.md ADR-0036.
+jsonpath-rust = "1.0"
 
 # Async + plumbing.
 flume = "0.12"

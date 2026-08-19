@@ -24,6 +24,7 @@ pub mod kubeconfig;
 pub mod logs;
 pub mod mutate;
 pub mod pods;
+pub mod printer;
 pub mod watch;
 pub mod yaml;
 

@@ -20,6 +20,22 @@ use periscope_bridge::{ClusterEvent, ClusterId, ConnectionState, EventSink, Kind
 
 use crate::columns::{self, KindColumns};
 use crate::errors::{Failure, attribute_plugin, classify_watch};
+use crate::printer::PrinterColumn;
+
+/// What a watch needs to know about the kind it is watching.
+///
+/// Bundled rather than passed as three arguments because all three come from
+/// the same answer — discovery's — and a watch that had the kind but not its
+/// declared columns would quietly render the generic table instead.
+#[derive(Clone, Debug)]
+pub struct Watched {
+    /// Which kind to watch.
+    pub kind: KindId,
+    /// Whether its objects live in namespaces, so the URL is built correctly.
+    pub namespaced: bool,
+    /// The printer columns its CustomResourceDefinition declared, if any.
+    pub printer_columns: Arc<[PrinterColumn]>,
+}
 
 /// What to do after handling a watch error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +93,15 @@ impl ResourceStream {
     /// Whether the last thing this stream saw was a failure.
     pub fn is_degraded(&self) -> bool {
         self.degraded
+    }
+
+    /// Renders this kind on the printer columns its CRD declared.
+    ///
+    /// An empty slice — every built-in kind, and every CRD that declares none —
+    /// leaves the table exactly as [`ResourceStream::new`] built it.
+    pub fn with_printer_columns(mut self, columns: Arc<[PrinterColumn]>) -> Self {
+        self.table = columns::for_kind_with(&self.kind, columns);
+        self
     }
 
     /// Notes that the stream is producing events again, if it was not.
@@ -233,13 +258,17 @@ async fn is_reachable(api: &Api<DynamicObject>) -> bool {
 /// the UI goes away.
 pub async fn run(
     cluster: ClusterId,
-    kind: KindId,
+    watched: Watched,
     client: Client,
-    namespaced: bool,
     filter: Filter,
     credential_plugin: Option<String>,
     events: EventSink,
 ) {
+    let Watched {
+        kind,
+        namespaced,
+        printer_columns,
+    } = watched;
     let api = api_for(client, &kind, namespaced, filter.namespace.as_deref());
     let config = watcher::Config {
         label_selector: filter.selector.as_deref().map(str::to_owned),
@@ -259,6 +288,7 @@ pub async fn run(
             .default_backoff(),
     );
     let mut translator = ResourceStream::new(cluster.clone(), kind.clone())
+        .with_printer_columns(printer_columns)
         .with_credential_plugin(credential_plugin);
 
     loop {
@@ -556,6 +586,45 @@ mod tests {
         match stream.apply(watcher::Event::InitDone) {
             Some(ClusterEvent::ResourceReset { rows, .. }) => assert!(rows.is_empty()),
             other => panic!("expected an empty reset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_crds_declared_columns_reach_the_ui_with_its_rows() {
+        use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceColumnDefinition;
+
+        let certificates = KindId::new("cert-manager.io", "v1", "Certificate", "certificates");
+        let declared = crate::printer::compile(
+            &certificates,
+            &[CustomResourceColumnDefinition {
+                name: "Secret".to_owned(),
+                type_: "string".to_owned(),
+                json_path: ".spec.secretName".to_owned(),
+                ..CustomResourceColumnDefinition::default()
+            }],
+        );
+
+        let mut stream =
+            ResourceStream::new("prod".into(), certificates.clone()).with_printer_columns(declared);
+        let certificate: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "cert-manager.io/v1",
+            "kind": "Certificate",
+            "metadata": { "name": "web-tls", "namespace": "default" },
+            "spec": { "secretName": "web-tls" }
+        }))
+        .expect("fixture is a valid object");
+
+        stream.apply(watcher::Event::Init);
+        stream.apply(watcher::Event::InitApply(certificate));
+
+        match stream.apply(watcher::Event::InitDone) {
+            Some(ClusterEvent::ResourceReset { columns, rows, .. }) => {
+                // The whole point: the UI is told the heading and the cell, and
+                // needs to know nothing about cert-manager to render either.
+                assert_eq!(&*columns[0].name, "SECRET");
+                assert_eq!(&*rows[0].cells[0], "web-tls");
+            }
+            other => panic!("expected a reset, got {other:?}"),
         }
     }
 

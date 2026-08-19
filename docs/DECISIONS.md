@@ -941,3 +941,85 @@ ignored keymap line gives you a key that does nothing, and no way to tell that
 apart from a bug in the app. A keystroke that is not a key is skipped and
 reported on screen — `KeyBinding::new` panics on a malformed one, and a typo in
 a config file must not take the app down before it has a window to complain in.
+
+## ADR-0036 — A custom resource prints the columns its CRD declared
+
+**Date:** 2026-08-18
+**Status:** Accepted
+
+Every kind but the fifteen this project writes projectors for used to render the
+same two columns — `STATUS` from `status.phase`, `READY` from a `Ready`
+condition — which for most CRDs means two empty cells. `kubectl get certificates`
+prints READY, SECRET and AGE, and it does so without knowing anything about
+cert-manager: a CustomResourceDefinition declares `additionalPrinterColumns`,
+each with a heading, an OpenAPI type, a JSONPath and a priority, and the
+apiserver renders them. Periscope now reads the same declarations, so a custom
+resource looks the same in both.
+
+### Where the columns come from
+
+Discovery already asks the apiserver what it serves. It now also lists
+CustomResourceDefinitions and, for each custom kind, reads the printer columns
+declared for the exact version being watched. The list is paged: a CRD carries
+its whole OpenAPI schema, four fields of which are wanted, and a cluster with a
+service mesh and two operators has hundreds of them.
+
+Reading CRDs cannot fail the listing. `customresourcedefinitions` is a
+cluster-scoped resource that plenty of RBAC setups withhold, and a cluster that
+serves custom resources it will not describe is ordinary; the failure is logged
+with its reason intact and every kind lists on the generic columns, exactly as
+before. The same is true one column at a time: a JSONPath this cannot parse
+costs that column and nothing else.
+
+### Why `jsonpath-rust` rather than a path walker
+
+The forms CRDs really write are `.spec.secretName`, `.status.conditions[0].type`
+and — cert-manager uses it on five kinds —
+`.status.conditions[?(@.type=="Ready")].status`. The first two are an afternoon;
+the filter is a parser, and a hand-rolled parser for an expression language is
+the kind of thing that is subtly wrong for a year. `jsonpath-rust` is already in
+the dependency tree because `kube-client` uses it, so depending on it directly
+costs nothing to build, and it accepts every form above once the root is named:
+`additionalPrinterColumns` declares paths relative to the object (`.spec.foo`)
+and RFC 9535 wants `$.spec.foo`, which is the whole translation.
+
+Expressions are parsed once, when discovery reads the CRD, and the parsed query
+is what each row is evaluated against. A ten-thousand-row listing evaluates
+every column on every object; re-parsing the expression per cell would put a
+`pest` parse in that loop.
+
+The one dialect difference left is `kubectl`'s backslash escaping for key names
+containing dots — `.metadata.labels.app\.kubernetes\.io/name`. RFC 9535 spells
+that with brackets and `jsonpath-rust` rejects the backslashes, so such a column
+is dropped with a warning naming it. No CRD in the test cluster writes one.
+
+### Matching what `kubectl` prints
+
+The point is a table the target user can read without translating, so the
+formatting rules are `kubectl`'s, not new ones:
+
+* a path that finds nothing, and a value whose JSON type is not the declared
+  one, both render `<none>` — a blank cell and an empty string mean different
+  things;
+* a `date` renders as an age (`5m`, `2d`) through the same formatter as the AGE
+  column, which moved into `periscope-bridge` so the cluster layer and the view
+  cannot drift apart on it. A timestamp in the future is `<invalid>`;
+* headings are upper-cased, so a CRD's `Sync Status` reads `SYNC STATUS`
+  alongside `READY` and `RESTARTS`.
+
+A column with a priority above zero is hidden, as `kubectl` hides one until
+asked for `-o wide`. There is no wide listing yet; `printer::is_visible` is the
+single test a `-o wide` toggle would relax, and rebuilding the table is what it
+would re-run.
+
+Two departures, both deliberate. A CRD's own `Age` column — cert-manager
+declares one on every kind — is dropped, because the table already appends AGE
+to every kind from the same field and two identical columns look like a bug. And
+a row's colour still comes from the conventional `status.phase` and `Ready`
+heuristic: printer columns say what to *print*, never how healthy an object is.
+
+### What did not change
+
+Columns still travel with the rows as data. The UI learned nothing: it renders a
+CRD's declared columns through the same path it renders a Pod's, and the
+`[columns]` setting narrows them by name like any other kind's.

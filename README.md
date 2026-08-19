@@ -130,6 +130,12 @@ cert-manager's `certificates` sit under `CERT-MANAGER.IO`. Only workloads is
 open at first; a section opens by itself when it holds whatever you have
 selected, and the filter box above them narrows across all of them at once.
 
+A custom resource shows the columns its own CustomResourceDefinition declares,
+which are the ones `kubectl` prints for it: `certificates` come out as READY and
+SECRET, Argo CD's `applications` as SYNC STATUS and HEALTH STATUS. Columns the
+CRD marked as only worth showing in a wide listing are hidden, dates render as
+ages, and a CRD that declares nothing falls back to STATUS and READY.
+
 Click a column heading to sort by it, again to reverse, and a third time to put
 the natural order back — numbers sort as numbers, so RESTARTS does not put 10
 before 2.

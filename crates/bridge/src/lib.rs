@@ -26,6 +26,7 @@
 pub mod channel;
 pub mod coalesce;
 pub mod exec;
+pub mod format;
 pub mod forward;
 pub mod link;
 pub mod logs;
