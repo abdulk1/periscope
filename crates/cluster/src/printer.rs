@@ -93,6 +93,13 @@ pub struct PrinterColumn {
     format: Format,
     /// Where the value is.
     path: JpQuery,
+    /// Whether the path reads the object's metadata rather than its body.
+    ///
+    /// `DynamicObject` splits an object in two: `metadata` is typed and lifted
+    /// out, `data` is everything else. A CRD's JSONPath is written against the
+    /// whole object, so `.metadata.labels['team']` — which plenty of them use —
+    /// found nothing at all until the two halves were put back together for it.
+    from_metadata: bool,
 }
 
 impl PrinterColumn {
@@ -234,11 +241,25 @@ fn is_visible(kind: &KindId, column: &CustomResourceColumnDefinition) -> bool {
 
 /// Parses one declaration, or says what about it could not be parsed.
 fn parse(column: &CustomResourceColumnDefinition) -> Result<PrinterColumn, String> {
+    let rooted = rooted(&column.json_path);
     Ok(PrinterColumn {
         name: Arc::from(column.name.to_uppercase()),
         format: Format::parse(&column.type_),
-        path: parse_json_path(&rooted(&column.json_path)).map_err(|error| error.to_string())?,
+        from_metadata: reads_metadata(&rooted),
+        path: parse_json_path(&rooted).map_err(|error| error.to_string())?,
     })
+}
+
+/// Whether a rooted JSONPath starts at the object's metadata.
+///
+/// Textual rather than structural: the query is opaque once parsed, and the
+/// only shapes that matter are `$.metadata…` and `$['metadata']…`, which is how
+/// every printer column in the wild writes it.
+fn reads_metadata(rooted: &str) -> bool {
+    let rest = rooted.trim_start_matches('$');
+    rest.starts_with(".metadata")
+        || rest.starts_with("['metadata']")
+        || rest.starts_with("[\"metadata\"]")
 }
 
 /// Rewrites a CRD's JSONPath into the form the parser accepts.
@@ -260,11 +281,35 @@ pub fn specs(columns: &[PrinterColumn]) -> Arc<[ColumnSpec]> {
 }
 
 /// The cells for one object, in column order.
-pub fn cells(columns: &[PrinterColumn], data: &Value, now: SystemTime) -> Vec<Arc<str>> {
+///
+/// `data` is `DynamicObject::data` — the object without its metadata — and
+/// `metadata` is the other half, serialised. Building it costs something, so
+/// the caller passes it only when a column asks for it; a column that wants
+/// metadata and is not given any renders `<none>` like any other miss.
+pub fn cells(
+    columns: &[PrinterColumn],
+    data: &Value,
+    metadata: Option<&Value>,
+    now: SystemTime,
+) -> Vec<Arc<str>> {
     columns
         .iter()
-        .map(|column| column.cell(data, now))
+        .map(|column| match column.from_metadata {
+            true => match metadata {
+                Some(metadata) => column.cell(metadata, now),
+                None => Arc::from(MISSING),
+            },
+            false => column.cell(data, now),
+        })
         .collect()
+}
+
+/// Whether any of these columns reads the object's metadata.
+///
+/// The caller uses this to decide whether serialising the metadata is worth it,
+/// which for a ten-thousand-row listing it is only when something reads it.
+pub fn reads_any_metadata(columns: &[PrinterColumn]) -> bool {
+    columns.iter().any(|column| column.from_metadata)
 }
 
 #[cfg(test)]
@@ -325,7 +370,7 @@ mod tests {
     }
 
     fn rendered(columns: &[PrinterColumn], data: &Value) -> Vec<String> {
-        cells(columns, data, SystemTime::UNIX_EPOCH)
+        cells(columns, data, None, SystemTime::UNIX_EPOCH)
             .iter()
             .map(|cell| cell.to_string())
             .collect()
@@ -439,6 +484,7 @@ mod tests {
         let cells = cells(
             &columns,
             &json!({ "status": { "notAfter": "1970-01-01T00:00:00Z" } }),
+            None,
             now,
         );
         assert_eq!(&*cells[0], "90m");
@@ -454,6 +500,7 @@ mod tests {
         let cells = cells(
             &columns,
             &json!({ "status": { "notAfter": "2999-01-01T00:00:00Z" } }),
+            None,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1),
         );
         assert_eq!(&*cells[0], "<invalid>");

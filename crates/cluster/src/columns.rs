@@ -65,10 +65,16 @@ impl KindColumns {
     pub fn row_at(&self, object: &DynamicObject, now: SystemTime) -> ResourceRow {
         let (cells, state) = match &self.project {
             Projection::BuiltIn(project) => project(object),
-            Projection::Declared(columns) => (
-                printer::cells(columns, &object.data, now),
-                conventional_state(&object.data),
-            ),
+            Projection::Declared(columns) => {
+                // Only paid for by the CRDs that actually read metadata, and
+                // then once per row rather than once per column.
+                let metadata = printer::reads_any_metadata(columns)
+                    .then(|| serde_json::json!({ "metadata": object.metadata }));
+                (
+                    printer::cells(columns, &object.data, metadata.as_ref(), now),
+                    conventional_state(&object.data),
+                )
+            }
         };
 
         ResourceRow {
@@ -464,11 +470,14 @@ fn job_columns() -> KindColumns {
                 0 => 1,
                 completions => completions,
             };
-            let failed = number(data, &["status", "failed"]);
-
-            let (status, state) = if failed > 0 {
+            // `status.failed` counts failed *pods*, not a failed Job. A Job
+            // with a backoff limit is expected to have some: two crashes and
+            // then a success is a Job that worked, and reading the count as
+            // failure painted it red forever. The conditions are what the
+            // apiserver actually decides with.
+            let (status, state) = if condition_is_true(data, "Failed") {
                 ("Failed", RowState::Failing)
-            } else if succeeded >= wanted {
+            } else if condition_is_true(data, "Complete") || succeeded >= wanted {
                 ("Complete", RowState::Healthy)
             } else {
                 ("Running", RowState::Transient)
@@ -803,6 +812,47 @@ mod tests {
     }
 
     #[test]
+    fn a_printer_column_can_read_the_objects_metadata() {
+        // `DynamicObject` lifts `metadata` out of the body, and the cells were
+        // evaluated against the body alone — so a CRD column reading
+        // `.metadata.labels[...]`, which plenty of them do, rendered <none>
+        // for every object while the value sat right there in the row's key.
+        use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceColumnDefinition;
+
+        let declared = |name: &str, path: &str| CustomResourceColumnDefinition {
+            name: name.to_owned(),
+            type_: "string".to_owned(),
+            json_path: path.to_owned(),
+            description: None,
+            format: None,
+            priority: None,
+        };
+
+        let widgets = kind("example.com", "Widget", "widgets");
+        let columns = crate::printer::compile(
+            &widgets,
+            &[
+                declared("Team", ".metadata.labels['team']"),
+                declared("Size", ".spec.size"),
+            ],
+        );
+        let table = from_printer_columns(columns).expect("the CRD declared columns");
+
+        let row = table.row(&object(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "left",
+                "namespace": "default",
+                "labels": { "team": "payments" },
+            },
+            "spec": { "size": "large" },
+        })));
+
+        assert_eq!(cells(&row), ["payments", "large"]);
+    }
+
+    #[test]
     fn a_pod_renders_the_columns_kubectl_prints() {
         let row = row_of(
             &kind("", "Pod", "pods"),
@@ -990,16 +1040,55 @@ mod tests {
         assert_eq!(cells(&complete), ["3/3", "Complete"]);
         assert_eq!(complete.state, RowState::Healthy);
 
+        // A Job that gave up: the apiserver says so in its conditions.
         let failed = row_of(
             &KindId::new("batch", "v1", "Job", "jobs"),
             json!({
                 "metadata": { "name": "migrate", "namespace": "default" },
                 "spec": {},
-                "status": { "failed": 1 }
+                "status": {
+                    "failed": 6,
+                    "conditions": [{ "type": "Failed", "status": "True" }]
+                }
             }),
         );
         assert_eq!(cells(&failed), ["0/1", "Failed"]);
         assert_eq!(failed.state, RowState::Failing);
+    }
+
+    #[test]
+    fn a_job_that_failed_twice_and_then_worked_is_not_red() {
+        // `status.failed` counts failed pods, and a Job with a backoff limit is
+        // supposed to have some. Reading that count as failure meant a Job that
+        // retried and succeeded stayed red for the rest of its life.
+        let retried = row_of(
+            &KindId::new("batch", "v1", "Job", "jobs"),
+            json!({
+                "metadata": { "name": "migrate", "namespace": "default" },
+                "spec": { "completions": 1, "backoffLimit": 6 },
+                "status": {
+                    "failed": 2,
+                    "succeeded": 1,
+                    "conditions": [{ "type": "Complete", "status": "True" }]
+                }
+            }),
+        );
+
+        assert_eq!(cells(&retried), ["1/1", "Complete"]);
+        assert_eq!(retried.state, RowState::Healthy);
+
+        // And one still working through its retries is running, not failed.
+        let retrying = row_of(
+            &KindId::new("batch", "v1", "Job", "jobs"),
+            json!({
+                "metadata": { "name": "migrate", "namespace": "default" },
+                "spec": { "completions": 1, "backoffLimit": 6 },
+                "status": { "failed": 2, "active": 1 }
+            }),
+        );
+
+        assert_eq!(cells(&retrying), ["0/1", "Running"]);
+        assert_eq!(retrying.state, RowState::Transient);
     }
 
     #[test]

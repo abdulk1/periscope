@@ -93,7 +93,18 @@ pub fn counts(data: &Value) -> PodCounts {
 
     let mut ready = 0;
     let mut restarts = 0;
-    for status in array(data, &["status", "containerStatuses"]) {
+
+    // Sidecars are counted in `total` above, and their statuses live in
+    // `initContainerStatuses` rather than beside the ordinary containers — so
+    // reading only the latter meant a healthy sidecar never made the pod look
+    // ready, and one that was crash-looping every ten seconds showed no
+    // restarts at all. That is the whole reason the RESTARTS column exists.
+    let counted = array(data, &["status", "initContainerStatuses"])
+        .iter()
+        .filter(|status| is_restartable(init_container(data, text(status, &["name"])).as_ref()))
+        .chain(array(data, &["status", "containerStatuses"]).iter());
+
+    for status in counted {
         restarts += status["restartCount"].as_u64().unwrap_or(0) as u32;
         if status["ready"].as_bool().unwrap_or(false) && !status["state"]["running"].is_null() {
             ready += 1;
@@ -471,14 +482,94 @@ mod tests {
         }));
 
         assert_eq!(status(&pod), "Running");
-        // The sidecar is part of the total, but only main containers are
-        // counted ready — exactly what `kubectl get pods` prints.
+        // A running sidecar is ready, and it is in the total, so a healthy pod
+        // reads 2/2. Counting it in the total and not in the ready count left
+        // every pod with a sidecar looking permanently one container short.
+        assert_eq!(
+            counts(&pod.data),
+            PodCounts {
+                ready: 2,
+                total: 2,
+                restarts: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_crash_looping_sidecar_is_visible_in_the_row() {
+        // A sidecar's status lives in `initContainerStatuses`, and the counts
+        // read only `containerStatuses` — so a sidecar restarting every ten
+        // seconds showed RESTARTS 0 and READY 1/2 with no hint of which
+        // container was the problem. RESTARTS exists for exactly this.
+        let pod = pod(json!({
+            "metadata": { "name": "api-0", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "api" }],
+                "initContainers": [{ "name": "proxy", "restartPolicy": "Always" }]
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [{ "type": "Initialized", "status": "True" }],
+                "initContainerStatuses": [{
+                    "name": "proxy",
+                    "ready": false,
+                    "started": false,
+                    "restartCount": 14,
+                    "state": { "waiting": { "reason": "CrashLoopBackOff" } }
+                }],
+                "containerStatuses": [{
+                    "name": "api",
+                    "ready": true,
+                    "restartCount": 0,
+                    "state": { "running": {} }
+                }]
+            }
+        }));
+
         assert_eq!(
             counts(&pod.data),
             PodCounts {
                 ready: 1,
                 total: 2,
-                restarts: 0
+                restarts: 14
+            }
+        );
+    }
+
+    #[test]
+    fn an_ordinary_init_containers_restarts_stop_counting_once_it_is_done() {
+        // Only sidecars keep contributing after initialization; `kubectl`
+        // drops an ordinary init container's restarts at that point, and a
+        // RESTARTS column that disagrees with `kubectl` is worse than none.
+        let pod = pod(json!({
+            "metadata": { "name": "api-0", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "api" }],
+                "initContainers": [{ "name": "migrate" }]
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [{ "type": "Initialized", "status": "True" }],
+                "initContainerStatuses": [{
+                    "name": "migrate",
+                    "restartCount": 3,
+                    "state": { "terminated": { "exitCode": 0 } }
+                }],
+                "containerStatuses": [{
+                    "name": "api",
+                    "ready": true,
+                    "restartCount": 1,
+                    "state": { "running": {} }
+                }]
+            }
+        }));
+
+        assert_eq!(
+            counts(&pod.data),
+            PodCounts {
+                ready: 1,
+                total: 1,
+                restarts: 1
             }
         );
     }

@@ -188,7 +188,42 @@ async fn read_source(
         if target.previous {
             return;
         }
+
+        // Neither must a pod that has finished. Re-attaching exists for a
+        // container that restarts, and a Succeeded or Failed pod never will —
+        // so this loop re-read the whole log every half second for as long as
+        // the view was open, appending the same lines to the buffer each time
+        // and asking the apiserver for them forever.
+        if let Some(reason) = finished(&api, &pod).await {
+            tracing::debug!(%pod, %container, %reason, "not re-attaching");
+            return;
+        }
+
         tokio::time::sleep(REATTACH_DELAY).await;
+    }
+}
+
+/// Why there will be no more output from a pod, if there will not be.
+///
+/// A pod that is gone is as final as one that succeeded: in both cases the
+/// stream that just ended was the last one there will ever be.
+async fn finished(api: &Api<Pod>, pod: &str) -> Option<String> {
+    match api.get(pod).await {
+        Ok(pod) => terminal_phase(&pod).map(|phase| format!("the pod {phase}")),
+        Err(kube::Error::Api(status)) if status.code == 404 => Some("the pod is gone".to_owned()),
+        // Anything else — a blip, a throttled apiserver — is not evidence that
+        // the pod is done, and guessing wrong here means silently stopping a
+        // tail somebody is watching.
+        Err(_) => None,
+    }
+}
+
+/// The terminal phase a pod has reached, if it has reached one.
+fn terminal_phase(pod: &Pod) -> Option<&'static str> {
+    match pod.status.as_ref()?.phase.as_deref()? {
+        "Succeeded" => Some("succeeded"),
+        "Failed" => Some("failed"),
+        _ => None,
     }
 }
 
@@ -381,6 +416,34 @@ mod tests {
 
     fn pod(value: serde_json::Value) -> Pod {
         serde_json::from_value(value).expect("fixture is a valid pod")
+    }
+
+    #[test]
+    fn a_pod_that_has_finished_is_not_re_attached_to() {
+        // The tail loop re-attaches so that a restarting container picks up its
+        // new stream. A Succeeded or Failed pod never restarts, so re-attaching
+        // re-read the whole log every half second and appended it to the buffer
+        // again, forever, for as long as the view was open.
+        assert_eq!(
+            terminal_phase(&pod(json!({ "status": { "phase": "Succeeded" } }))),
+            Some("succeeded")
+        );
+        assert_eq!(
+            terminal_phase(&pod(json!({ "status": { "phase": "Failed" } }))),
+            Some("failed")
+        );
+
+        // Everything else is still live, including a pod whose status has not
+        // arrived yet: stopping a tail somebody is watching is the worse error.
+        assert_eq!(
+            terminal_phase(&pod(json!({ "status": { "phase": "Running" } }))),
+            None
+        );
+        assert_eq!(
+            terminal_phase(&pod(json!({ "status": { "phase": "Pending" } }))),
+            None
+        );
+        assert_eq!(terminal_phase(&pod(json!({}))), None);
     }
 
     #[test]
