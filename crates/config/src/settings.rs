@@ -239,11 +239,21 @@ pub enum Command {
     Previous,
     /// Take the highlighted palette result.
     Confirm,
+    /// Move down the table.
+    RowDown,
+    /// Move up the table.
+    RowUp,
+    /// Jump to the first row.
+    RowTop,
+    /// Jump to the last row.
+    RowBottom,
+    /// Open the row the keyboard is on.
+    OpenRow,
 }
 
 impl Command {
     /// Every command, so the UI can bind them all.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 13] = [
         Self::Palette,
         Self::Dismiss,
         Self::Logs,
@@ -252,6 +262,11 @@ impl Command {
         Self::Next,
         Self::Previous,
         Self::Confirm,
+        Self::RowDown,
+        Self::RowUp,
+        Self::RowTop,
+        Self::RowBottom,
+        Self::OpenRow,
     ];
 
     /// How it is written in `settings.toml`.
@@ -265,6 +280,11 @@ impl Command {
             Self::Next => "next",
             Self::Previous => "previous",
             Self::Confirm => "confirm",
+            Self::RowDown => "row-down",
+            Self::RowUp => "row-up",
+            Self::RowTop => "row-top",
+            Self::RowBottom => "row-bottom",
+            Self::OpenRow => "open-row",
         }
     }
 
@@ -286,6 +306,14 @@ impl Command {
             Self::Next => &["down", "ctrl-n"],
             Self::Previous => &["up", "ctrl-p"],
             Self::Confirm => &["enter"],
+            // The table's own navigation: vim's letters and the arrows, which
+            // is what both halves of the audience reach for. `enter` opens,
+            // as it does everywhere else.
+            Self::RowDown => &["j", "down"],
+            Self::RowUp => &["k", "up"],
+            Self::RowTop => &["g", "home"],
+            Self::RowBottom => &["shift-g", "end"],
+            Self::OpenRow => &["enter"],
         }
     }
 }

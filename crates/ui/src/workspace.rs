@@ -54,6 +54,16 @@ actions!(
         ToggleFollow,
         /// Show two clusters side by side, or go back to one.
         ToggleSplit,
+        /// Move the table's keyboard cursor down.
+        RowDown,
+        /// Move the table's keyboard cursor up.
+        RowUp,
+        /// Put the cursor on the first row.
+        RowTop,
+        /// Put the cursor on the last row.
+        RowBottom,
+        /// Open whatever the cursor is on.
+        OpenRow,
     ]
 );
 
@@ -87,6 +97,18 @@ fn context_of(command: periscope_config::Command, keystroke: &str) -> Option<&'s
 
     match command {
         Command::Next | Command::Previous | Command::Confirm => Some("Palette"),
+        // The table's keys are the palette's keys — `down`, `up`, `enter` —
+        // and only one of the two may answer. `Periscope` is the root's context
+        // while the palette is closed, so this says "the table, not the list".
+        Command::RowDown
+        | Command::RowUp
+        | Command::RowTop
+        | Command::RowBottom
+        | Command::OpenRow => Some(if is_typable(keystroke) {
+            "Periscope && !Input && !NumberInput && !SearchPanel"
+        } else {
+            "Periscope"
+        }),
         _ if is_typable(keystroke) => Some(OUTSIDE_TEXT_FIELDS),
         _ => None,
     }
@@ -145,6 +167,11 @@ pub fn init_with_keys(cx: &mut App, keys: &periscope_config::Keys) -> Vec<String
                 Command::Next => KeyBinding::new(&keystroke, SelectNext, context),
                 Command::Previous => KeyBinding::new(&keystroke, SelectPrevious, context),
                 Command::Confirm => KeyBinding::new(&keystroke, Confirm, context),
+                Command::RowDown => KeyBinding::new(&keystroke, RowDown, context),
+                Command::RowUp => KeyBinding::new(&keystroke, RowUp, context),
+                Command::RowTop => KeyBinding::new(&keystroke, RowTop, context),
+                Command::RowBottom => KeyBinding::new(&keystroke, RowBottom, context),
+                Command::OpenRow => KeyBinding::new(&keystroke, OpenRow, context),
             });
         }
     }
@@ -300,6 +327,8 @@ pub struct Workspace {
     log_filter_input: Entity<InputState>,
     log_selector_input: Entity<InputState>,
     log_container_input: Entity<InputState>,
+    /// One per pane, so moving the cursor can bring its row into view.
+    table_scroll: [gpui::UniformListScrollHandle; 2],
     log_scroll: gpui::UniformListScrollHandle,
     /// The command output's scroll position, kept apart from the log view's so
     /// the two panes do not fight over it.
@@ -498,6 +527,10 @@ impl Workspace {
             log_filter_input,
             log_selector_input,
             log_container_input,
+            table_scroll: [
+                gpui::UniformListScrollHandle::new(),
+                gpui::UniformListScrollHandle::new(),
+            ],
             log_scroll: gpui::UniformListScrollHandle::new(),
             exec_scroll: gpui::UniformListScrollHandle::new(),
             log_visible: 0,
@@ -1383,6 +1416,61 @@ impl Workspace {
         }
     }
 
+    fn row_down(&mut self, _: &RowDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(1, cx);
+    }
+
+    fn row_up(&mut self, _: &RowUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(-1, cx);
+    }
+
+    fn row_top(&mut self, _: &RowTop, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.set_cursor(0) {
+            self.reveal_cursor(cx);
+        }
+    }
+
+    fn row_bottom(&mut self, _: &RowBottom, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.cursor_to_end() {
+            self.reveal_cursor(cx);
+        }
+    }
+
+    /// Opens whatever the cursor is on.
+    fn open_row(&mut self, _: &OpenRow, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = self.state.current_row().map(|row| row.key.clone()) else {
+            return;
+        };
+        self.open_object(key, window, cx);
+    }
+
+    /// Puts the cursor on a row, without opening it.
+    pub fn set_cursor(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.state.set_cursor(index) {
+            cx.notify();
+        }
+    }
+
+    /// Moves the cursor and scrolls it into view.
+    fn move_cursor(&mut self, by: isize, cx: &mut Context<Self>) {
+        if self.state.move_cursor(by) {
+            self.reveal_cursor(cx);
+        }
+    }
+
+    /// Keeps the cursor on screen after it moves.
+    ///
+    /// `scroll_to_item` is non-strict — it does nothing when the row is already
+    /// fully visible and otherwise scrolls the least it can — which is what
+    /// makes holding `j` feel like a list rather than a slideshow.
+    fn reveal_cursor(&mut self, cx: &mut Context<Self>) {
+        let pane = self.state.focus();
+        if let Some(scroll) = self.table_scroll.get(pane) {
+            scroll.scroll_to_item(self.state.cursor(), gpui::ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
     fn select_next(&mut self, _: &SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
         if self.palette_open && !self.palette_matches.is_empty() {
             self.palette_index = (self.palette_index + 1).min(self.palette_matches.len() - 1);
@@ -1975,15 +2063,17 @@ impl Workspace {
             };
             table::placeholder(message, cx).into_any_element()
         } else {
-            table::body(
-                cx.entity(),
-                index,
+            table::body(table::View {
+                workspace: cx.entity(),
+                pane: index,
                 rows,
-                columns.clone(),
+                columns: columns.clone(),
                 namespaced,
-                self.state.detail().map(|detail| detail.key().clone()),
-                SystemTime::now(),
-            )
+                opened: self.state.detail().map(|detail| detail.key().clone()),
+                cursor: pane.cursor(),
+                scroll: self.table_scroll[index.min(1)].clone(),
+                now: SystemTime::now(),
+            })
             .into_any_element()
         };
 
@@ -3112,6 +3202,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_logs))
             .on_action(cx.listener(Self::toggle_follow))
             .on_action(cx.listener(Self::toggle_split))
+            .on_action(cx.listener(Self::row_down))
+            .on_action(cx.listener(Self::row_up))
+            .on_action(cx.listener(Self::row_top))
+            .on_action(cx.listener(Self::row_bottom))
+            .on_action(cx.listener(Self::open_row))
             .child(
                 v_flex()
                     .size_full()
@@ -3581,6 +3676,160 @@ mod tests {
                 kind("cert-manager.io", "certificates", true),
             ]),
         }
+    }
+
+    #[gpui::test]
+    fn j_and_k_move_through_the_table_and_enter_opens_a_row(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![reset("prod", pods(), &["api-0", "api-1", "api-2"])],
+        );
+        drain(&rx);
+
+        harness.keys(cx, "j");
+        harness.keys(cx, "j");
+        assert_eq!(harness.read(cx, |workspace| workspace.state().cursor()), 2);
+
+        harness.keys(cx, "k");
+        assert_eq!(harness.read(cx, |workspace| workspace.state().cursor()), 1);
+
+        harness.keys(cx, "enter");
+        harness.read(cx, |workspace| {
+            let detail = workspace.state().detail().expect("a row opened");
+            assert_eq!(&*detail.key().name, "api-1");
+        });
+        // Opening it asks the cluster for the object, as a click would.
+        assert!(matches!(
+            drain(&rx).as_slice(),
+            [ClusterCommand::FetchObject { .. }]
+        ));
+    }
+
+    #[gpui::test]
+    fn the_arrows_do_the_same_as_j_and_k(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![reset("prod", pods(), &["api-0", "api-1"])],
+        );
+        drain(&rx);
+
+        harness.keys(cx, "down");
+        assert_eq!(harness.read(cx, |workspace| workspace.state().cursor()), 1);
+        harness.keys(cx, "up");
+        assert_eq!(harness.read(cx, |workspace| workspace.state().cursor()), 0);
+    }
+
+    #[gpui::test]
+    fn g_and_shift_g_jump_to_the_ends(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![reset("prod", pods(), &["api-0", "api-1", "api-2", "api-3"])],
+        );
+        drain(&rx);
+
+        harness.keys(cx, "shift-g");
+        assert_eq!(harness.read(cx, |workspace| workspace.state().cursor()), 3);
+        harness.keys(cx, "g");
+        assert_eq!(harness.read(cx, |workspace| workspace.state().cursor()), 0);
+    }
+
+    #[gpui::test]
+    fn the_tables_keys_do_not_fire_while_the_palette_is_open(cx: &mut TestAppContext) {
+        // `down` and `enter` belong to both; only one of them may answer.
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![reset("prod", pods(), &["api-0", "api-1"])],
+        );
+        drain(&rx);
+
+        harness.keys(cx, "cmd-k");
+        harness.keys(cx, "down");
+
+        harness.read(cx, |workspace| {
+            assert!(workspace.palette_open());
+            // The palette moved; the table stayed where it was.
+            assert_eq!(workspace.state().cursor(), 0);
+        });
+    }
+
+    #[gpui::test]
+    fn moving_the_cursor_is_not_the_same_as_opening_a_row(cx: &mut TestAppContext) {
+        // Fetching an object on every keypress would be a request per row in a
+        // list somebody is scrolling through.
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![reset("prod", pods(), &["api-0", "api-1"])],
+        );
+        drain(&rx);
+
+        harness.keys(cx, "j");
+        harness.keys(cx, "k");
+
+        assert!(drain(&rx).is_empty());
+        assert!(harness.read(cx, |workspace| workspace.state().detail().is_none()));
+    }
+
+    #[gpui::test]
+    fn a_letter_bound_to_the_table_is_still_typed_into_a_filter(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![reset("prod", pods(), &["api-0", "api-1"])],
+        );
+        drain(&rx);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace.search_input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+        harness.keys(cx, "j");
+
+        harness.read(cx, |workspace| assert_eq!(workspace.state().cursor(), 0));
+        harness.update(cx, |workspace, _window, cx| {
+            assert_eq!(workspace.search_input.read(cx).value(), "j");
+        });
     }
 
     #[gpui::test]

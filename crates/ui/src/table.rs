@@ -69,6 +69,9 @@ pub fn header(columns: &[(usize, ColumnSpec)], namespaced: bool, cx: &App) -> im
         .text_xs()
         .text_color(cx.theme().muted_foreground);
 
+    // Matches the marker stripe on every row, so the columns line up.
+    row = row.child(div().w(px(2.)).flex_none());
+
     if namespaced {
         row = row.child(cell(Some(NAMESPACE_WIDTH)).child("NAMESPACE"));
     }
@@ -87,7 +90,11 @@ fn row(
     entry: &ResourceRow,
     columns: &[(usize, ColumnSpec)],
     namespaced: bool,
-    selected: bool,
+    // `under_cursor` is where the keyboard is; `opened` is what the detail pane
+    // is showing. Usually the same row, and they must not look identical when
+    // they are not.
+    under_cursor: bool,
+    opened: bool,
     now: SystemTime,
     cx: &App,
 ) -> gpui::Div {
@@ -140,24 +147,65 @@ fn row(
         .w_full()
         .border_b_1()
         .border_color(cx.theme().border)
-        .when(selected, |row| row.bg(cx.theme().accent))
-        .child(line)
+        .when(under_cursor, |row| row.bg(cx.theme().accent))
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                // A stripe down the left of whatever the detail pane is
+                // showing, so it stays findable after the cursor moves on.
+                .child(div().w(px(2.)).h(px(ROW_HEIGHT)).flex_none().bg(if opened {
+                    cx.theme().primary
+                } else {
+                    gpui::transparent_black()
+                }))
+                .child(line),
+        )
 }
 
-/// The virtualised body of the table.
+/// Everything one table needs to render.
 ///
-/// `now` is passed in rather than read per row so every age in one frame is
+/// A struct rather than nine arguments: they are all "what this table is", and
+/// half of them are `usize`s and options that would be easy to pass in the
+/// wrong order.
+///
+/// `now` is carried rather than read per row so every age in one frame is
 /// measured against the same instant. Clicking a row opens it in the detail
 /// pane, which is why the workspace entity comes along.
-pub fn body(
-    workspace: Entity<Workspace>,
-    pane: usize,
-    rows: Arc<[Arc<ResourceRow>]>,
-    columns: Arc<[(usize, ColumnSpec)]>,
-    namespaced: bool,
-    selected: Option<ResourceKey>,
-    now: SystemTime,
-) -> impl IntoElement {
+#[derive(Clone, Debug)]
+pub struct View {
+    /// The root view, so a click can open what it hit.
+    pub workspace: Entity<Workspace>,
+    /// Which pane this is, so a click can focus it.
+    pub pane: usize,
+    /// The rows to render.
+    pub rows: Arc<[Arc<ResourceRow>]>,
+    /// Columns, each with its position in the kind's full set.
+    pub columns: Arc<[(usize, ColumnSpec)]>,
+    /// Whether this kind's objects live in namespaces.
+    pub namespaced: bool,
+    /// The object the detail pane is showing, if any.
+    pub opened: Option<ResourceKey>,
+    /// Where the keyboard is.
+    pub cursor: usize,
+    /// Scroll position, so the cursor can be brought into view.
+    pub scroll: gpui::UniformListScrollHandle,
+    /// One instant for every age in the frame.
+    pub now: SystemTime,
+}
+
+pub fn body(view: View) -> impl IntoElement {
+    let View {
+        workspace,
+        pane,
+        rows,
+        columns,
+        namespaced,
+        opened,
+        cursor,
+        scroll,
+        now,
+    } = view;
     let count = rows.len();
 
     uniform_list(
@@ -173,7 +221,8 @@ pub fn body(
                         entry,
                         &columns,
                         namespaced,
-                        selected.as_ref() == Some(&entry.key),
+                        index == cursor,
+                        opened.as_ref() == Some(&entry.key),
                         now,
                         cx,
                     )
@@ -185,6 +234,10 @@ pub fn body(
                             // Clicking a row is also how a pane is focused:
                             // the object opens in the pane it was clicked in.
                             workspace.focus_pane(pane, cx);
+                            // And it moves the keyboard cursor there, so that
+                            // `j` after a click continues from what was
+                            // clicked rather than from wherever it last was.
+                            workspace.set_cursor(index, cx);
                             workspace.open_object(key.clone(), window, cx);
                         });
                     })
@@ -192,6 +245,7 @@ pub fn body(
                 .collect()
         },
     )
+    .track_scroll(scroll)
     .flex_1()
     .w_full()
 }

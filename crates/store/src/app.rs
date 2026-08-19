@@ -159,6 +159,13 @@ pub struct Pane {
     /// than a copy of ten thousand pointers.
     rows: Arc<[Arc<ResourceRow>]>,
     columns: Arc<[ColumnSpec]>,
+    /// Which row the keyboard is on.
+    ///
+    /// An index rather than a key, because the thing being pointed at is a
+    /// position in a list somebody is moving through — and it is clamped
+    /// whenever the rows change, so a row vanishing under the cursor moves it
+    /// rather than leaving it pointing past the end.
+    cursor: usize,
 }
 
 impl Pane {
@@ -175,6 +182,16 @@ impl Pane {
     /// The filters applied to it.
     pub fn filters(&self) -> &Filters {
         &self.filters
+    }
+
+    /// Which row the keyboard is on.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// The row the keyboard is on, if there is one.
+    pub fn current_row(&self) -> Option<&Arc<ResourceRow>> {
+        self.rows.get(self.cursor)
     }
 
     /// The rows it renders.
@@ -485,6 +502,9 @@ impl AppState {
         }
         self.last_viewed.insert(cluster.clone(), Instant::now());
         self.panes[self.focus].cluster = Some(cluster);
+        // A different cluster is a different table; keeping the cursor at row
+        // 500 of the last one points it at something unrelated.
+        self.panes[self.focus].cursor = 0;
         self.detail = None;
         // A tail — or a command's output — belongs to the cluster it was opened
         // on; carrying it across would leave lines on screen that no longer
@@ -500,6 +520,7 @@ impl AppState {
             return;
         }
         self.panes[self.focus].kind = Some(kind);
+        self.panes[self.focus].cursor = 0;
         self.detail = None;
         self.refresh_pane(self.focus);
     }
@@ -627,6 +648,57 @@ impl AppState {
     }
 
     // --- mutations ----------------------------------------------------------
+
+    // --- keyboard cursor ----------------------------------------------------
+
+    /// Where the keyboard is in the focused pane's table.
+    pub fn cursor(&self) -> usize {
+        self.panes[self.focus].cursor()
+    }
+
+    /// The row the keyboard is on, if the table has any.
+    pub fn current_row(&self) -> Option<&Arc<ResourceRow>> {
+        self.panes[self.focus].current_row()
+    }
+
+    /// Moves the cursor, reporting whether it went anywhere.
+    ///
+    /// It stops at both ends rather than wrapping: in a list of ten thousand
+    /// pods, wrapping from the top to the bottom is never what was meant, and
+    /// it loses your place.
+    pub fn move_cursor(&mut self, by: isize) -> bool {
+        let pane = &mut self.panes[self.focus];
+        if pane.rows.is_empty() {
+            return false;
+        }
+
+        let last = pane.rows.len() - 1;
+        let moved = pane.cursor.saturating_add_signed(by).min(last);
+        if moved == pane.cursor {
+            return false;
+        }
+
+        pane.cursor = moved;
+        true
+    }
+
+    /// Puts the cursor on a specific row, clamped to what exists.
+    pub fn set_cursor(&mut self, index: usize) -> bool {
+        let pane = &mut self.panes[self.focus];
+        let clamped = index.min(pane.rows.len().saturating_sub(1));
+        if clamped == pane.cursor {
+            return false;
+        }
+
+        pane.cursor = clamped;
+        true
+    }
+
+    /// Puts the cursor on the last row.
+    pub fn cursor_to_end(&mut self) -> bool {
+        let last = self.panes[self.focus].rows.len().saturating_sub(1);
+        self.set_cursor(last)
+    }
 
     /// Sets the policy, from settings.
     pub fn set_permissions(&mut self, permissions: Permissions) {
@@ -1144,6 +1216,10 @@ impl AppState {
         let pane = &mut self.panes[index];
         pane.columns = columns;
         pane.rows = Arc::from(rows);
+        // A row can disappear under the cursor at any moment — that is what a
+        // watch stream does — so the cursor follows the list rather than the
+        // list being assumed to hold still.
+        pane.cursor = pane.cursor.min(pane.rows.len().saturating_sub(1));
     }
 }
 
@@ -1867,6 +1943,136 @@ mod tests {
         assert_eq!(configured.row_budget, DEFAULT_ROW_BUDGET);
         assert_eq!(configured.idle_timeout.get(), DEFAULT_IDLE_TIMEOUT);
         assert_eq!(configured.log_buffer, crate::logs::DEFAULT_CAPACITY);
+    }
+
+    #[test]
+    fn the_cursor_moves_through_the_rows_and_stops_at_both_ends() {
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[
+                    row("default", "a"),
+                    row("default", "b"),
+                    row("default", "c"),
+                ],
+            )],
+            Instant::now(),
+        );
+
+        assert_eq!(state.cursor(), 0);
+        assert!(state.move_cursor(1));
+        assert_eq!(
+            state
+                .current_row()
+                .map(|row| row.key.name.to_string())
+                .as_deref(),
+            Some("b")
+        );
+
+        assert!(state.cursor_to_end());
+        assert_eq!(state.cursor(), 2);
+        // Stopping rather than wrapping: in ten thousand pods, wrapping loses
+        // your place and is never what was meant.
+        assert!(!state.move_cursor(1));
+        assert_eq!(state.cursor(), 2);
+
+        assert!(state.move_cursor(-10));
+        assert_eq!(state.cursor(), 0);
+        assert!(!state.move_cursor(-1));
+    }
+
+    #[test]
+    fn a_row_disappearing_under_the_cursor_moves_it_rather_than_stranding_it() {
+        // Exactly what a watch stream does while somebody is reading.
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[
+                    row("default", "a"),
+                    row("default", "b"),
+                    row("default", "c"),
+                ],
+            )],
+            Instant::now(),
+        );
+        state.cursor_to_end();
+        assert_eq!(state.cursor(), 2);
+
+        state.apply_batch(
+            &[reset("prod", pods(), &[row("default", "a")])],
+            Instant::now(),
+        );
+
+        assert_eq!(state.cursor(), 0);
+        assert_eq!(
+            state
+                .current_row()
+                .map(|row| row.key.name.to_string())
+                .as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn changing_what_the_table_shows_puts_the_cursor_back_at_the_top() {
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[
+                    row("default", "a"),
+                    row("default", "b"),
+                    row("default", "c"),
+                ],
+            )],
+            Instant::now(),
+        );
+        state.cursor_to_end();
+        assert_eq!(state.cursor(), 2);
+
+        // A different kind is a different table: row 3 of pods says nothing
+        // about row 3 of deployments.
+        state.select_kind(deployments());
+        assert_eq!(state.cursor(), 0);
+    }
+
+    #[test]
+    fn an_empty_table_has_nowhere_to_move_and_says_so() {
+        let mut state = state_with_contexts();
+
+        assert!(!state.move_cursor(1));
+        assert!(state.current_row().is_none());
+    }
+
+    #[test]
+    fn each_pane_keeps_its_own_place() {
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset(
+                "prod",
+                pods(),
+                &[
+                    row("default", "a"),
+                    row("default", "b"),
+                    row("default", "c"),
+                ],
+            )],
+            Instant::now(),
+        );
+        state.cursor_to_end();
+
+        state.split();
+        state.focus_pane(1);
+        // A fresh pane starts at the top, not wherever the other one was.
+        assert_eq!(state.cursor(), 0);
+
+        state.focus_pane(0);
+        assert_eq!(state.cursor(), 2);
     }
 
     #[test]

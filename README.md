@@ -66,6 +66,9 @@ explicit about what that costs.
 
 | Key | Does |
 |---|---|
+| `j` `k` / `↑` `↓` | Move through the table |
+| `g` / `G`, `home` / `end` | Jump to the first or last row |
+| `enter` | Open the row you are on |
 | `⌘K` / `ctrl-K` / `:` | Jump to a cluster, a kind, or an object by name |
 | `↑` `↓` / `ctrl-P` `ctrl-N`, `enter` | Move through the jump results and open one |
 | `escape` / `q` | Close the palette, then the command output, the log view, the detail pane |
@@ -117,6 +120,20 @@ cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fi
 
 Architecture decisions are recorded in [`docs/DECISIONS.md`](docs/DECISIONS.md) —
 append, never rewrite.
+
+## Finding things
+
+The sidebar groups every kind the cluster serves the way Rancher and the EKS
+console do — workloads, networking, configuration, storage, access control,
+cluster — with each custom resource under the API group that installed it, so
+cert-manager's `certificates` sit under `CERT-MANAGER.IO`. Only workloads is
+open at first; a section opens by itself when it holds whatever you have
+selected, and the filter box above them narrows across all of them at once.
+
+Moving through a table is `j`/`k` or the arrows, `g`/`G` for the ends, and
+`enter` to open what you are on. The cursor is a highlight; the object the
+detail pane is showing keeps a stripe down its left edge, so it stays findable
+after you have moved on.
 
 ## Several clusters
 
@@ -208,6 +225,11 @@ split = ["cmd-\\", "ctrl-\\"]
 next = ["down", "ctrl-n"]
 previous = ["up", "ctrl-p"]
 confirm = ["enter"]
+row-down = ["j", "down"]
+row-up = ["k", "up"]
+row-top = ["g", "home"]
+row-bottom = ["shift-g", "end"]
+open-row = ["enter"]
 ```
 
 Durations are written the way people write them — `30s`, `5m`, `1h` — and a bare
