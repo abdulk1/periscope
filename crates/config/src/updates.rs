@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 /// GitHub's releases endpoint for the repository this is built from.
-const DEFAULT_ENDPOINT: &str = "https://api.github.com/repos/abdul/periscope/releases/latest";
+const DEFAULT_ENDPOINT: &str = "https://api.github.com/repos/abdulk1/periscope/releases/latest";
 
 /// Whether to look for a newer version, and where.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

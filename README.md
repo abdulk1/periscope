@@ -225,7 +225,7 @@ pods = ["READY", "STATUS", "NODE"]
 
 [updates]
 check = false               # the only non-cluster network call, off unless asked for
-endpoint = "https://api.github.com/repos/abdul/periscope/releases/latest"
+endpoint = "https://api.github.com/repos/abdulk1/periscope/releases/latest"
 
 [keys]
 palette = ["cmd-k", "ctrl-k", ":"]

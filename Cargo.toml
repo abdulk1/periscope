@@ -8,7 +8,7 @@ edition = "2024"
 # Floor set by `kube` 4.2, which declares 1.89. See docs/DECISIONS.md ADR-0009.
 rust-version = "1.89"
 license = "Apache-2.0"
-repository = "https://github.com/abdul/periscope"
+repository = "https://github.com/abdulk1/periscope"
 authors = ["Periscope contributors"]
 
 [workspace.dependencies]
