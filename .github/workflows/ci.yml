@@ -18,7 +18,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -32,7 +32,7 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # GPUI links against the system graphics, font and input stacks.
       - name: Install Linux build dependencies
@@ -70,7 +70,7 @@ jobs:
     name: kind
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The e2e crate needs no display, but it does link the same graphics
       # dependencies through the workspace.
@@ -156,7 +156,7 @@ jobs:
     name: macOS bundle
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -174,7 +174,7 @@ jobs:
           test -f target/bundle/Periscope.app/Contents/Resources/AppIcon.icns
           hdiutil verify target/bundle/Periscope.dmg
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Periscope-macos-unsigned
           path: target/bundle/Periscope.dmg
@@ -184,7 +184,7 @@ jobs:
     name: deb and rpm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -241,7 +241,7 @@ jobs:
           desktop-file-validate /usr/share/applications/periscope.desktop
           sudo dpkg --remove periscope
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: periscope-linux-packages
           path: |
@@ -259,7 +259,7 @@ jobs:
     # on Windows is a question this job exists to answer, not one it assumes.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
