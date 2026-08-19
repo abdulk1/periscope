@@ -44,6 +44,16 @@ For a real application bundle on macOS:
 packaging/macos/bundle.sh      # -> target/bundle/Periscope.app and Periscope.dmg
 ```
 
+On Linux:
+
+```sh
+cargo deb --package scope            # -> target/debian/periscope_<version>_<arch>.deb
+cargo generate-rpm -p crates/scope   # -> target/generate-rpm/periscope-<version>.rpm
+```
+
+Both install `scope` to `/usr/bin`, a desktop entry and an icon; CI builds them,
+installs the `.deb` and validates the desktop entry on every change.
+
 The bundle is **unsigned** unless `PERISCOPE_CODESIGN_IDENTITY` and
 `PERISCOPE_NOTARY_PROFILE` are set, so on a machine other than the one that
 built it Gatekeeper refuses to open it until you right-click and choose Open.

@@ -161,3 +161,72 @@ jobs:
           name: Periscope-macos-unsigned
           path: target/bundle/Periscope.dmg
           if-no-files-found: error
+
+  linux-packages:
+    name: deb and rpm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libfontconfig-dev \
+            libwayland-dev \
+            libxkbcommon-x11-dev \
+            libssl-dev \
+            libzstd-dev \
+            libvulkan-dev \
+            libgl1-mesa-dev \
+            libxcb-composite0-dev \
+            desktop-file-utils \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: Build the binary
+        run: cargo build --release --bin scope
+
+      - name: Package
+        run: |
+          cargo deb --no-build --package scope
+          cargo generate-rpm -p crates/scope
+
+      # Proving the packages contain what they claim: a binary, a desktop entry
+      # and an icon, in the places a desktop expects to find them. `$auto` fills
+      # Depends in from the binary's own NEEDED entries, which only works on a
+      # real ELF build — this is the only place that is exercised.
+      - name: Check the packages
+        run: |
+          deb="$(ls target/debian/*.deb)"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          dpkg-deb --contents "$deb" | grep -q ' ./usr/bin/scope$'
+          dpkg-deb --contents "$deb" | grep -q 'periscope.desktop$'
+          dpkg-deb --field "$deb" Depends | grep -q .
+
+          rpm="$(ls target/generate-rpm/*.rpm)"
+          rpm -qlp "$rpm"
+          rpm -qlp "$rpm" | grep -qx '/usr/bin/scope'
+
+      - name: Install the deb and check it lands where it should
+        run: |
+          sudo dpkg --install "$(ls target/debian/*.deb)" || sudo apt-get -f install -y
+          test -x /usr/bin/scope
+          test -f /usr/share/applications/periscope.desktop
+          desktop-file-validate /usr/share/applications/periscope.desktop
+          sudo dpkg --remove periscope
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: periscope-linux-packages
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+          if-no-files-found: error

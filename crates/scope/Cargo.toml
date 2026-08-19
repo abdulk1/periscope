@@ -13,6 +13,42 @@ default-run = "scope"
 name = "scope"
 path = "src/main.rs"
 
+# Debian and RPM packaging. Both name the package `periscope` while the binary
+# stays `scope`: the application has a name, and the thing you type is shorter.
+[package.metadata.deb]
+name = "periscope"
+maintainer = "Periscope contributors"
+copyright = "2026, Periscope contributors"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+A native, GPU-accelerated Kubernetes console. Live resource streams over watch \
+APIs, log tailing across many pods at once, and several clusters side by side."""
+section = "utils"
+priority = "optional"
+# `$auto` reads the binary's own NEEDED entries, which is the only way to get
+# the graphics, font and input libraries GPUI links right.
+depends = "$auto"
+assets = [
+    ["target/release/scope", "usr/bin/", "755"],
+    ["../../packaging/linux/periscope.desktop", "usr/share/applications/", "644"],
+    [
+        "../../packaging/linux/periscope.png",
+        "usr/share/icons/hicolor/512x512/apps/periscope.png",
+        "644",
+    ],
+    ["../../README.md", "usr/share/doc/periscope/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "periscope"
+summary = "A native, GPU-accelerated Kubernetes console"
+assets = [
+    { source = "target/release/scope", dest = "/usr/bin/scope", mode = "755" },
+    { source = "../../packaging/linux/periscope.desktop", dest = "/usr/share/applications/periscope.desktop", mode = "644" },
+    { source = "../../packaging/linux/periscope.png", dest = "/usr/share/icons/hicolor/512x512/apps/periscope.png", mode = "644" },
+    { source = "../../LICENSE", dest = "/usr/share/doc/periscope/LICENSE", mode = "644", doc = true },
+]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

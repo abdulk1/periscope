@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Periscope
+GenericName=Kubernetes console
+Comment=Live Kubernetes resource streams, logs and multi-cluster navigation
+# The binary is `scope`; the application is Periscope. Both names are load
+# bearing — the first is what people type, the second is what they look for.
+Exec=scope
+Icon=periscope
+Terminal=false
+Categories=Development;System;Monitor;
+Keywords=kubernetes;k8s;kubectl;cluster;logs;
+StartupWMClass=scope
