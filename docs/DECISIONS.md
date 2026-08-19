@@ -399,6 +399,20 @@ Two things this deliberately does not do:
   over twice the budget, where a frame was genuinely dropped. Only the second
   number means something is wrong.
 
+**Amended 2026-08-19.** The meter timed the frame and nothing else, which was
+not enough to act on. Two changes, both because a number that cannot settle an
+argument is not worth logging:
+
+- The build timer starts at the first statement of `render` rather than partway
+  through it. Pruning the changed-row map and reparsing a newly-opened object's
+  YAML are work the frame does, and were being reported as free.
+- Batches from the cluster layer are timed separately (`applies`,
+  `apply_p50_us`, `apply_max_us`). They are folded into the store on the same
+  thread, between frames, so a slow batch is a dropped frame with nothing in the
+  frame's own numbers to explain it. Without this, "the store choked on a
+  resync" and "the compositor skipped a flip" looked identical — and the
+  hitches recorded in `docs/LIMITATIONS.md` turned out to be the second.
+
 ---
 
 ## ADR-0016 — Every auth failure names the credential plugin
