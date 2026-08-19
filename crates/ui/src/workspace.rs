@@ -792,6 +792,8 @@ impl Workspace {
         stats: FlushStats,
         cx: &mut Context<Self>,
     ) {
+        let timing = self.frames.enabled().then(Instant::now);
+
         self.stats.record(stats);
         self.state.apply_batch(events.iter(), Instant::now());
 
@@ -843,6 +845,14 @@ impl Workspace {
         }
         self.ensure_watches();
         self.sweep_idle_clusters(Instant::now(), cx);
+
+        // Applying a batch is not part of a frame, and it runs on the same
+        // thread — so a batch that takes longer than 16ms is a dropped frame
+        // with nothing in the frame's own numbers to explain it. That is the
+        // shape of the hitches `docs/LIMITATIONS.md` could not account for.
+        if let Some(started) = timing {
+            self.frames.applied(started.elapsed());
+        }
 
         cx.notify();
     }
@@ -4490,6 +4500,9 @@ impl Render for Workspace {
                 p95_ms = format!("{:.2}", stats.p95.as_secs_f64() * 1_000.0),
                 max_ms = format!("{:.2}", stats.max.as_secs_f64() * 1_000.0),
                 build_p50_us = stats.build_p50.as_micros() as u64,
+                applies = stats.applies,
+                apply_p50_us = stats.apply_p50.as_micros() as u64,
+                apply_max_us = stats.apply_max.as_micros() as u64,
                 over_budget = stats.over_budget,
                 hitches = stats.hitches,
                 rows = self.state.rows().len(),

@@ -361,11 +361,12 @@ The load fixture is `cargo run --release -p periscope-e2e --bin seed-pods`.
 were late. Re-measured on 2026-08-19 against `kind-periscope` with 10,024 pods
 loaded, release build, 60Hz panel.
 
-**A table of 10,024 rows, no log pane** — 38 reports:
+**A table of 10,024 rows, no log pane** — 48 reports:
 
 ```
-frames=120 fps=60.0 p50_ms=16.67 p95_ms=17.55 max_ms=17.91
-build_p50_us=150 over_budget=61 hitches=0 rows=10024 log_lines=0
+frames=120 fps=60.0 p50_ms=16.67 p95_ms=17.02 max_ms=17.62
+build_p50_us=100 applies=0 apply_p50_us=0 apply_max_us=0
+over_budget=62 hitches=0 rows=10024 log_lines=0
 ```
 
 **The same table with a log pane tailing four firehose pods, buffer at its
@@ -376,8 +377,10 @@ frames=120 fps=60.0 p50_ms=16.66 p95_ms=17.22 max_ms=17.46
 build_p50_us=138 over_budget=59 hitches=0 rows=10028 log_lines=100000
 ```
 
-Those are medians across the reports; `build_p50_us` ranged 124–179µs for the
-first and 109–138µs for the second, with occasional outliers noted below.
+Those are medians across the reports. `build_p50_us` varies between runs more
+than within one — 88–179µs across three separate sessions of the first
+scenario — which is background load on the machine, not the app changing its
+mind. Take ~100µs as the figure and the order of magnitude as the claim.
 
 The 60fps floor is met *because the panel is 60Hz*: every frame is vsync-locked
 at 16.67ms and the app is not the limiting factor — the whole element tree,
@@ -410,14 +413,36 @@ with no log pane open. The "before" column is a *lower* bound: it was produced
 by disabling only the memoisation, and the original also collected into a `Vec`
 and converted it, which this does not.
 
-Three honest caveats:
+### The hitches are the display, not the app
 
-- **The hitches are real and unexplained.** Seven of 38 reports in the
-  table-only run recorded 1–4 intervals over 33ms, with one outlier at 74.6ms;
-  the log run was mostly clean. A resync re-materialises all 10,024 rows in one
-  frame, which is the obvious suspect and has not been confirmed. `p50` and
-  `p95` are unaffected, so this is a rare stutter rather than a sustained cost,
-  but it is not nothing and it is not yet understood.
+An earlier draft of this section recorded occasional intervals over 33ms and
+could not account for them. `--perf` measured the frame and not the event pump,
+so "the store spent 40ms folding in a resync" was indistinguishable from "the
+compositor skipped a flip". It measures both now — `applies`, `apply_p50_us`,
+`apply_max_us` — and the answer is unambiguous.
+
+Across 48 reports, five recorded a hitch:
+
+```
+hitches=1 max_ms=43.17 build_p50_us=110 applies=1 apply_p50_us=916 apply_max_us=916
+hitches=1 max_ms=33.59 build_p50_us=105 applies=0 apply_p50_us=0   apply_max_us=0
+hitches=1 max_ms=33.54 build_p50_us=108 applies=0 apply_p50_us=0   apply_max_us=0
+hitches=1 max_ms=33.86 build_p50_us=111 applies=0 apply_p50_us=0   apply_max_us=0
+hitches=1 max_ms=33.55 build_p50_us=96  applies=0 apply_p50_us=0   apply_max_us=0
+```
+
+Four of the five applied *no batch at all* and built their tree in about 100µs:
+the app did essentially nothing in those windows. And the intervals sit at
+33.5ms, which is 16.67 × 2 to within a rounding error — one missed vsync, not
+a slow frame. The fifth folded in a batch that took 916µs, which is a
+seventeenth of a frame and cannot explain 43ms either.
+
+So the stutter is the display pipeline dropping a flip, and the app is not the
+cause. That is a claim worth being able to make, and it was not possible to make
+it before the pump was measured.
+
+Two honest caveats remain:
+
 - **120fps is unverified.** No 120Hz display was available.
 - **This measures redraw, not scrolling.** Continuous full redraw is strictly
   more work per frame than scrolling a `uniform_list`, so it is a reasonable

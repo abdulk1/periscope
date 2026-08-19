@@ -24,6 +24,13 @@ pub struct FrameMeter {
     intervals: Vec<Duration>,
     /// Time spent building the element tree, in the current report window.
     builds: Vec<Duration>,
+    /// Time spent folding batches from the cluster layer into the store, in the
+    /// current report window.
+    ///
+    /// Separate from `builds` because it is not part of a frame: it runs on the
+    /// same thread, between frames, and a long one shows up as a dropped frame
+    /// with nothing in the frame's own numbers to explain it.
+    applies: Vec<Duration>,
     /// Frames measured since the process started.
     total: u64,
 }
@@ -44,6 +51,13 @@ pub struct FrameStats {
     /// and paint, which happen after `render` returns, so a healthy `build_p50`
     /// beside a bad `p50` means the cost is not in this crate.
     pub build_p50: Duration,
+    /// Median time spent applying one batch from the cluster layer.
+    pub apply_p50: Duration,
+    /// The worst batch in this window. A single batch that takes longer than a
+    /// frame is a dropped frame, however cheap the frame itself was.
+    pub apply_max: Duration,
+    /// How many batches were applied in this window.
+    pub applies: usize,
     /// Intervals longer than the 60fps budget of 16.67ms.
     ///
     /// On a vsync-locked 60Hz display this sits near half the frames whatever
@@ -89,6 +103,17 @@ impl FrameMeter {
         self.total
     }
 
+    /// Records how long one batch from the cluster layer took to fold in.
+    ///
+    /// Costs nothing when `--perf` is off, so the caller can time
+    /// unconditionally only if timing is free; it is not, so the caller checks
+    /// [`FrameMeter::enabled`] first.
+    pub fn applied(&mut self, took: Duration) {
+        if self.enabled {
+            self.applies.push(took);
+        }
+    }
+
     /// Records the start of a render, returning the instant to hand back to
     /// [`FrameMeter::finish`]. `None` when timing is off, so the whole thing
     /// costs nothing in a normal run.
@@ -118,6 +143,7 @@ impl FrameMeter {
         let stats = self.stats();
         self.intervals.clear();
         self.builds.clear();
+        self.applies.clear();
         Some(stats)
     }
 
@@ -126,6 +152,8 @@ impl FrameMeter {
         intervals.sort_unstable();
         let mut builds = self.builds.clone();
         builds.sort_unstable();
+        let mut applies = self.applies.clone();
+        applies.sort_unstable();
 
         FrameStats {
             frames: intervals.len(),
@@ -133,6 +161,9 @@ impl FrameMeter {
             p95: percentile(&intervals, 0.95),
             max: intervals.last().copied().unwrap_or_default(),
             build_p50: percentile(&builds, 0.50),
+            apply_p50: percentile(&applies, 0.50),
+            apply_max: applies.last().copied().unwrap_or_default(),
+            applies: applies.len(),
             over_budget: intervals
                 .iter()
                 .filter(|interval| **interval > SIXTY_FPS)
@@ -183,7 +214,33 @@ mod tests {
     fn a_disabled_meter_records_nothing() {
         let mut meter = FrameMeter::new(false);
         assert!(run(&mut meter, 500, Duration::from_millis(8), Duration::ZERO).is_none());
+        meter.applied(Duration::from_millis(50));
         assert_eq!(meter.total(), 0);
+    }
+
+    #[test]
+    fn a_slow_batch_is_reported_separately_from_the_frame() {
+        // A batch is folded in between frames, on the same thread, so a slow
+        // one is a dropped frame that nothing in the frame's own numbers
+        // explains. That was a real unexplained stutter before it was measured.
+        let mut meter = meter();
+        meter.applied(Duration::from_millis(4));
+        meter.applied(Duration::from_millis(40));
+        meter.applied(Duration::from_millis(6));
+
+        let stats = run(
+            &mut meter,
+            REPORT_EVERY + 1,
+            Duration::from_millis(16),
+            Duration::from_micros(200),
+        )
+        .expect("a report");
+
+        assert_eq!(stats.applies, 3);
+        assert_eq!(stats.apply_p50, Duration::from_millis(6));
+        assert_eq!(stats.apply_max, Duration::from_millis(40));
+        // The frame's own build time is untouched by it, which is the point.
+        assert_eq!(stats.build_p50, Duration::from_micros(200));
     }
 
     #[test]
