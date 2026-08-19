@@ -128,8 +128,16 @@ cargo test -p periscope-e2e -- --ignored --test-threads 1
 cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fixture
 ```
 
-Architecture decisions are recorded in [`docs/DECISIONS.md`](docs/DECISIONS.md) —
-append, never rewrite.
+### Documentation
+
+| Document | For |
+|---|---|
+| [`CLAUDE.md`](CLAUDE.md) | Anyone changing this repository — the invariants, the loop, the traps |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | How the six crates fit together, and where a new feature goes |
+| [`docs/STYLE.md`](docs/STYLE.md) | How the code, tests and commit messages are written |
+| [`docs/TESTING.md`](docs/TESTING.md) | The six kinds of test, and which one you need |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Why things are the way they are. Append, never rewrite |
+| [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | What does not work, measured and unhidden |
 
 To look at what you changed, on macOS:
 
