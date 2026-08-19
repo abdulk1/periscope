@@ -81,7 +81,7 @@ where
             }
 
             let collapsed = coalescer.collapsed();
-            let batch = coalescer.drain();
+            let mut batch = coalescer.drain();
             let stats = FlushStats {
                 applied: batch.len(),
                 collapsed,
@@ -92,6 +92,22 @@ where
                 tracing::warn!(
                     dropped = stats.dropped,
                     "event channel overflowed; UI data may be stale"
+                );
+                // The store has a whole pathway for this — mark the data
+                // stale, clear the mark on the next full resync — and until
+                // now nothing in the program produced the event that starts
+                // it, so an overflow left rows that had quietly stopped being
+                // true with a counter in the footer as the only sign.
+                //
+                // The channel does not know whose event it discarded, and
+                // `None` is defined as tainting everything connected. Applied
+                // before the batch, because the drop happened before it.
+                batch.insert(
+                    0,
+                    ClusterEvent::Stale {
+                        cluster: None,
+                        dropped: stats.dropped,
+                    },
                 );
             }
 
@@ -129,6 +145,7 @@ mod tests {
         state: Option<ConnectionState>,
         flushes: usize,
         collapsed: u64,
+        stale: usize,
     }
 
     impl Readout {
@@ -138,6 +155,7 @@ mod tests {
                 state: None,
                 flushes: 0,
                 collapsed: 0,
+                stale: 0,
             }
         }
 
@@ -148,6 +166,7 @@ mod tests {
                 match event {
                     ClusterEvent::Pong { nonce, .. } => self.pongs.push(nonce),
                     ClusterEvent::Status { state, .. } => self.state = Some(state),
+                    ClusterEvent::Stale { dropped, .. } => self.stale += dropped,
                     _ => {}
                 }
             }
@@ -283,6 +302,33 @@ mod tests {
                 readout.flushes
             );
         });
+    }
+
+    #[gpui::test]
+    async fn an_overflow_tells_the_store_its_data_is_stale(cx: &mut TestAppContext) {
+        // The store has had the whole mechanism for this from the start — mark
+        // the cluster stale, clear it on the next full resync — and nothing
+        // produced the event that starts it. An overflow silently left rows
+        // that had stopped being true.
+        let (sink, stream) = event_channel(4);
+        let (readout, _pump) = start_pump(cx, stream);
+
+        // Nothing is draining yet, so past the fourth these are discarded.
+        for nonce in 0..64 {
+            sink.send(ClusterEvent::Pong {
+                cluster: "prod".into(),
+                nonce,
+                elapsed: Duration::from_millis(1),
+            });
+        }
+        assert!(sink.dropped() > 0, "the channel did not actually overflow");
+
+        let probe = readout.clone();
+        let told = settle_until(cx, Duration::from_secs(10), move |cx| {
+            probe.read_with(cx, |readout, _| readout.stale > 0)
+        });
+
+        assert!(told, "an overflow was never reported as staleness");
     }
 
     #[gpui::test]

@@ -788,6 +788,16 @@ impl Workspace {
         self.stats.record(stats);
         self.state.apply_batch(events.iter(), Instant::now());
 
+        // An overflow means events were discarded before anybody saw them, so
+        // the rows on screen may be describing objects that have since moved
+        // on. The only way back to the truth is to list again, which is what
+        // forgetting the watch does: `ensure_watches` re-sends it below, the
+        // cluster layer replaces the stream, and the resync that follows
+        // clears the stale marker.
+        if stats.dropped > 0 {
+            self.watching.clear();
+        }
+
         // Reading kubeconfig picks a cluster; opening it is what the user
         // actually asked for by starting the app. Every pane's cluster is
         // connected, not just the focused one.
@@ -4689,6 +4699,44 @@ mod tests {
 
     fn drain(rx: &CommandReceiver) -> Vec<ClusterCommand> {
         std::iter::from_fn(|| rx.try_recv()).collect()
+    }
+
+    #[gpui::test]
+    fn a_dropped_event_makes_the_table_list_itself_again(cx: &mut TestAppContext) {
+        // Events discarded by a full channel are objects that changed and were
+        // never described. Everything on screen might now be wrong, and the
+        // only way back to the truth is a fresh listing.
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(&harness, cx, vec![reset("prod", pods(), &["api-0"])]);
+        drain(&rx);
+
+        // A quiet batch asks for nothing: the watch is already running.
+        apply(&harness, cx, Vec::new());
+        assert!(drain(&rx).is_empty());
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.apply_events(
+                Vec::new(),
+                FlushStats {
+                    applied: 0,
+                    collapsed: 0,
+                    dropped: 3,
+                },
+                cx,
+            );
+        });
+
+        assert!(
+            drain(&rx).iter().any(
+                |command| matches!(command, ClusterCommand::Watch { kind, .. } if *kind == pods())
+            ),
+            "an overflow left the stale rows on screen"
+        );
     }
 
     #[test]
