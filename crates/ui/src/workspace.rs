@@ -362,6 +362,8 @@ pub struct Workspace {
     exec_input: Entity<InputState>,
     /// Whether the forwards panel is open.
     forwards_open: bool,
+    /// Whether the namespace list is showing.
+    namespace_menu_open: bool,
     /// How many lines a session keeps before dropping the oldest.
     log_capacity: usize,
     /// Which columns each kind shows.
@@ -550,6 +552,7 @@ impl Workspace {
             port_input,
             exec_input,
             forwards_open: false,
+            namespace_menu_open: false,
             log_capacity: periscope_store::logs::DEFAULT_CAPACITY,
             columns: periscope_store::Layout::default(),
             exports: 0,
@@ -1403,6 +1406,9 @@ impl Workspace {
         if self.pending.is_some() {
             // Escape closes the most dangerous thing on screen first.
             self.cancel_mutation(cx);
+        } else if self.namespace_menu_open {
+            self.namespace_menu_open = false;
+            cx.notify();
         } else if self.palette_open {
             self.close_palette(window, cx);
         } else if self.state.exec().is_some() {
@@ -1442,6 +1448,31 @@ impl Workspace {
             return;
         };
         self.open_object(key, window, cx);
+    }
+
+    /// Shows or hides the namespace list.
+    fn toggle_namespace_menu(&mut self, cx: &mut Context<Self>) {
+        self.namespace_menu_open = !self.namespace_menu_open;
+        cx.notify();
+    }
+
+    /// Applies a namespace picked from the list.
+    ///
+    /// `None` is "all namespaces", which is a real choice rather than an empty
+    /// field: it is how you get back to seeing everything.
+    fn pick_namespace(
+        &mut self,
+        namespace: Option<Arc<str>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = namespace.as_deref().unwrap_or_default().to_owned();
+        self.namespace_input.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+        });
+
+        self.namespace_menu_open = false;
+        self.apply_server_filters(cx);
     }
 
     /// Puts the cursor on a row, without opening it.
@@ -1850,6 +1881,18 @@ impl Workspace {
                 div()
                     .w(px(200.))
                     .child(Input::new(&self.namespace_input).small()),
+            )
+            // Typing a namespace requires knowing its name; this is how you
+            // find out what there is.
+            .child(
+                Button::new("namespaces")
+                    .outline()
+                    .small()
+                    .label(match self.state.filters().namespace.as_deref() {
+                        Some(namespace) => namespace.to_owned(),
+                        None => "All namespaces".to_owned(),
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_namespace_menu(cx))),
             )
             .child(
                 div()
@@ -3037,6 +3080,98 @@ impl Workspace {
         )
     }
 
+    /// The list of namespaces the loaded rows are in.
+    ///
+    /// Only what is held, which is what can be known without another request —
+    /// so the text field stays, for a namespace that has no rows yet.
+    fn namespace_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.namespace_menu_open {
+            return None;
+        }
+
+        let current = self.state.filters().namespace.clone();
+        let mut entries: Vec<gpui::AnyElement> = Vec::new();
+
+        let all_selected = current.is_none();
+        entries.push(
+            div()
+                .id("namespace-all")
+                .w_full()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .when(all_selected, |row| row.bg(cx.theme().accent))
+                .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.pick_namespace(None, window, cx);
+                }))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child("All namespaces"),
+                )
+                .into_any_element(),
+        );
+
+        for namespace in self.state.namespaces() {
+            let selected = current.as_deref() == Some(&*namespace);
+            let picked = Arc::clone(&namespace);
+
+            entries.push(
+                div()
+                    .id(SharedString::from(format!("namespace-{namespace}")))
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(cx.theme().accent))
+                    .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.pick_namespace(Some(Arc::clone(&picked)), window, cx);
+                    }))
+                    .child(
+                        div()
+                            .text_sm()
+                            .truncate()
+                            .text_color(cx.theme().foreground)
+                            .child(namespace.to_string()),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                // Clicking anywhere else puts it away, which is what everybody
+                // expects of a menu and what `escape` also does.
+                .id("namespace-backdrop")
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_namespace_menu(cx)))
+                .child(
+                    v_flex()
+                        .absolute()
+                        .top(px(96.))
+                        .left(px(500.))
+                        .w(px(260.))
+                        .max_h(px(320.))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().background)
+                        .p_1()
+                        .id("namespace-menu")
+                        .overflow_y_scroll()
+                        .children(entries),
+                ),
+        )
+    }
+
     /// The fuzzy jump palette, drawn over everything else.
     fn palette_overlay(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.palette_open {
@@ -3228,6 +3363,7 @@ impl Render for Workspace {
                     )
                     .child(self.footer(cx)),
             )
+            .children(self.namespace_menu(cx))
             .children(self.confirmation(cx))
             .children(self.palette_overlay(cx));
 
@@ -3676,6 +3812,121 @@ mod tests {
                 kind("cert-manager.io", "certificates", true),
             ]),
         }
+    }
+
+    #[gpui::test]
+    fn the_namespace_picker_lists_what_is_loaded_and_applies_a_choice(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![ClusterEvent::ResourceReset {
+                cluster: "prod".into(),
+                kind: pods(),
+                columns: Arc::from([ColumnSpec::fixed("STATUS", 100)]),
+                rows: Arc::from([
+                    ResourceRow {
+                        key: ResourceKey::new("payments", "api-0"),
+                        uid: None,
+                        cells: Arc::from([Arc::from("Running")]),
+                        state: RowState::Healthy,
+                        created: None,
+                    },
+                    ResourceRow {
+                        key: ResourceKey::new("kube-system", "coredns-0"),
+                        uid: None,
+                        cells: Arc::from([Arc::from("Running")]),
+                        state: RowState::Healthy,
+                        created: None,
+                    },
+                ]),
+            }],
+        );
+        drain(&rx);
+
+        harness.read(cx, |workspace| {
+            let namespaces: Vec<String> = workspace
+                .state()
+                .namespaces()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(namespaces, ["kube-system", "payments"]);
+            assert!(!workspace.namespace_menu_open);
+        });
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace.toggle_namespace_menu(cx);
+            assert!(workspace.namespace_menu_open);
+            workspace.pick_namespace(Some(Arc::from("payments")), window, cx);
+        });
+
+        harness.read(cx, |workspace| {
+            // Picking one closes the menu, filters the table, and shows the
+            // choice in the field somebody could also have typed into.
+            assert!(!workspace.namespace_menu_open);
+            assert_eq!(
+                workspace.state().filters().namespace.as_deref(),
+                Some("payments")
+            );
+            assert_eq!(workspace.state().rows().len(), 1);
+        });
+
+        // And it re-lists from the apiserver with the narrower scope.
+        assert!(drain(&rx).iter().any(|command| matches!(
+            command,
+            ClusterCommand::Watch { namespace: Some(namespace), .. } if &**namespace == "payments"
+        )));
+    }
+
+    #[gpui::test]
+    fn all_namespaces_is_a_choice_not_an_empty_field(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        harness.update(cx, |workspace, window, cx| {
+            workspace.pick_namespace(Some(Arc::from("payments")), window, cx);
+        });
+        drain(&rx);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace.pick_namespace(None, window, cx);
+        });
+
+        harness.read(cx, |workspace| {
+            assert_eq!(workspace.state().filters().namespace, None);
+        });
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_namespace_picker_before_anything_else(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        drain(&rx);
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.toggle_namespace_menu(cx);
+        });
+        harness.keys(cx, "escape");
+
+        harness.read(cx, |workspace| {
+            assert!(!workspace.namespace_menu_open);
+            // The detail pane behind it stayed.
+            assert!(workspace.state().detail().is_some());
+        });
     }
 
     #[gpui::test]

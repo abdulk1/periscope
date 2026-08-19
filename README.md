@@ -131,7 +131,10 @@ open at first; a section opens by itself when it holds whatever you have
 selected, and the filter box above them narrows across all of them at once.
 
 Moving through a table is `j`/`k` or the arrows, `g`/`G` for the ends, and
-`enter` to open what you are on. The cursor is a highlight; the object the
+`enter` to open what you are on. The **All namespaces** button beside the
+namespace field lists the namespaces the loaded rows are in, so narrowing to one
+does not mean knowing its name first; the field is still there for a namespace
+nothing has been loaded from yet. The cursor is a highlight; the object the
 detail pane is showing keeps a stripe down its left edge, so it stays findable
 after you have moved on.
 
