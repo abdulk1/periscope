@@ -5,6 +5,7 @@
 //! window and without a cluster.
 
 pub mod app;
+pub mod catalog;
 pub mod columns;
 pub mod connections;
 pub mod logs;
@@ -12,6 +13,7 @@ pub mod permissions;
 pub mod table;
 
 pub use app::{AppState, Detail, ExecSession, Filters};
+pub use catalog::{Category, sections};
 pub use columns::Layout;
 pub use connections::{Connection, ConnectionRegistry};
 pub use logs::{FilterSpec, LogBuffer};

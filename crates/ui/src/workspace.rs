@@ -287,6 +287,11 @@ pub struct Workspace {
     namespace_input: Entity<InputState>,
     selector_input: Entity<InputState>,
     search_input: Entity<InputState>,
+    /// Narrows the sidebar's kind list. Seventy-seven kinds is a lot to scroll.
+    kind_filter_input: Entity<InputState>,
+    /// Sections the user has opened or closed, overriding the default. Keyed by
+    /// heading, so a custom API group keeps its state when kinds are rediscovered.
+    sections_open: std::collections::HashMap<String, bool>,
     /// The YAML pane, a read-only syntax-highlighted editor.
     yaml_view: Entity<InputState>,
     /// Which object's YAML the editor currently holds.
@@ -397,6 +402,8 @@ impl Workspace {
             cx.new(|cx| InputState::new(window, cx).placeholder("jump to a kind or object"));
         let replicas_input = cx.new(|cx| InputState::new(window, cx).placeholder("replicas"));
         let port_input = cx.new(|cx| InputState::new(window, cx).placeholder("port"));
+        let kind_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("filter kinds"));
         let exec_input = cx.new(|cx| InputState::new(window, cx).placeholder("command"));
         let log_filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("filter lines"));
         let log_selector_input =
@@ -429,6 +436,15 @@ impl Workspace {
                     this.apply_server_filters(cx);
                 }
             }),
+            // Local to the sidebar: nothing is re-fetched, so it applies as typed.
+            cx.subscribe(
+                &kind_filter_input,
+                |_this, _input, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                },
+            ),
             // Filtering never restarts the stream, so it applies as it is typed.
             cx.subscribe(&log_filter_input, |this, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -477,6 +493,8 @@ impl Workspace {
             namespace_input,
             selector_input,
             search_input,
+            kind_filter_input,
+            sections_open: std::collections::HashMap::new(),
             log_filter_input,
             log_selector_input,
             log_container_input,
@@ -1574,61 +1592,132 @@ impl Workspace {
             })
             .collect();
 
+        let filter = self
+            .kind_filter_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
         let current_kind = self.state.kind().cloned();
-        let kinds: Vec<_> = self
-            .state
-            .kinds()
-            .iter()
-            .filter(|info| info.watchable)
-            .map(|info| {
-                let selected = current_kind.as_ref() == Some(&info.id);
-                let count = self.state.row_count(&info.id);
-                let click_kind = info.id.clone();
+        let mut sections: Vec<gpui::AnyElement> = Vec::new();
 
+        for (category, kinds) in periscope_store::sections(self.state.kinds()) {
+            let matching: Vec<_> = kinds
+                .iter()
+                .filter(|info| {
+                    filter.is_empty() || info.id.label().to_lowercase().contains(&filter)
+                })
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+
+            let title = category.title();
+            // Three things open a section: the user, a filter that found
+            // something in it, and the selection being inside it — the last so
+            // that what you are looking at is never hidden behind a chevron.
+            let holds_selection = current_kind
+                .as_ref()
+                .is_some_and(|kind| matching.iter().any(|info| &info.id == kind));
+            let by_choice = self.section_is_open(&category);
+            let open = !filter.is_empty() || holds_selection || by_choice;
+
+            let heading = title.clone();
+            sections.push(
                 div()
-                    .id(SharedString::from(format!("kind-{}", info.id.label())))
+                    .id(SharedString::from(format!("section-{title}")))
                     .w_full()
-                    .px_3()
+                    .px_2()
                     .py_1()
                     .rounded_md()
-                    .when(selected, |row| row.bg(cx.theme().accent))
-                    .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
                     .cursor_pointer()
+                    .hover(|row| row.bg(cx.theme().accent.opacity(0.4)))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_kind(click_kind.clone(), cx);
+                        this.toggle_section(heading.clone(), by_choice, cx);
                     }))
                     .child(
                         h_flex()
                             .justify_between()
                             .items_center()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
                             .child(
-                                div()
-                                    .text_sm()
-                                    .truncate()
-                                    .text_color(if info.custom {
-                                        cx.theme().info
-                                    } else {
-                                        cx.theme().foreground
-                                    })
-                                    .child(info.id.label()),
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(if open { "▾" } else { "▸" })
+                                    .child(title.clone()),
                             )
-                            .children((count > 0).then(|| {
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(count.to_string())
-                            })),
+                            .child(matching.len().to_string()),
                     )
-            })
-            .collect();
+                    .into_any_element(),
+            );
 
-        let kinds_empty = kinds.is_empty().then(|| {
+            if !open {
+                continue;
+            }
+
+            for info in matching {
+                let selected = current_kind.as_ref() == Some(&info.id);
+                let count = self.state.row_count(&info.id);
+                let click_kind = info.id.clone();
+                let custom = info.custom;
+
+                sections.push(
+                    div()
+                        .id(SharedString::from(format!("kind-{}", info.id.label())))
+                        .w_full()
+                        .pl_5()
+                        .pr_3()
+                        .py_1()
+                        .rounded_md()
+                        .when(selected, |row| row.bg(cx.theme().accent))
+                        .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_kind(click_kind.clone(), cx);
+                        }))
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .truncate()
+                                        .text_color(if custom {
+                                            cx.theme().info
+                                        } else {
+                                            cx.theme().foreground
+                                        })
+                                        // Inside a section the group is the
+                                        // heading, so the plural alone reads
+                                        // better than `deployments.apps`.
+                                        .child(info.id.plural.to_string()),
+                                )
+                                .children((count > 0).then(|| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(count.to_string())
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let nothing = sections.is_empty().then(|| {
             div()
                 .px_3()
                 .py_1()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child("connect to discover kinds")
+                .child(if self.state.kinds().is_empty() {
+                    "connect to discover kinds"
+                } else {
+                    "no kind matches that filter"
+                })
         });
 
         v_flex()
@@ -1643,9 +1732,16 @@ impl Workspace {
             .border_color(cx.theme().border)
             .child(section("CONTEXTS", cx))
             .children(contexts)
-            .child(section("KINDS", cx))
-            .children(kinds)
-            .children(kinds_empty)
+            .child(section("RESOURCES", cx))
+            .child(
+                div()
+                    .w_full()
+                    .px_1()
+                    .pb_1()
+                    .child(Input::new(&self.kind_filter_input).small()),
+            )
+            .children(sections)
+            .children(nothing)
     }
 
     /// Namespace, selector and text filters.
@@ -1793,6 +1889,34 @@ impl Workspace {
                     ))
                     .child(cold_start),
             )
+    }
+
+    /// What the sidebar's kind filter currently holds, for tests.
+    #[cfg(test)]
+    fn kind_filter(&self, cx: &App) -> String {
+        self.kind_filter_input.read(cx).value().to_string()
+    }
+
+    /// Whether a sidebar section is showing its kinds.
+    ///
+    /// The user's choice if they made one, and the category's own default
+    /// otherwise — everything except workloads starts closed, because a list of
+    /// seventy-seven kinds is the thing sections exist to remove.
+    fn section_is_open(&self, category: &periscope_store::Category) -> bool {
+        self.sections_open
+            .get(&category.title())
+            .copied()
+            .unwrap_or_else(|| category.open_by_default())
+    }
+
+    /// Opens a closed section, or closes an open one.
+    ///
+    /// `open` is the section's *own* state, not what is on screen: a section
+    /// forced open by a filter or by holding the selection still collapses back
+    /// to closed when its heading is clicked, rather than needing two clicks.
+    fn toggle_section(&mut self, title: String, open: bool, cx: &mut Context<Self>) {
+        self.sections_open.insert(title, !open);
+        cx.notify();
     }
 
     /// The columns a pane renders, each paired with its position in the kind's
@@ -3434,6 +3558,151 @@ mod tests {
 
         harness.read(cx, |workspace| {
             assert_eq!(workspace.visible_columns(0).len(), 4);
+        });
+    }
+
+    /// A discovery event with kinds spread across several sidebar sections.
+    fn many_kinds(cluster: &str) -> ClusterEvent {
+        let kind = |group: &str, plural: &str, custom: bool| KindInfo {
+            id: KindId::new(group, "v1", plural, plural),
+            namespaced: true,
+            watchable: true,
+            custom,
+        };
+
+        ClusterEvent::Kinds {
+            cluster: cluster.into(),
+            kinds: Arc::from([
+                kind("", "pods", false),
+                kind("apps", "deployments", false),
+                kind("", "services", false),
+                kind("", "secrets", false),
+                kind("", "nodes", false),
+                kind("cert-manager.io", "certificates", true),
+            ]),
+        }
+    }
+
+    #[gpui::test]
+    fn the_sidebar_groups_kinds_and_opens_only_workloads(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        apply(&harness, cx, vec![contexts(&["prod"], "prod")]);
+        apply(&harness, cx, vec![many_kinds("prod")]);
+
+        harness.read(cx, |workspace| {
+            let sections = periscope_store::sections(workspace.state().kinds());
+            let titles: Vec<String> = sections
+                .iter()
+                .map(|(category, _)| category.title())
+                .collect();
+
+            assert_eq!(
+                titles,
+                [
+                    "WORKLOADS",
+                    "NETWORKING",
+                    "CONFIGURATION",
+                    "CLUSTER",
+                    "CERT-MANAGER.IO"
+                ]
+            );
+
+            // Only workloads is open, or the sections would be a wall again.
+            for (category, _) in &sections {
+                assert_eq!(
+                    workspace.section_is_open(category),
+                    category.title() == "WORKLOADS",
+                    "{}",
+                    category.title()
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn a_section_opens_and_closes_when_its_heading_is_clicked(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        apply(&harness, cx, vec![contexts(&["prod"], "prod")]);
+        apply(&harness, cx, vec![many_kinds("prod")]);
+
+        let storage = periscope_store::Category::Networking;
+        harness.update(cx, |workspace, _window, cx| {
+            assert!(!workspace.section_is_open(&storage));
+            // One click opens a closed section — the bug this guards against is
+            // a first click that stores the state it already had.
+            workspace.toggle_section(storage.title(), false, cx);
+            assert!(workspace.section_is_open(&storage));
+
+            workspace.toggle_section(storage.title(), true, cx);
+            assert!(!workspace.section_is_open(&storage));
+        });
+
+        // And the same for one that starts open.
+        let workloads = periscope_store::Category::Workloads;
+        harness.update(cx, |workspace, _window, cx| {
+            assert!(workspace.section_is_open(&workloads));
+            workspace.toggle_section(workloads.title(), true, cx);
+            assert!(!workspace.section_is_open(&workloads));
+        });
+    }
+
+    #[gpui::test]
+    fn selecting_a_kind_in_a_closed_section_still_shows_it(cx: &mut TestAppContext) {
+        // Opening `secrets` from the palette must not leave the selection
+        // hidden behind a collapsed heading.
+        let (harness, _rx) = workspace(cx);
+        apply(&harness, cx, vec![contexts(&["prod"], "prod")]);
+        apply(&harness, cx, vec![many_kinds("prod")]);
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.select_kind(KindId::new("", "v1", "secrets", "secrets"), cx);
+        });
+
+        harness.read(cx, |workspace| {
+            let configuration = periscope_store::Category::Configuration;
+            // The section itself is still closed by choice...
+            assert!(!workspace.section_is_open(&configuration));
+            // ...and the sidebar renders it open anyway, which is what the
+            // render path asserts by holding the selection.
+            let holds = periscope_store::sections(workspace.state().kinds())
+                .into_iter()
+                .find(|(category, _)| category == &configuration)
+                .is_some_and(|(_, kinds)| {
+                    kinds
+                        .iter()
+                        .any(|info| Some(&info.id) == workspace.state().kind())
+                });
+            assert!(
+                holds,
+                "the selected kind is not in the section it renders in"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_kind_filter_narrows_the_sidebar(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        apply(&harness, cx, vec![contexts(&["prod"], "prod")]);
+        apply(&harness, cx, vec![many_kinds("prod")]);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace
+                .kind_filter_input
+                .update(cx, |input, cx| input.set_value("cert", window, cx));
+        });
+
+        harness.read(cx, |workspace| {
+            let matches: Vec<String> = periscope_store::sections(workspace.state().kinds())
+                .into_iter()
+                .flat_map(|(_, kinds)| kinds)
+                .map(|info| info.id.label())
+                .filter(|label| label.contains("cert"))
+                .collect();
+
+            assert_eq!(matches, ["certificates.cert-manager.io"]);
+        });
+        harness.update(cx, |workspace, _window, cx| {
+            assert_eq!(workspace.kind_filter(cx), "cert");
         });
     }
 
