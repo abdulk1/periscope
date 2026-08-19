@@ -358,41 +358,70 @@ The load fixture is `cargo run --release -p periscope-e2e --bin seed-pods`.
 
 `--perf` puts the window into continuous redraw and logs frame statistics every
 120 frames: fps, p50/p95/max interval, element-build time, and how many frames
-were late. Measured with 10,009 rows loaded:
+were late. Re-measured on 2026-08-19 against `kind-periscope` with 10,024 pods
+loaded, release build, 60Hz panel.
+
+**A table of 10,024 rows, no log pane** — 38 reports:
 
 ```
-frames=120 fps=60.0 p50_ms=16.66 p95_ms=17.15 max_ms=21.77
-build_p50_us=198 over_budget=57 hitches=0 rows=10009
+frames=120 fps=60.0 p50_ms=16.67 p95_ms=17.55 max_ms=17.91
+build_p50_us=150 over_budget=61 hitches=0 rows=10024 log_lines=0
 ```
 
-The 60fps floor is met with nothing to spare *because the panel is 60Hz*: every
-frame is vsync-locked at 16.67ms and the app is not the limiting factor.
+**The same table with a log pane tailing four firehose pods, buffer at its
+100,000-line capacity** — 71 reports:
+
+```
+frames=120 fps=60.0 p50_ms=16.66 p95_ms=17.22 max_ms=17.46
+build_p50_us=138 over_budget=59 hitches=0 rows=10028 log_lines=100000
+```
+
+Those are medians across the reports; `build_p50_us` ranged 124–179µs for the
+first and 109–138µs for the second, with occasional outliers noted below.
+
+The 60fps floor is met *because the panel is 60Hz*: every frame is vsync-locked
+at 16.67ms and the app is not the limiting factor — the whole element tree,
+including a full-capacity log buffer, is built in under 1% of the budget.
 `over_budget` counts intervals over 16.67ms and hovers near half the frames
 purely from vsync jitter; `hitches` (over 33ms, i.e. a frame genuinely skipped)
-stayed at 0.
+was 0 in most reports and 1–4 in a minority — see below.
+
+### What this replaces
+
+The figure recorded here before was `build_p50_us=198`, and it is not
+comparable: the timer used to start partway through `render`, after the
+changed-row map had been pruned and a newly-opened object's YAML reparsed, so
+that work was measured as free. It starts at the first statement now, measures
+strictly more, and reads *lower*, because three per-frame costs that scaled with
+the size of the cluster were removed in between.
+
+The largest is worth quoting, because it was measured both ways. With the log
+buffer at capacity, in the run above:
+
+| | `build_p50_us` |
+|---|---|
+| Copying the visible lines every frame | 1,777 (range 1,272–2,050) |
+| Handing out a shared snapshot | 138 (range 109–138) |
+
+1.8ms of a 16.67ms budget — 11% of every frame — spent copying 100,000 `Arc`s
+and allocating 800KB, sixty times a second, to render the thirty lines on
+screen. It never showed up in the old number because the old measurement ran
+with no log pane open. The "before" column is a *lower* bound: it was produced
+by disabling only the memoisation, and the original also collected into a `Vec`
+and converted it, which this does not.
 
 Three honest caveats:
 
-- **`build_p50_us=198` understates the frame, and is not comparable to what the
-  binary prints today.** The timer used to start partway through `render`, after
-  the changed-row map had been pruned and a newly-opened object's YAML reparsed,
-  so that work was measured as free. It starts at the first statement now. The
-  figure above has not been re-measured since; the number the current build
-  prints should be larger and is the honest one. What has *not* changed is the
-  conclusion — `p50_ms` and `hitches` are end-to-end measurements and they are
-  what says the app holds 60fps.
+- **The hitches are real and unexplained.** Seven of 38 reports in the
+  table-only run recorded 1–4 intervals over 33ms, with one outlier at 74.6ms;
+  the log run was mostly clean. A resync re-materialises all 10,024 rows in one
+  frame, which is the obvious suspect and has not been confirmed. `p50` and
+  `p95` are unaffected, so this is a rare stutter rather than a sustained cost,
+  but it is not nothing and it is not yet understood.
 - **120fps is unverified.** No 120Hz display was available.
 - **This measures redraw, not scrolling.** Continuous full redraw is strictly
   more work per frame than scrolling a `uniform_list`, so it is a reasonable
   floor — but nobody has driven a scroll gesture under instrumentation.
-
-Three per-frame costs that scaled with the size of the cluster were removed
-after those numbers were taken, and all three were invisible in them because the
-measurement above ran with no log pane open and one pane: the log buffer was
-copied whole (100,000 `Arc` clones and an 800KB allocation) every frame, the
-toolbar walked every row to render a namespace count, and sorting by a column
-allocated two lowercased strings per comparison. They would have shown up on a
-busier screen than the one that was measured.
 
 ## Testing
 
