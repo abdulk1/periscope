@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use periscope_bridge::{ColumnSpec, ResourceKey, ResourceRow};
 
@@ -15,6 +16,19 @@ use periscope_bridge::{ColumnSpec, ResourceKey, ResourceRow};
 pub struct ResourceTable {
     rows: BTreeMap<ResourceKey, Arc<ResourceRow>>,
     columns: Arc<[ColumnSpec]>,
+    /// When each row last changed. Pruned as it is read, so a resync cannot
+    /// leave a timestamp per object behind it.
+    changed: BTreeMap<ResourceKey, Instant>,
+    /// The same map, shared with the view.
+    ///
+    /// Rebuilt only when the set actually moves rather than once per frame: a
+    /// busy cluster can have thousands of rows inside the highlight window, and
+    /// copying that map sixty times a second to render thirty visible rows is
+    /// the kind of cost that does not show up until somebody has a real
+    /// workload.
+    snapshot: Arc<BTreeMap<ResourceKey, Instant>>,
+    /// Whether `snapshot` is behind `changed`.
+    restale: bool,
 }
 
 impl ResourceTable {
@@ -51,18 +65,54 @@ impl ResourceTable {
 
         self.columns = columns;
         self.rows = replacement;
+        // Deliberately not marked as changed: a resync replaces everything, and
+        // flashing every row would say "all of this just happened" when what
+        // happened is that the watch reconnected.
+        self.changed.clear();
+        self.restale = true;
         true
     }
 
     /// Adds or updates one row, reporting whether it differed from what was held.
     pub fn apply(&mut self, row: Arc<ResourceRow>) -> bool {
+        self.apply_at(row, Instant::now())
+    }
+
+    /// Adds or replaces a row, recording when it changed.
+    ///
+    /// The clock is a parameter so the marking is testable without sleeping.
+    pub fn apply_at(&mut self, row: Arc<ResourceRow>, now: Instant) -> bool {
         match self.rows.get(&row.key) {
             Some(existing) if **existing == *row => false,
             _ => {
+                self.changed.insert(row.key.clone(), now);
+                self.restale = true;
                 self.rows.insert(row.key.clone(), row);
                 true
             }
         }
+    }
+
+    /// When each row last changed, for the view to mark what just moved.
+    ///
+    /// Only recent changes are kept — anything older than `window` is dropped
+    /// as it is asked for — so this cannot grow with the table. A resync
+    /// rewrites every row at once, which would otherwise leave ten thousand
+    /// timestamps behind for a highlight that lasts under a second.
+    pub fn changed_since(
+        &mut self,
+        now: Instant,
+        window: Duration,
+    ) -> Arc<BTreeMap<ResourceKey, Instant>> {
+        let before = self.changed.len();
+        self.changed
+            .retain(|_, at| now.duration_since(*at) < window);
+
+        if self.restale || self.changed.len() != before {
+            self.snapshot = Arc::new(self.changed.clone());
+            self.restale = false;
+        }
+        Arc::clone(&self.snapshot)
     }
 
     /// Removes a row, reporting whether it was there.
@@ -105,6 +155,91 @@ impl ResourceTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_named(name: &str, cell: &str) -> Arc<ResourceRow> {
+        Arc::new(ResourceRow {
+            key: ResourceKey::new("default", name),
+            uid: None,
+            cells: Arc::from([Arc::from(cell)]),
+            state: periscope_bridge::RowState::Healthy,
+            created: None,
+        })
+    }
+
+    #[test]
+    fn a_changed_row_is_marked_and_then_forgotten() {
+        let mut table = ResourceTable::new();
+        let start = Instant::now();
+        let window = Duration::from_millis(900);
+
+        table.apply_at(row_named("api-0", "1"), start);
+        assert!(
+            table
+                .changed_since(start, window)
+                .contains_key(&ResourceKey::new("default", "api-0"))
+        );
+
+        // The mark is what makes a live change visible; it has to expire, or
+        // the table ends up permanently highlighted.
+        let later = start + window + Duration::from_millis(1);
+        assert!(table.changed_since(later, window).is_empty());
+    }
+
+    #[test]
+    fn a_row_that_did_not_change_is_not_marked() {
+        // The same object arriving again is what a watch does constantly; only
+        // a difference is news.
+        let mut table = ResourceTable::new();
+        let start = Instant::now();
+
+        table.apply_at(row_named("api-0", "1"), start);
+        table.changed_since(start + Duration::from_secs(5), Duration::from_millis(900));
+
+        assert!(!table.apply_at(row_named("api-0", "1"), start));
+        assert!(
+            table
+                .changed_since(start, Duration::from_millis(900))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_resync_marks_nothing() {
+        // Everything arriving at once means the watch reconnected, not that
+        // every object in the cluster just moved.
+        let mut table = ResourceTable::new();
+        let now = Instant::now();
+
+        table.reset(
+            Arc::from([ColumnSpec::fixed("DATA", 60)]),
+            &[
+                (*row_named("api-0", "1")).clone(),
+                (*row_named("api-1", "2")).clone(),
+            ],
+        );
+
+        assert!(
+            table
+                .changed_since(now, Duration::from_millis(900))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_shared_map_is_not_rebuilt_when_nothing_moved() {
+        // It is read once per frame; rebuilding it each time would copy a map
+        // of every row a busy cluster touched in the last second, sixty times
+        // a second.
+        let mut table = ResourceTable::new();
+        let now = Instant::now();
+        table.apply_at(row_named("api-0", "1"), now);
+
+        let first = table.changed_since(now, Duration::from_secs(5));
+        let second = table.changed_since(now, Duration::from_secs(5));
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
     use periscope_bridge::RowState;
 
     fn columns() -> Arc<[ColumnSpec]> {

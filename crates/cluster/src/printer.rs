@@ -98,7 +98,13 @@ pub struct PrinterColumn {
 impl PrinterColumn {
     /// The column as the table renders it.
     fn spec(&self) -> ColumnSpec {
-        ColumnSpec::fixed(&self.name, self.format.width())
+        let spec = ColumnSpec::fixed(&self.name, self.format.width());
+        // A declared `integer` or `number` reads down its right edge, like
+        // every count column the built-in kinds define.
+        match self.format {
+            Format::Numeric => spec.numeric(),
+            _ => spec,
+        }
     }
 
     /// This column's cell for one object, as of `now`.

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui::prelude::FluentBuilder as _;
+use gpui::{Animation, AnimationExt as _, pulsating_between};
 use gpui::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
     IntoElement, KeyBinding, ParentElement as _, Render, SharedString,
@@ -465,6 +466,9 @@ pub struct Workspace {
     log_capacity: usize,
     /// Which columns each kind shows.
     columns: periscope_store::Layout,
+    /// Rows that changed recently, refreshed once per frame rather than looked
+    /// up per row: the table is virtualised but the map is one allocation.
+    changed: Arc<std::collections::BTreeMap<ResourceKey, Instant>>,
     /// Counts exports, so two in one session do not overwrite each other.
     exports: u32,
     /// Frame timing, collected only under `--perf`.
@@ -679,6 +683,7 @@ impl Workspace {
             detail_tab: DetailTab::default(),
             log_capacity: periscope_store::logs::DEFAULT_CAPACITY,
             columns: periscope_store::Layout::default(),
+            changed: Arc::default(),
             exports: 0,
             frames: FrameMeter::new(perf),
             _subscriptions: subscriptions,
@@ -1968,8 +1973,8 @@ impl Workspace {
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let subtitle = match (self.state.active(), self.state.kind()) {
-            (Some(cluster), Some(kind)) => format!("{cluster} · {kind}"),
-            (Some(cluster), None) => cluster.to_string(),
+            (Some(_), Some(kind)) => kind.label(),
+            (Some(_), None) => "no kind selected".to_owned(),
             _ => "no cluster selected".to_owned(),
         };
 
@@ -1978,23 +1983,38 @@ impl Workspace {
             .flex_none()
             .items_center()
             .justify_between()
-            .px_5()
-            .py_4()
+            .px_4()
+            .py_3()
             .border_b_1()
-            .border_color(cx.theme().border)
+            .border_color(crate::style::hairline(cx))
             .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .text_color(cx.theme().foreground)
-                            .child("Periscope"),
-                    )
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    // The cluster is the title. The window is already called
+                    // Periscope, and a console's first question is always
+                    // "which cluster am I about to change".
+                    .children(self.state.active().map(|cluster| {
+                        let state = self
+                            .state
+                            .active_connection()
+                            .map(|connection| connection.state.clone())
+                            .unwrap_or(ConnectionState::Idle);
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(status_dot(&state, cx))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .text_color(crate::style::text(cx))
+                                    .child(cluster.to_string()),
+                            )
+                    }))
                     .child(
                         div()
                             .text_sm()
-                            .text_color(cx.theme().muted_foreground)
+                            .text_color(crate::style::text_faint(cx))
                             .child(subtitle),
                     ),
             )
@@ -2020,7 +2040,7 @@ impl Workspace {
                     )
                     .child(
                         Button::new("palette")
-                            .outline()
+                            .ghost()
                             .small()
                             .label("Jump  ⌘K")
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -2029,7 +2049,7 @@ impl Workspace {
                     )
                     .children((self.state.forward_count() > 0).then(|| {
                         Button::new("forwards")
-                            .outline()
+                            .ghost()
                             .small()
                             .label(if self.state.broken_forwards() > 0 {
                                 format!("Forwards {} ⚠", self.state.forward_count())
@@ -2040,7 +2060,7 @@ impl Workspace {
                     }))
                     .child(
                         Button::new("split")
-                            .outline()
+                            .ghost()
                             .small()
                             .label(if self.state.is_split() {
                                 "Single  ⌘\\"
@@ -2053,16 +2073,18 @@ impl Workspace {
                     )
                     .child(
                         Button::new("reload")
-                            .outline()
+                            .ghost()
                             .small()
-                            .label("Reload contexts")
+                            .label("Reload")
                             .on_click(cx.listener(|this, _, _, cx| this.reload_contexts(cx))),
                     )
                     .child(
                         Button::new("theme")
-                            .outline()
+                            .ghost()
                             .small()
-                            .label(format!("Theme: {}", self.theme.label()))
+                            // The word "Theme" is the one thing the button
+                            // cannot be about anything else.
+                            .label(self.theme.label())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.cycle_theme(window, cx)),
                             ),
@@ -2199,25 +2221,31 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("context-{}", context.name)))
                     .w_full()
-                    .px_3()
-                    .py_2()
+                    .h(px(crate::style::ITEM_HEIGHT))
+                    .flex_none()
+                    .px_2()
                     .rounded_md()
-                    .when(selected, |row| row.bg(cx.theme().accent))
-                    .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
+                    .when(selected, |row| row.bg(crate::style::selected(cx)))
+                    .hover(|row| row.bg(crate::style::hover(cx)))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_cluster(click_id.clone(), cx);
                     }))
                     .child(
                         h_flex()
+                            .h_full()
                             .gap_2()
                             .items_center()
-                            .child(div().size(px(8.)).rounded_full().bg(state_color(state, cx)))
+                            .child(status_dot(state, cx))
                             .child(
                                 div()
                                     .text_sm()
                                     .truncate()
-                                    .text_color(cx.theme().foreground)
+                                    .text_color(if selected {
+                                        crate::style::text(cx)
+                                    } else {
+                                        crate::style::text_dim(cx)
+                                    })
                                     .child(context.name.to_string()),
                             )
                             // A cluster open in the other pane is still open;
@@ -2362,33 +2390,22 @@ impl Workspace {
             .py_2()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(
-                div()
-                    .w(px(200.))
-                    .child(Input::new(&self.namespace_input).small()),
-            )
-            // Typing a namespace requires knowing its name; this is how you
-            // find out what there is.
+            // The filters read as one strip rather than four boxes: they are
+            // the same kind of thing, and a bordered field for each made them
+            // the loudest part of a window whose subject is the table below.
             .child(
                 Button::new("namespaces")
-                    .outline()
+                    .ghost()
                     .small()
                     .label(match self.state.filters().namespace.as_deref() {
-                        Some(namespace) => namespace.to_owned(),
-                        None => "All namespaces".to_owned(),
+                        Some(namespace) => format!("{namespace}  ▾"),
+                        None => "All namespaces  ▾".to_owned(),
                     })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_namespace_menu(cx))),
             )
-            .child(
-                div()
-                    .w(px(220.))
-                    .child(Input::new(&self.selector_input).small()),
-            )
-            .child(
-                div()
-                    .w(px(220.))
-                    .child(Input::new(&self.search_input).small()),
-            )
+            .child(Self::field(180., &self.namespace_input, cx))
+            .child(Self::field(200., &self.selector_input, cx))
+            .child(Self::field(200., &self.search_input, cx))
             .child(
                 div()
                     .text_xs()
@@ -2399,6 +2416,16 @@ impl Workspace {
                         format!("{shown} of {total} shown · {namespaces} namespaces")
                     }),
             )
+    }
+
+    /// One filter field: a quiet surface that only shows an edge when it is
+    /// being typed into.
+    fn field(width: f32, input: &Entity<InputState>, cx: &App) -> gpui::Div {
+        div()
+            .w(px(width))
+            .rounded(px(crate::style::RADIUS))
+            .bg(crate::style::raised(cx))
+            .child(Input::new(input).small().appearance(false).bordered(false))
     }
 
     /// The banner that explains whatever is currently wrong.
@@ -2444,9 +2471,6 @@ impl Workspace {
 
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let connection = self.state.active_connection();
-        let state = connection
-            .map(|connection| connection.state.label())
-            .unwrap_or("no cluster selected");
 
         let stale = connection
             .filter(|connection| connection.is_stale())
@@ -2462,12 +2486,12 @@ impl Workspace {
             .flex_none()
             .items_center()
             .justify_between()
-            .px_5()
-            .py_3()
+            .px_4()
+            .py_2()
             .border_t_1()
-            .border_color(cx.theme().border)
+            .border_color(crate::style::hairline(cx))
             .text_xs()
-            .text_color(cx.theme().muted_foreground)
+            .text_color(crate::style::text_faint(cx))
             .children(self.state.last_activity().map(|activity| {
                 div()
                     .text_xs()
@@ -2486,14 +2510,18 @@ impl Workspace {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(format!("{} kinds · {state}", self.state.kinds().len()))
-                    // What every warm cluster is costing, in the units the
-                    // budget is written in.
-                    .child(format!(
-                        "· {} connected · {} rows held",
-                        self.connected_clusters(),
-                        self.state.total_rows()
-                    ))
+                    // It used to read "77 kinds · connected · 1 connected · 24
+                    // rows held": the connection state and the count of warm
+                    // clusters both rendered as the word "connected", next to
+                    // each other. The state is the dot in the header now, and
+                    // the cluster count only appears when there is more than
+                    // one to count.
+                    .child(format!("{} kinds", self.state.kinds().len()))
+                    .children(
+                        (self.connected_clusters() > 1)
+                            .then(|| format!("· {} clusters warm", self.connected_clusters())),
+                    )
+                    .child(format!("· {} rows held", self.state.total_rows()))
                     .children(stale),
             )
             .child(
@@ -2603,6 +2631,7 @@ impl Workspace {
                 namespaced,
                 opened: self.state.detail().map(|detail| detail.key().clone()),
                 cursor: pane.cursor(),
+                changed: Arc::clone(&self.changed),
                 scroll: self.table_scroll[index.min(1)].clone(),
                 now: SystemTime::now(),
             })
@@ -4048,6 +4077,13 @@ impl Render for Workspace {
             tracing::info!(cold_start_ms = elapsed.as_millis() as u64, "first paint");
         }
 
+        // Which rows changed lately, read once for the frame. Reading it also
+        // prunes it, which is why it happens here rather than per row.
+        let focus = self.state.focus();
+        self.changed = self
+            .state
+            .changed_recently(focus, Instant::now(), crate::style::FLASH);
+
         // The YAML editor is a separate entity that needs a `Window` to be
         // written to, which the event pump does not have; render time is where
         // the two meet.
@@ -4271,6 +4307,33 @@ fn state_color(state: &ConnectionState, cx: &App) -> gpui::Hsla {
         ConnectionState::Disconnected { reason: Some(_) } => cx.theme().danger,
         _ => cx.theme().muted_foreground,
     }
+}
+
+/// The dot that carries connection state at a glance.
+///
+/// It pulses while connecting. A spinner would claim more attention than the
+/// event deserves, and a static dot cannot tell "reaching the apiserver" from
+/// "reached it" — which is the one moment somebody actually watches for.
+fn status_dot(state: &ConnectionState, cx: &App) -> gpui::AnyElement {
+    let dot = div()
+        .size(px(7.))
+        .rounded_full()
+        .flex_none()
+        .bg(state_color(state, cx));
+
+    if matches!(state, ConnectionState::Connecting) {
+        return dot
+            .with_animation(
+                "connecting",
+                Animation::new(std::time::Duration::from_millis(1_100))
+                    .repeat()
+                    .with_easing(pulsating_between(0.35, 1.0)),
+                |dot, delta| dot.opacity(delta),
+            )
+            .into_any_element();
+    }
+
+    dot.into_any_element()
 }
 
 /// Turns a command failure into text that says what to do about it.

@@ -759,6 +759,29 @@ impl AppState {
 
     // --- mutations ----------------------------------------------------------
 
+    /// When each visible row of the focused pane last changed.
+    ///
+    /// The view uses it to mark what just moved: a watch stream rewrites rows
+    /// under the reader with nothing else to say that anything happened.
+    pub fn changed_recently(
+        &mut self,
+        pane: usize,
+        now: Instant,
+        window: std::time::Duration,
+    ) -> Arc<BTreeMap<ResourceKey, Instant>> {
+        let Some(pane) = self.panes.get(pane) else {
+            return Arc::default();
+        };
+        let (Some(cluster), Some(kind)) = (pane.cluster.clone(), pane.kind.clone()) else {
+            return Arc::default();
+        };
+
+        self.tables
+            .get_mut(&(cluster, kind))
+            .map(|table| table.changed_since(now, window))
+            .unwrap_or_default()
+    }
+
     // --- keyboard cursor ----------------------------------------------------
 
     /// Where the keyboard is in the focused pane's table.

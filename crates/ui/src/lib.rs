@@ -8,6 +8,7 @@ pub mod format;
 pub mod logview;
 pub mod palette;
 pub mod perf;
+pub mod style;
 pub mod table;
 pub mod theme;
 pub mod workspace;

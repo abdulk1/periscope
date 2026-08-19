@@ -158,9 +158,9 @@ fn condition_is_true(data: &Value, kind: &str) -> bool {
 fn pods_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([
-            ColumnSpec::fixed("READY", 72),
+            ColumnSpec::fixed("READY", 72).numeric(),
             ColumnSpec::fixed("STATUS", 180),
-            ColumnSpec::fixed("RESTARTS", 90),
+            ColumnSpec::fixed("RESTARTS", 90).numeric(),
             ColumnSpec::fixed("NODE", 200),
         ]),
         project: Projection::BuiltIn(|object| {
@@ -221,9 +221,9 @@ fn pod_state(status: &str, all_ready: bool) -> RowState {
 fn deployment_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([
-            ColumnSpec::fixed("READY", 90),
-            ColumnSpec::fixed("UP-TO-DATE", 110),
-            ColumnSpec::fixed("AVAILABLE", 110),
+            ColumnSpec::fixed("READY", 90).numeric(),
+            ColumnSpec::fixed("UP-TO-DATE", 110).numeric(),
+            ColumnSpec::fixed("AVAILABLE", 110).numeric(),
         ]),
         project: Projection::BuiltIn(|object| {
             let data = &object.data;
@@ -244,7 +244,7 @@ fn deployment_columns() -> KindColumns {
 
 fn statefulset_columns() -> KindColumns {
     KindColumns {
-        columns: Arc::from([ColumnSpec::fixed("READY", 90)]),
+        columns: Arc::from([ColumnSpec::fixed("READY", 90).numeric()]),
         project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let (ready, state) = ratio(
@@ -259,9 +259,9 @@ fn statefulset_columns() -> KindColumns {
 fn replicaset_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([
-            ColumnSpec::fixed("DESIRED", 90),
-            ColumnSpec::fixed("CURRENT", 90),
-            ColumnSpec::fixed("READY", 90),
+            ColumnSpec::fixed("DESIRED", 90).numeric(),
+            ColumnSpec::fixed("CURRENT", 90).numeric(),
+            ColumnSpec::fixed("READY", 90).numeric(),
         ]),
         project: Projection::BuiltIn(|object| {
             let data = &object.data;
@@ -284,9 +284,9 @@ fn replicaset_columns() -> KindColumns {
 fn daemonset_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([
-            ColumnSpec::fixed("DESIRED", 90),
-            ColumnSpec::fixed("READY", 90),
-            ColumnSpec::fixed("AVAILABLE", 110),
+            ColumnSpec::fixed("DESIRED", 90).numeric(),
+            ColumnSpec::fixed("READY", 90).numeric(),
+            ColumnSpec::fixed("AVAILABLE", 110).numeric(),
         ]),
         project: Projection::BuiltIn(|object| {
             let data = &object.data;
@@ -312,7 +312,7 @@ fn service_columns() -> KindColumns {
             ColumnSpec::fixed("TYPE", 130),
             ColumnSpec::fixed("CLUSTER-IP", 140),
             ColumnSpec::fixed("EXTERNAL-IP", 160),
-            ColumnSpec::fixed("PORTS", 180),
+            ColumnSpec::fixed("PORTS", 180).numeric(),
         ]),
         project: Projection::BuiltIn(|object| {
             let data = &object.data;
@@ -454,7 +454,7 @@ fn node_columns() -> KindColumns {
 fn job_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([
-            ColumnSpec::fixed("COMPLETIONS", 130),
+            ColumnSpec::fixed("COMPLETIONS", 130).numeric(),
             ColumnSpec::fixed("STATUS", 130),
         ]),
         project: Projection::BuiltIn(|object| {
@@ -487,7 +487,7 @@ fn cronjob_columns() -> KindColumns {
         columns: Arc::from([
             ColumnSpec::fixed("SCHEDULE", 140),
             ColumnSpec::fixed("SUSPEND", 90),
-            ColumnSpec::fixed("ACTIVE", 90),
+            ColumnSpec::fixed("ACTIVE", 90).numeric(),
         ]),
         project: Projection::BuiltIn(|object| {
             let data = &object.data;
@@ -513,7 +513,7 @@ fn cronjob_columns() -> KindColumns {
 
 fn configmap_columns() -> KindColumns {
     KindColumns {
-        columns: Arc::from([ColumnSpec::fixed("DATA", 90)]),
+        columns: Arc::from([ColumnSpec::fixed("DATA", 90).numeric()]),
         project: Projection::BuiltIn(|object| {
             let keys = object.data["data"].as_object().map_or(0, |data| data.len())
                 + object.data["binaryData"]
@@ -528,7 +528,7 @@ fn secret_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([
             ColumnSpec::fixed("TYPE", 240),
-            ColumnSpec::fixed("DATA", 90),
+            ColumnSpec::fixed("DATA", 90).numeric(),
         ]),
         project: Projection::BuiltIn(|object| {
             // Only the key count, never a value: secrets are masked by default
@@ -596,7 +596,7 @@ fn pvc_columns() -> KindColumns {
         columns: Arc::from([
             ColumnSpec::fixed("STATUS", 120),
             ColumnSpec::fixed("VOLUME", 220),
-            ColumnSpec::fixed("CAPACITY", 110),
+            ColumnSpec::fixed("CAPACITY", 110).numeric(),
             ColumnSpec::fixed("STORAGECLASS", 160),
         ]),
         project: Projection::BuiltIn(|object| {
@@ -711,7 +711,7 @@ fn generic_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([
             ColumnSpec::fixed("STATUS", 140),
-            ColumnSpec::fixed("READY", 90),
+            ColumnSpec::fixed("READY", 90).numeric(),
         ]),
         project: Projection::BuiltIn(|object| {
             let data = &object.data;

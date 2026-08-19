@@ -153,6 +153,11 @@ pub struct ColumnSpec {
     pub name: Arc<str>,
     /// Fixed width in pixels, or `None` to take the remaining space.
     pub width: Option<u32>,
+    /// Whether the column holds numbers, and should be read down its right
+    /// edge. A count column that is left-aligned makes the reader compare
+    /// digits that do not line up, which is most of what makes a table hard to
+    /// scan.
+    pub numeric: bool,
 }
 
 impl ColumnSpec {
@@ -161,7 +166,14 @@ impl ColumnSpec {
         Self {
             name: Arc::from(name.as_ref()),
             width: Some(width),
+            numeric: false,
         }
+    }
+
+    /// Says this column holds numbers.
+    pub fn numeric(mut self) -> Self {
+        self.numeric = true;
+        self
     }
 
     /// A column that takes whatever space is left.
@@ -169,6 +181,7 @@ impl ColumnSpec {
         Self {
             name: Arc::from(name.as_ref()),
             width: None,
+            numeric: false,
         }
     }
 }

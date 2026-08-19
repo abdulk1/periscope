@@ -11,36 +11,37 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use gpui::AnimationExt as _;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px, uniform_list,
 };
-use gpui_component::{ActiveTheme as _, h_flex, v_flex};
-use periscope_bridge::{ColumnSpec, ResourceKey, ResourceRow, RowState};
+use gpui_component::{h_flex, v_flex};
+use periscope_bridge::{ColumnSpec, ResourceKey, ResourceRow};
 use periscope_store::app::{Sort, SortKey};
 
-use crate::format;
-use crate::workspace::Workspace;
-
-/// Height of one row. Fixed, because `uniform_list` requires uniformity and
-/// because a table that reflows while it streams is unreadable.
-pub(crate) const ROW_HEIGHT: f32 = 28.;
+use crate::style;
+pub(crate) use crate::style::ROW_HEIGHT;
+use crate::{format, workspace::Workspace};
 
 /// Width of the namespace column.
-const NAMESPACE_WIDTH: f32 = 180.;
+const NAMESPACE_WIDTH: f32 = 170.;
 
 /// Width of the age column.
-const AGE_WIDTH: f32 = 80.;
+///
+/// Ages are short (`5m`, `22h`, `3d`) and right-aligned against the edge, so
+/// the column needs the width of the longest one and no more.
+const AGE_WIDTH: f32 = 56.;
 
-/// The colour a row's state reads as.
-fn state_color(state: RowState, cx: &App) -> gpui::Hsla {
-    match state {
-        RowState::Healthy => cx.theme().success,
-        RowState::Transient => cx.theme().warning,
-        RowState::Failing => cx.theme().danger,
-        RowState::Neutral => cx.theme().foreground,
-    }
+/// Whether a cell holds a number, and should therefore be read on the right.
+///
+/// `1/1` counts: a ready column is a pair of numbers and lines up as one.
+fn is_numeric(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, '/' | '.' | '-'))
 }
 
 /// One cell, clipped rather than wrapped: wrapping would break the fixed row
@@ -75,73 +76,109 @@ pub fn header(
         .h(px(ROW_HEIGHT))
         .items_center()
         .flex_none()
+        // One hairline under the headings and none between the rows: a table
+        // that boxes every cell is read as a grid rather than as a list.
         .border_b_1()
-        .border_color(cx.theme().border)
-        .bg(cx.theme().secondary)
+        .border_color(style::hairline(cx))
         .text_xs()
-        .text_color(cx.theme().muted_foreground);
+        .text_color(style::text_faint(cx));
 
     // Matches the marker stripe on every row, so the columns line up.
-    row = row.child(div().w(px(2.)).flex_none());
+    row = row.child(div().w(px(style::MARKER)).flex_none());
+
+    /// One column, as the heading row needs to know it.
+    struct Heading {
+        label: String,
+        key: SortKey,
+        width: Option<f32>,
+        numeric: bool,
+    }
 
     /// One clickable heading.
     fn heading(
         workspace: &Entity<Workspace>,
         pane: usize,
-        label: String,
-        key: SortKey,
-        width: Option<f32>,
+        column: Heading,
         sort: Sort,
+        cx: &App,
     ) -> gpui::Stateful<gpui::Div> {
+        let Heading {
+            label,
+            key,
+            width,
+            numeric,
+        } = column;
         let workspace = workspace.clone();
-        let marker = sort.marker(key).unwrap_or_default();
+        let marker = sort.marker(key);
+        let sorted = marker.is_some();
 
         cell(width)
             .id(SharedString::from(format!("heading-{pane}-{label}")))
             .cursor_pointer()
+            // The column being sorted by is the only heading that is not faint,
+            // so the sort is visible without reading the arrows.
+            .when(sorted, |heading| heading.text_color(style::accent(cx)))
+            .hover(|heading| heading.text_color(style::text(cx)))
+            .when(numeric, gpui::Styled::text_right)
             .on_click(move |_, _, cx| {
                 workspace.update(cx, |workspace, cx| workspace.sort_by(pane, key, cx));
             })
-            .child(format!("{label}{marker}"))
+            .child(format!("{label}{}", marker.unwrap_or_default()))
     }
 
     if namespaced {
         row = row.child(heading(
             &workspace,
             pane,
-            "NAMESPACE".to_owned(),
-            SortKey::Namespace,
-            Some(NAMESPACE_WIDTH),
+            Heading {
+                label: "NAMESPACE".to_owned(),
+                key: SortKey::Namespace,
+                width: Some(NAMESPACE_WIDTH),
+                numeric: false,
+            },
             sort,
+            cx,
         ));
     }
     row = row.child(heading(
         &workspace,
         pane,
-        "NAME".to_owned(),
-        SortKey::Name,
-        None,
+        Heading {
+            label: "NAME".to_owned(),
+            key: SortKey::Name,
+            width: None,
+            numeric: false,
+        },
         sort,
+        cx,
     ));
 
     for (index, column) in columns {
         row = row.child(heading(
             &workspace,
             pane,
-            column.name.to_string(),
-            SortKey::Cell(*index),
-            column.width.map(|width| width as f32),
+            Heading {
+                label: column.name.to_string(),
+                key: SortKey::Cell(*index),
+                width: column.width.map(|width| width as f32),
+                numeric: column.numeric,
+            },
             sort,
+            cx,
         ));
     }
 
     row.child(heading(
         &workspace,
         pane,
-        "AGE".to_owned(),
-        SortKey::Age,
-        Some(AGE_WIDTH),
+        Heading {
+            label: "AGE".to_owned(),
+            key: SortKey::Age,
+            width: Some(AGE_WIDTH),
+            numeric: true,
+        },
         sort,
+        cx,
     ))
 }
 
@@ -163,21 +200,22 @@ fn row(
         .map(format::age)
         .unwrap_or_else(|| "—".to_owned());
 
-    let mut line = h_flex()
-        .w_full()
-        .h(px(ROW_HEIGHT))
-        .items_center()
-        .text_sm()
-        .text_color(cx.theme().foreground);
+    let mut line = h_flex().w_full().h(px(ROW_HEIGHT)).items_center().text_sm();
 
     if namespaced {
+        // The namespace repeats down the whole column and is read second, so
+        // it is quiet. The name is what the eye is hunting for.
         line = line.child(
             cell(Some(NAMESPACE_WIDTH))
-                .text_color(cx.theme().muted_foreground)
+                .text_color(style::text_dim(cx))
                 .child(entry.key.namespace.to_string()),
         );
     }
-    line = line.child(cell(None).child(entry.key.name.to_string()));
+    line = line.child(
+        cell(None)
+            .text_color(style::text(cx))
+            .child(entry.key.name.to_string()),
+    );
 
     for (index, column) in columns {
         let text = entry.cell(*index).to_owned();
@@ -186,12 +224,16 @@ fn row(
         // original position, so hiding it does not move the colour somewhere it
         // means nothing.
         let color = if *index == 0 {
-            state_color(entry.state, cx)
+            style::state(entry.state, cx)
         } else {
-            cx.theme().foreground
+            style::text_dim(cx)
         };
         line = line.child(
             cell(column.width.map(|width| width as f32))
+                .when(
+                    column.numeric || is_numeric(&text),
+                    gpui::Styled::text_right,
+                )
                 .text_color(color)
                 .child(text),
         );
@@ -199,26 +241,31 @@ fn row(
 
     line = line.child(
         cell(Some(AGE_WIDTH))
-            .text_color(cx.theme().muted_foreground)
+            .text_right()
+            .text_color(style::text_faint(cx))
             .child(age),
     );
 
     div()
         .w_full()
-        .border_b_1()
-        .border_color(cx.theme().border)
-        .when(under_cursor, |row| row.bg(cx.theme().accent))
+        .when(under_cursor, |row| row.bg(style::selected(cx)))
         .child(
             h_flex()
                 .w_full()
                 .items_center()
                 // A stripe down the left of whatever the detail pane is
                 // showing, so it stays findable after the cursor moves on.
-                .child(div().w(px(2.)).h(px(ROW_HEIGHT)).flex_none().bg(if opened {
-                    cx.theme().primary
-                } else {
-                    gpui::transparent_black()
-                }))
+                .child(
+                    div()
+                        .w(px(style::MARKER))
+                        .h(px(ROW_HEIGHT))
+                        .flex_none()
+                        .bg(if opened {
+                            style::accent(cx)
+                        } else {
+                            gpui::transparent_black()
+                        }),
+                )
                 .child(line),
         )
 }
@@ -248,6 +295,8 @@ pub struct View {
     pub opened: Option<ResourceKey>,
     /// Where the keyboard is.
     pub cursor: usize,
+    /// Rows that changed recently, and when, so the change can be shown.
+    pub changed: Arc<std::collections::BTreeMap<ResourceKey, std::time::Instant>>,
     /// Scroll position, so the cursor can be brought into view.
     pub scroll: gpui::UniformListScrollHandle,
     /// One instant for every age in the frame.
@@ -263,6 +312,7 @@ pub fn body(view: View) -> impl IntoElement {
         namespaced,
         opened,
         cursor,
+        changed,
         scroll,
         now,
     } = view;
@@ -277,6 +327,8 @@ pub fn body(view: View) -> impl IntoElement {
                 .map(|(index, entry)| {
                     let key = entry.key.clone();
                     let workspace = workspace.clone();
+                    let changed_at = changed.get(&entry.key).copied();
+
                     row(
                         entry,
                         &columns,
@@ -288,7 +340,7 @@ pub fn body(view: View) -> impl IntoElement {
                     )
                     .id(index)
                     .cursor_pointer()
-                    .hover(|row| row.bg(cx.theme().accent.opacity(0.5)))
+                    .hover(|row| row.bg(style::hover(cx)))
                     .on_click(move |_, window, cx| {
                         workspace.update(cx, |workspace, cx| {
                             // Clicking a row is also how a pane is focused:
@@ -301,6 +353,7 @@ pub fn body(view: View) -> impl IntoElement {
                             workspace.open_object(key.clone(), window, cx);
                         });
                     })
+                    .map(|row| flash(row, changed_at, cx))
                 })
                 .collect()
         },
@@ -308,6 +361,44 @@ pub fn body(view: View) -> impl IntoElement {
     .track_scroll(scroll)
     .flex_1()
     .w_full()
+}
+
+/// Fades a wash out of a row that just changed.
+///
+/// A watch stream rewrites rows underneath whoever is reading them, and without
+/// this there is nothing at all to say that a pod restarted or a deployment
+/// scaled — the number simply differs from the one that was there a moment ago.
+/// The remaining time drives the animation's start, so a row that changed
+/// half a second ago is already half faded rather than starting over.
+fn flash(
+    row: gpui::Stateful<gpui::Div>,
+    changed_at: Option<std::time::Instant>,
+    cx: &App,
+) -> gpui::AnyElement {
+    // A row that never changed gets no animation at all. Returning a
+    // zero-length one instead — which `FLASH - FLASH` quietly produces — makes
+    // GPUI divide the elapsed time by zero, and every table in the test suite
+    // panicked on the assertion that catches it.
+    let Some(remaining) = changed_at
+        .map(|at| at.elapsed())
+        .and_then(|elapsed| style::FLASH.checked_sub(elapsed))
+        .filter(|remaining| *remaining > std::time::Duration::from_millis(16))
+    else {
+        return row.into_any_element();
+    };
+
+    let tint = style::accent(cx);
+    let start = 1.0 - remaining.as_secs_f32() / style::FLASH.as_secs_f32();
+
+    row.with_animation(
+        "flash",
+        gpui::Animation::new(remaining),
+        move |row, delta| {
+            let fade = 1.0 - (start + delta * (1.0 - start));
+            row.bg(tint.opacity(0.28 * fade.clamp(0., 1.)))
+        },
+    )
+    .into_any_element()
 }
 
 /// The message shown where the rows would be, when there are none.
@@ -318,6 +409,6 @@ pub fn placeholder(message: impl Into<SharedString>, cx: &App) -> impl IntoEleme
         .items_center()
         .justify_center()
         .text_sm()
-        .text_color(cx.theme().muted_foreground)
+        .text_color(style::text_faint(cx))
         .child(message.into())
 }
