@@ -62,6 +62,10 @@ actions!(
         RowTop,
         /// Put the cursor on the last row.
         RowBottom,
+        /// Move the cursor half a screen down.
+        HalfPageDown,
+        /// Move the cursor half a screen up.
+        HalfPageUp,
         /// Open whatever the cursor is on.
         OpenRow,
     ]
@@ -86,6 +90,9 @@ pub fn init(cx: &mut App) {
 /// prove it.
 const OUTSIDE_TEXT_FIELDS: &str = "!Input && !NumberInput && !SearchPanel";
 
+/// The table's keys, where the table is: not inside a field, not in the palette.
+const TABLE: &str = "Periscope && !Input && !NumberInput && !SearchPanel";
+
 /// Where a command's keys apply.
 ///
 /// `Palette` bindings only fire while the palette is open, so `enter` in a
@@ -105,10 +112,18 @@ fn context_of(command: periscope_config::Command, keystroke: &str) -> Option<&'s
         | Command::RowTop
         | Command::RowBottom
         | Command::OpenRow => Some(if is_typable(keystroke) {
-            "Periscope && !Input && !NumberInput && !SearchPanel"
+            TABLE
         } else {
             "Periscope"
         }),
+        // The third case, and the reason this is not simply "is it typable":
+        // `ctrl-d` and `ctrl-u` carry a modifier, so nobody is typing them, but
+        // they are what readline gave every text field on this machine for
+        // deleting a character and clearing a line. `gpui-component`'s input
+        // binds neither, so a root binding would swallow both inside every
+        // filter box and the YAML pane. Scoped to the table, whatever they are
+        // remapped to.
+        Command::HalfPageDown | Command::HalfPageUp => Some(TABLE),
         _ if is_typable(keystroke) => Some(OUTSIDE_TEXT_FIELDS),
         _ => None,
     }
@@ -171,6 +186,8 @@ pub fn init_with_keys(cx: &mut App, keys: &periscope_config::Keys) -> Vec<String
                 Command::RowUp => KeyBinding::new(&keystroke, RowUp, context),
                 Command::RowTop => KeyBinding::new(&keystroke, RowTop, context),
                 Command::RowBottom => KeyBinding::new(&keystroke, RowBottom, context),
+                Command::HalfPageDown => KeyBinding::new(&keystroke, HalfPageDown, context),
+                Command::HalfPageUp => KeyBinding::new(&keystroke, HalfPageUp, context),
                 Command::OpenRow => KeyBinding::new(&keystroke, OpenRow, context),
             });
         }
@@ -194,6 +211,15 @@ fn validate(keystrokes: &str) -> Result<(), String> {
 
 /// How often the view repaints with no events, so the age column keeps moving.
 const TICK: Duration = Duration::from_secs(1);
+
+/// The heading the recently opened kinds sit under.
+const RECENT_HEADING: &str = "RECENT";
+
+/// Whether the sidebar's kind filter matches a kind. An empty filter matches
+/// everything, which is what makes the box narrow rather than select.
+fn matches_filter(info: &periscope_bridge::KindInfo, filter: &str) -> bool {
+    filter.is_empty() || info.id.label().to_lowercase().contains(filter)
+}
 
 /// The server-side filters a watch was started with.
 ///
@@ -359,9 +385,12 @@ pub struct Workspace {
     search_input: Entity<InputState>,
     /// Narrows the sidebar's kind list. Seventy-seven kinds is a lot to scroll.
     kind_filter_input: Entity<InputState>,
-    /// Sections the user has opened or closed, overriding the default. Keyed by
-    /// heading, so a custom API group keeps its state when kinds are rediscovered.
-    sections_open: std::collections::HashMap<String, bool>,
+    /// What the sidebar looked like last time: which sections were open, and
+    /// which kinds were looked at on which cluster.
+    remembered: periscope_config::UiState,
+    /// Where that is written back to. `None` in tests, which is what stops a
+    /// test window from writing over a real session.
+    state_file: Option<periscope_config::StateFile>,
     /// The YAML pane, a read-only syntax-highlighted editor.
     yaml_view: Entity<InputState>,
     /// Which object's YAML the editor currently holds.
@@ -609,7 +638,8 @@ impl Workspace {
             selector_input,
             search_input,
             kind_filter_input,
-            sections_open: std::collections::HashMap::new(),
+            remembered: periscope_config::UiState::default(),
+            state_file: None,
             log_filter_input,
             log_selector_input,
             log_container_input,
@@ -697,7 +727,7 @@ impl Workspace {
         for index in 0..self.state.panes().len() {
             if self.state.panes()[index].kind().is_none() {
                 let cluster = self.state.panes()[index].cluster().cloned();
-                if let Some(kind) = self.default_kind_of(cluster.as_ref()) {
+                if let Some(kind) = self.opening_kind_of(cluster.as_ref()) {
                     let focus = self.state.focus();
                     self.state.focus_pane(index);
                     self.state.select_kind(kind);
@@ -734,6 +764,34 @@ impl Workspace {
     /// only ever appear in a log file nobody has opened.
     pub fn report(&mut self, problem: impl Into<SharedString>) {
         self.last_error = Some(problem.into());
+    }
+
+    /// Restores the sidebar the last session left behind, and says where to
+    /// write it back.
+    ///
+    /// Both together, because remembering something and never writing it down
+    /// is the failure this exists to fix. A window built without this — every
+    /// test window — remembers nothing and writes nothing.
+    pub fn restore(
+        &mut self,
+        remembered: periscope_config::UiState,
+        file: periscope_config::StateFile,
+    ) {
+        self.remembered = remembered;
+        self.state_file = Some(file);
+    }
+
+    /// Writes the remembered sidebar back out.
+    ///
+    /// Failing to write it is worth a log line and nothing else: the session
+    /// carries on with what is in memory, and the next change tries again.
+    fn remember(&self) {
+        let Some(file) = &self.state_file else {
+            return;
+        };
+        if let Err(error) = file.write(&self.remembered) {
+            tracing::warn!(%error, path = %file.path().display(), "could not write the remembered sidebar");
+        }
     }
 
     /// Applies the configured column choices.
@@ -782,13 +840,24 @@ impl Workspace {
         self.palette_open
     }
 
-    /// Pods if the focused pane's cluster serves them, otherwise the first
-    /// watchable kind.
-    fn default_kind(&self) -> Option<KindId> {
-        self.default_kind_of(self.state.active())
+    /// What a pane opens on when its cluster's kinds arrive.
+    ///
+    /// The kind that cluster was last left on, if it still serves it, and pods
+    /// otherwise. Remembered per cluster because a kind is only meaningful on
+    /// the cluster that serves it: half of what a cluster with cert-manager
+    /// offers does not exist on the next one along.
+    fn opening_kind_of(&self, cluster: Option<&ClusterId>) -> Option<KindId> {
+        cluster
+            .and_then(|cluster| {
+                let last = self.remembered.last_kind(&cluster.to_string())?;
+                periscope_store::recent(self.state.kinds_of(Some(cluster)), [last])
+                    .first()
+                    .map(|info| info.id.clone())
+            })
+            .or_else(|| self.default_kind_of(cluster))
     }
 
-    /// The same, for any cluster.
+    /// Pods if the cluster serves them, otherwise the first watchable kind.
     fn default_kind_of(&self, cluster: Option<&ClusterId>) -> Option<KindId> {
         let kinds = self.state.kinds_of(cluster);
         kinds
@@ -877,8 +946,10 @@ impl Workspace {
         self.connect_once(cluster.clone());
 
         // The new cluster's kinds may not have arrived; the watch starts when
-        // they do.
-        if let Some(kind) = self.default_kind() {
+        // they do. Whichever kind it opens on is the one that cluster was left
+        // on, in this session or the last, so switching back and forth between
+        // two clusters keeps two places rather than resetting both to pods.
+        if let Some(kind) = self.opening_kind_of(self.state.active()) {
             self.state.select_kind(kind);
         }
         self.ensure_watches();
@@ -887,9 +958,28 @@ impl Workspace {
 
     /// Switches which kind the table shows.
     fn select_kind(&mut self, kind: KindId, cx: &mut Context<Self>) {
+        self.visit(&kind);
         self.state.select_kind(kind);
         self.ensure_watches();
         cx.notify();
+    }
+
+    /// Records a kind having been opened on the focused pane's cluster.
+    ///
+    /// The context name and the kind, and nothing else: it is the same pair the
+    /// audit log already writes, with no object, namespace or server in it.
+    fn visit(&mut self, kind: &KindId) {
+        let Some(cluster) = self.state.active() else {
+            return;
+        };
+        // Selecting the kind that is already showing is not a visit — repainting
+        // or clicking the row you are on must not reorder the recents list.
+        if self.state.kind() == Some(kind) {
+            return;
+        }
+
+        self.remembered.visited(cluster.to_string(), kind.label());
+        self.remember();
     }
 
     /// Opens an object in the detail pane and asks for its YAML.
@@ -951,6 +1041,7 @@ impl Workspace {
     /// Jumps to an object of a kind other than the one on screen — what an
     /// owner reference or a palette hit does.
     fn open_elsewhere(&mut self, kind: KindId, key: ResourceKey, cx: &mut Context<Self>) {
+        self.visit(&kind);
         self.state.select_kind(kind.clone());
         self.ensure_watches();
 
@@ -1582,7 +1673,7 @@ impl Workspace {
             if let Some(cluster) = self.state.active().cloned() {
                 self.connect_once(cluster);
             }
-            if let Some(kind) = self.default_kind() {
+            if let Some(kind) = self.opening_kind_of(self.state.active()) {
                 self.state.select_kind(kind);
             }
             self.ensure_watches();
@@ -1701,6 +1792,39 @@ impl Workspace {
 
     fn row_up(&mut self, _: &RowUp, _window: &mut Window, cx: &mut Context<Self>) {
         self.move_cursor(-1, cx);
+    }
+
+    fn half_page_down(&mut self, _: &HalfPageDown, _window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.visible_rows();
+        if self.state.move_cursor_half_page(true, visible) {
+            self.reveal_cursor(cx);
+        }
+    }
+
+    fn half_page_up(&mut self, _: &HalfPageUp, _window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.visible_rows();
+        if self.state.move_cursor_half_page(false, visible) {
+            self.reveal_cursor(cx);
+        }
+    }
+
+    /// How many rows fit in the focused pane, as of the last layout.
+    ///
+    /// Read from the list's own scroll handle rather than tracked through
+    /// render: the table is virtualised, so the height it was laid out at is
+    /// already recorded there, and a second copy could only ever disagree with
+    /// it. Zero before the first frame, and zero rather than a panic if the
+    /// handle is borrowed — a keystroke must not be able to take the app down.
+    fn visible_rows(&self) -> usize {
+        let Some(handle) = self.table_scroll.get(self.state.focus()) else {
+            return 0;
+        };
+        let Ok(scroll) = handle.0.try_borrow() else {
+            return 0;
+        };
+
+        let height = f32::from(scroll.base_handle.bounds().size.height);
+        (height / table::ROW_HEIGHT) as usize
     }
 
     fn row_top(&mut self, _: &RowTop, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1946,6 +2070,112 @@ impl Workspace {
             )
     }
 
+    /// The recently opened kinds the focused pane's cluster still serves.
+    fn recent_kinds(&self) -> Vec<periscope_bridge::KindInfo> {
+        let Some(cluster) = self.state.active() else {
+            return Vec::new();
+        };
+        periscope_store::recent(
+            self.state.kinds_of(Some(cluster)),
+            self.remembered.recent_kinds(&cluster.to_string()),
+        )
+    }
+
+    /// One collapsible heading: a chevron, the name, and how many kinds are
+    /// under it.
+    fn section_heading(
+        &self,
+        title: String,
+        open: bool,
+        by_choice: bool,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let heading = title.clone();
+
+        div()
+            .id(SharedString::from(format!("section-{title}")))
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|row| row.bg(cx.theme().accent.opacity(0.4)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_section(heading.clone(), by_choice, cx);
+            }))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(if open { "▾" } else { "▸" })
+                            .child(title),
+                    )
+                    .child(count.to_string()),
+            )
+            .into_any_element()
+    }
+
+    /// One kind in the sidebar, under whichever heading is showing it.
+    ///
+    /// `group` keeps the element ids apart: a kind under RECENT is also under
+    /// its own section, and two elements with one id are one element.
+    fn kind_row(
+        &self,
+        info: &periscope_bridge::KindInfo,
+        group: &str,
+        label: String,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let count = self.state.row_count(&info.id);
+        let click_kind = info.id.clone();
+        let custom = info.custom;
+
+        div()
+            .id(SharedString::from(format!("{group}-{}", info.id.label())))
+            .w_full()
+            .pl_5()
+            .pr_3()
+            .py_1()
+            .rounded_md()
+            .when(selected, |row| row.bg(cx.theme().accent))
+            .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select_kind(click_kind.clone(), cx);
+            }))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .truncate()
+                            .text_color(if custom {
+                                cx.theme().info
+                            } else {
+                                cx.theme().foreground
+                            })
+                            .child(label),
+                    )
+                    .children((count > 0).then(|| {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(count.to_string())
+                    })),
+            )
+            .into_any_element()
+    }
+
     /// Contexts, then the kinds the active cluster serves.
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.state.active().cloned();
@@ -2012,12 +2242,40 @@ impl Workspace {
         let current_kind = self.state.kind().cloned();
         let mut sections: Vec<gpui::AnyElement> = Vec::new();
 
+        // What this cluster was last looked at, above the catalog. It needs no
+        // curation and no pinning gesture: opening a kind is the only thing
+        // anybody has to do to get on it.
+        let recent = self.recent_kinds();
+        let matching: Vec<_> = recent
+            .iter()
+            .filter(|info| matches_filter(info, &filter))
+            .collect();
+        if !matching.is_empty() {
+            let by_choice = self.heading_is_open(RECENT_HEADING, true);
+            let open = !filter.is_empty() || by_choice;
+
+            sections.push(self.section_heading(
+                RECENT_HEADING.to_owned(),
+                open,
+                by_choice,
+                matching.len(),
+                cx,
+            ));
+
+            if open {
+                for info in matching {
+                    let selected = current_kind.as_ref() == Some(&info.id);
+                    // The full label here: there is no group heading above a
+                    // recents list to say which `certificates` this is.
+                    sections.push(self.kind_row(info, "recent", info.id.label(), selected, cx));
+                }
+            }
+        }
+
         for (category, kinds) in periscope_store::sections(self.state.kinds()) {
             let matching: Vec<_> = kinds
                 .iter()
-                .filter(|info| {
-                    filter.is_empty() || info.id.label().to_lowercase().contains(&filter)
-                })
+                .filter(|info| matches_filter(info, &filter))
                 .collect();
             if matching.is_empty() {
                 continue;
@@ -2033,36 +2291,7 @@ impl Workspace {
             let by_choice = self.section_is_open(&category);
             let open = !filter.is_empty() || holds_selection || by_choice;
 
-            let heading = title.clone();
-            sections.push(
-                div()
-                    .id(SharedString::from(format!("section-{title}")))
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|row| row.bg(cx.theme().accent.opacity(0.4)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_section(heading.clone(), by_choice, cx);
-                    }))
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .items_center()
-                                    .child(if open { "▾" } else { "▸" })
-                                    .child(title.clone()),
-                            )
-                            .child(matching.len().to_string()),
-                    )
-                    .into_any_element(),
-            );
+            sections.push(self.section_heading(title, open, by_choice, matching.len(), cx));
 
             if !open {
                 continue;
@@ -2070,51 +2299,15 @@ impl Workspace {
 
             for info in matching {
                 let selected = current_kind.as_ref() == Some(&info.id);
-                let count = self.state.row_count(&info.id);
-                let click_kind = info.id.clone();
-                let custom = info.custom;
-
-                sections.push(
-                    div()
-                        .id(SharedString::from(format!("kind-{}", info.id.label())))
-                        .w_full()
-                        .pl_5()
-                        .pr_3()
-                        .py_1()
-                        .rounded_md()
-                        .when(selected, |row| row.bg(cx.theme().accent))
-                        .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_kind(click_kind.clone(), cx);
-                        }))
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .truncate()
-                                        .text_color(if custom {
-                                            cx.theme().info
-                                        } else {
-                                            cx.theme().foreground
-                                        })
-                                        // Inside a section the group is the
-                                        // heading, so the plural alone reads
-                                        // better than `deployments.apps`.
-                                        .child(info.id.plural.to_string()),
-                                )
-                                .children((count > 0).then(|| {
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(count.to_string())
-                                })),
-                        )
-                        .into_any_element(),
-                );
+                // Inside a section the group is the heading, so the plural
+                // alone reads better than `deployments.apps`.
+                sections.push(self.kind_row(
+                    info,
+                    "kind",
+                    info.id.plural.to_string(),
+                    selected,
+                    cx,
+                ));
             }
         }
 
@@ -2322,23 +2515,27 @@ impl Workspace {
 
     /// Whether a sidebar section is showing its kinds.
     ///
-    /// The user's choice if they made one, and the category's own default
-    /// otherwise — everything except workloads starts closed, because a list of
-    /// seventy-seven kinds is the thing sections exist to remove.
+    /// The user's choice if they made one — in this session or in any before it
+    /// — and the category's own default otherwise: everything except workloads
+    /// starts closed, because a list of seventy-seven kinds is the thing
+    /// sections exist to remove.
     fn section_is_open(&self, category: &periscope_store::Category) -> bool {
-        self.sections_open
-            .get(&category.title())
-            .copied()
-            .unwrap_or_else(|| category.open_by_default())
+        self.heading_is_open(&category.title(), category.open_by_default())
     }
 
-    /// Opens a closed section, or closes an open one.
+    /// The same, for a heading that is not one of the catalog's categories.
+    fn heading_is_open(&self, heading: &str, by_default: bool) -> bool {
+        self.remembered.section(heading).unwrap_or(by_default)
+    }
+
+    /// Opens a closed section, or closes an open one, and remembers which.
     ///
     /// `open` is the section's *own* state, not what is on screen: a section
     /// forced open by a filter or by holding the selection still collapses back
     /// to closed when its heading is clicked, rather than needing two clicks.
     fn toggle_section(&mut self, title: String, open: bool, cx: &mut Context<Self>) {
-        self.sections_open.insert(title, !open);
+        self.remembered.set_section(title, !open);
+        self.remember();
         cx.notify();
     }
 
@@ -3953,6 +4150,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::row_up))
             .on_action(cx.listener(Self::row_top))
             .on_action(cx.listener(Self::row_bottom))
+            .on_action(cx.listener(Self::half_page_down))
+            .on_action(cx.listener(Self::half_page_up))
             .on_action(cx.listener(Self::open_row))
             .child(
                 v_flex()
@@ -4914,6 +5113,280 @@ mod tests {
                 "the selected kind is not in the section it renders in"
             );
         });
+    }
+
+    /// A directory that removes itself, for the tests that write state out.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "periscope-workspace-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+
+        fn state(&self) -> periscope_config::StateFile {
+            periscope_config::StateFile::at(self.0.join("state.toml"))
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[gpui::test]
+    fn a_section_left_open_is_still_open_next_time(cx: &mut TestAppContext) {
+        let dir = TempDir::new("sections");
+        let file = dir.state();
+
+        let (harness, _rx) = workspace(cx);
+        apply(&harness, cx, vec![contexts(&["prod"], "prod")]);
+        apply(&harness, cx, vec![many_kinds("prod")]);
+        harness.update(cx, |workspace, _window, _cx| {
+            workspace.restore(periscope_config::UiState::default(), file.clone());
+        });
+
+        let networking = periscope_store::Category::Networking;
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.toggle_section(networking.title(), false, cx);
+        });
+
+        // What the next run would read off disk, restored into the view the way
+        // the binary restores it at startup.
+        let (remembered, problem) = file.read();
+        assert!(problem.is_none(), "{problem:?}");
+        harness.update(cx, |workspace, _window, _cx| {
+            workspace.restore(remembered, file.clone());
+        });
+
+        harness.read(cx, |workspace| {
+            assert!(workspace.section_is_open(&networking));
+            // And a section nobody touched still follows its own default.
+            assert!(workspace.section_is_open(&periscope_store::Category::Workloads));
+            assert!(!workspace.section_is_open(&periscope_store::Category::Storage));
+        });
+    }
+
+    #[gpui::test]
+    fn a_window_with_nowhere_to_write_remembers_nothing_and_says_nothing(cx: &mut TestAppContext) {
+        // Every test window is this one: without a state file the sidebar still
+        // works, and no session on this machine is overwritten by a test.
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), many_kinds("prod")],
+        );
+
+        let networking = periscope_store::Category::Networking;
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.toggle_section(networking.title(), false, cx);
+            assert!(workspace.section_is_open(&networking));
+        });
+    }
+
+    #[gpui::test]
+    fn opening_a_kind_puts_it_at_the_top_of_the_recent_list(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), many_kinds("prod")],
+        );
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.select_kind(KindId::new("", "v1", "secrets", "secrets"), cx);
+            workspace.select_kind(KindId::new("apps", "v1", "deployments", "deployments"), cx);
+        });
+
+        harness.read(cx, |workspace| {
+            let recent: Vec<String> = workspace
+                .recent_kinds()
+                .iter()
+                .map(|info| info.id.label())
+                .collect();
+            // Most recent first, and the kind the pane opened on by itself is
+            // not on the list: recents are what somebody asked for.
+            assert_eq!(recent, ["deployments.apps", "secrets"]);
+        });
+    }
+
+    #[gpui::test]
+    fn recents_belong_to_the_cluster_they_were_opened_on(cx: &mut TestAppContext) {
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod", "staging"], "prod"), many_kinds("prod")],
+        );
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.select_kind(
+                KindId::new("cert-manager.io", "v1", "certificates", "certificates"),
+                cx,
+            );
+        });
+
+        // A cluster without cert-manager must not be offered a jump that lands
+        // nowhere, even though it is the last thing that was opened.
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.select_cluster(ClusterId::new("staging"), cx);
+        });
+        apply(&harness, cx, vec![kinds_event("staging")]);
+
+        harness.read(cx, |workspace| assert!(workspace.recent_kinds().is_empty()));
+    }
+
+    #[gpui::test]
+    fn a_pane_opens_on_the_kind_that_cluster_was_left_on(cx: &mut TestAppContext) {
+        let dir = TempDir::new("last-kind");
+        let (harness, rx) = workspace(cx);
+
+        let mut remembered = periscope_config::UiState::default();
+        remembered.visited("prod", "deployments.apps");
+        harness.update(cx, |workspace, _window, _cx| {
+            workspace.restore(remembered, dir.state());
+        });
+
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+
+        // Pods is the default; this cluster was left on deployments.
+        assert!(
+            drain(&rx).contains(&ClusterCommand::Watch {
+                cluster: ClusterId::new("prod"),
+                kind: deployments(),
+                namespace: None,
+                selector: None,
+            }),
+            "the remembered kind is not what the pane opened on"
+        );
+    }
+
+    #[gpui::test]
+    fn a_remembered_kind_the_cluster_no_longer_serves_falls_back_to_pods(cx: &mut TestAppContext) {
+        // Uninstalling an operator must not leave the app opening on a kind the
+        // apiserver has never heard of.
+        let dir = TempDir::new("gone-kind");
+        let (harness, rx) = workspace(cx);
+
+        let mut remembered = periscope_config::UiState::default();
+        remembered.visited("prod", "certificates.cert-manager.io");
+        harness.update(cx, |workspace, _window, _cx| {
+            workspace.restore(remembered, dir.state());
+        });
+
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+
+        assert!(drain(&rx).contains(&ClusterCommand::Watch {
+            cluster: ClusterId::new("prod"),
+            kind: pods(),
+            namespace: None,
+            selector: None,
+        }));
+    }
+
+    #[gpui::test]
+    fn coming_back_to_a_cluster_comes_back_to_what_it_was_showing(cx: &mut TestAppContext) {
+        let dir = TempDir::new("two-clusters");
+        let (harness, _rx) = workspace(cx);
+        harness.update(cx, |workspace, _window, _cx| {
+            workspace.restore(periscope_config::UiState::default(), dir.state());
+        });
+        apply(
+            &harness,
+            cx,
+            vec![
+                contexts(&["prod", "staging"], "prod"),
+                kinds_event("prod"),
+                kinds_event("staging"),
+            ],
+        );
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.select_kind(deployments(), cx);
+            workspace.select_cluster(ClusterId::new("staging"), cx);
+        });
+        harness.read(cx, |workspace| {
+            // Staging has never been pointed anywhere, so it opens on pods.
+            assert_eq!(workspace.state().kind(), Some(&pods()));
+        });
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.select_cluster(ClusterId::new("prod"), cx);
+        });
+        harness.read(cx, |workspace| {
+            assert_eq!(workspace.state().kind(), Some(&deployments()));
+        });
+    }
+
+    #[gpui::test]
+    fn half_a_page_moves_further_than_a_row_and_comes_back(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        let names: Vec<String> = (0..200).map(|index| format!("api-{index:03}")).collect();
+        let rows: Vec<&str> = names.iter().map(String::as_str).collect();
+        apply(&harness, cx, vec![reset("prod", pods(), &rows)]);
+        drain(&rx);
+        // The half is half of what fits, which is only known once the list has
+        // been laid out.
+        harness.draw(cx);
+
+        harness.keys(cx, "ctrl-d");
+        let moved = harness.read(cx, |workspace| workspace.state().cursor());
+        assert!(moved > 1, "ctrl-d moved {moved} rows");
+
+        harness.keys(cx, "ctrl-u");
+        harness.read(cx, |workspace| assert_eq!(workspace.state().cursor(), 0));
+
+        // Moving is not opening, here as everywhere else.
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[gpui::test]
+    fn ctrl_d_in_a_filter_field_is_not_the_tables(cx: &mut TestAppContext) {
+        // It carries a modifier, so `is_typable` says nobody is typing it — and
+        // it is still the key that deletes a character in every text field on
+        // this machine.
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![reset("prod", pods(), &["api-0", "api-1", "api-2"])],
+        );
+        drain(&rx);
+        harness.draw(cx);
+
+        harness.update(cx, |workspace, window, cx| {
+            workspace.search_input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+        harness.keys(cx, "ctrl-d");
+
+        harness.read(cx, |workspace| assert_eq!(workspace.state().cursor(), 0));
     }
 
     #[gpui::test]

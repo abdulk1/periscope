@@ -247,13 +247,17 @@ pub enum Command {
     RowTop,
     /// Jump to the last row.
     RowBottom,
+    /// Move half a screen down the table.
+    HalfPageDown,
+    /// Move half a screen up the table.
+    HalfPageUp,
     /// Open the row the keyboard is on.
     OpenRow,
 }
 
 impl Command {
     /// Every command, so the UI can bind them all.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::Palette,
         Self::Dismiss,
         Self::Logs,
@@ -266,6 +270,8 @@ impl Command {
         Self::RowUp,
         Self::RowTop,
         Self::RowBottom,
+        Self::HalfPageDown,
+        Self::HalfPageUp,
         Self::OpenRow,
     ];
 
@@ -284,6 +290,8 @@ impl Command {
             Self::RowUp => "row-up",
             Self::RowTop => "row-top",
             Self::RowBottom => "row-bottom",
+            Self::HalfPageDown => "half-page-down",
+            Self::HalfPageUp => "half-page-up",
             Self::OpenRow => "open-row",
         }
     }
@@ -313,6 +321,12 @@ impl Command {
             Self::RowUp => &["k", "up"],
             Self::RowTop => &["g", "home"],
             Self::RowBottom => &["shift-g", "end"],
+            // vim's, and k9s's, half-screen pair. They are also text-editing
+            // keys — `ctrl-u` clears a line in every readline there has ever
+            // been — so they are bound outside text fields even though they
+            // carry a modifier; see `context_of`.
+            Self::HalfPageDown => &["ctrl-d"],
+            Self::HalfPageUp => &["ctrl-u"],
             Self::OpenRow => &["enter"],
         }
     }

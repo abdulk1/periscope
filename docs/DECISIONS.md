@@ -1088,3 +1088,83 @@ for a plain init container is a few seconds near the start of the pod's life.
 A pod with one container gets no button. There is nothing to choose, the
 confirmation says nothing about a container, and a control that offers one
 option is noise in a header that is already full.
+
+## ADR-0038 — Remembered UI state is a file the app owns, beside the audit log
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+Which sidebar sections are open, and which kinds each cluster was last looked at,
+have to survive a restart or they are not worth having. There were two places to
+put them and only one of them is defensible.
+
+`settings.toml` is written by a person. It holds rules — which clusters refuse
+changes, which keys do what, which columns a kind shows — it is read exactly once
+at startup, and it is the sort of file people keep in a dotfiles repository with
+comments in it explaining why `prod` is in `read-only`. Serialising a struct back
+over that file destroys the comments and the ordering its author chose, races
+with the editor they may still have it open in, and makes every click on a
+sidebar heading a write to a file whose whole value is that the user controls it.
+"The app rewrote my config" is a complaint no amount of correctness elsewhere
+recovers from.
+
+So remembered state is `state.toml` in the data directory, beside `audit.log`,
+for the same reason the audit log is not in the config directory: it is a record
+of what happened, not something anybody edits. On macOS the two directories are
+in fact the same path, which is why the separation has to be in the file name and
+why the file says in a comment on its first line who writes it and that deleting
+it is safe.
+
+The failure handling is the exact inverse of settings', and deliberately. A
+malformed `settings.toml` is fatal, because starting with permissive defaults
+when somebody has written a read-only rule is the worst thing that file could do.
+A malformed `state.toml` starts a fresh session and logs why, because the worst
+thing *this* file can do is make a section start closed. Nothing in it is a rule.
+
+What goes in it is narrow on purpose: kubeconfig context names, which the user
+chose and the audit log already records, and kind names, which are types. No
+server URLs, no namespaces, no object names, nothing derived from a credential.
+Recording that somebody looked at `secrets` on `prod` is the same class of fact
+the audit log has held since ADR-0029; recording *which* secret would not be.
+
+The path is held by the `StateFile` the workspace is given rather than looked up
+when it writes. A window built without one — every test window — remembers
+nothing and writes nothing, which is what stops the test suite from overwriting
+the developer's own session.
+
+## ADR-0039 — The section layout stays in the code
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+The obvious next step after grouping the sidebar is a `[sections]` block in
+`settings.toml` that moves a kind somewhere else or hides one. It was considered
+and refused; this records why, so it is not re-proposed as an oversight.
+
+The case for it is thin. The disagreement people actually have with a fixed
+grouping is about custom resources, and those are already grouped by the API
+group that installed them, which is both self-explanatory and correct by
+construction. What remains is arguing about
+whether `poddisruptionbudgets` is configuration or workloads — a question with no
+right answer, asked once, and now answered in under a second by the filter box.
+
+The case against is thick, and most of it is failure modes:
+
+* **Hiding is a trap.** `Category::Other` exists precisely so that a kind the
+  rules have never heard of is still reachable. A setting that hides a kind
+  produces a cluster where something exists, `kubectl` can see it, and Periscope
+  cannot — with the only evidence in a file the user edited weeks ago.
+* **Every entry can be wrong.** A kind that is not served, an API group that
+  moved between versions, a section name that is a typo: each needs validation,
+  an error message, and a decision about whether it is fatal. That is the whole
+  weight of the `[keys]` machinery for a cosmetic preference.
+* **It cannot be discovered.** Sections are a thing you see; a mapping in a text
+  file is a thing you remember writing. Any real answer here is a drag of a kind
+  in the sidebar that writes itself down — which is `state.toml`'s job, not
+  settings' — and building the text form first would mean two mechanisms for one
+  outcome, one of them permanently second-best.
+
+Recents cover the underlying need better than a custom layout would: the reason
+anybody wants to move six kinds to the top is that those six are what they open,
+and that list now builds itself. `docs/LIMITATIONS.md` says the layout is fixed
+and points here.

@@ -25,7 +25,7 @@ use crate::workspace::Workspace;
 
 /// Height of one row. Fixed, because `uniform_list` requires uniformity and
 /// because a table that reflows while it streams is unreadable.
-const ROW_HEIGHT: f32 = 28.;
+pub(crate) const ROW_HEIGHT: f32 = 28.;
 
 /// Width of the namespace column.
 const NAMESPACE_WIDTH: f32 = 180.;

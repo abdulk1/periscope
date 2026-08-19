@@ -165,21 +165,34 @@ Smaller gaps in what *is* built:
 
 ## Navigation
 
-Kinds are grouped into sections — workloads, networking, configuration, storage,
-access control, cluster, one per custom API group — with a filter box, and the
-table can be driven from the keyboard (`j`/`k`, `g`/`G`, `enter`).
+Kinds are grouped into sections — recent, workloads, networking, configuration,
+storage, access control, cluster, one per custom API group — with a filter box,
+and the table can be driven from the keyboard (`j`/`k`, `ctrl-d`/`ctrl-u`,
+`g`/`G`, `enter`). Which sections are open, which kinds each cluster was last
+looked at, and which kind a cluster opens on are remembered in `state.toml`
+beside the audit log.
 
 What is **not** there:
 
 - **The section layout is not configurable.** The rules are in the code
   (`crates/store/src/catalog.rs`); a kind cannot be moved to another section, and
-  a section cannot be renamed, pinned or hidden.
-- **Which sections are open is not remembered** between runs. It is in-memory
-  state, not settings.
-- **No favourites or recents.** Every console eventually grows a "things I look
-  at" list; there is none here.
-- **No `ctrl-d`/`ctrl-u` half-page movement**, and no type-to-jump inside a
-  table — the palette covers finding an object by name.
+  a section cannot be renamed or hidden. This is a decision rather than a gap —
+  ADR-0039 records why a `[sections]` block in `settings.toml` was considered and
+  refused — but it is still a thing this does not do, and somebody who disagrees
+  with where `poddisruptionbudgets` lives has no recourse but the filter box.
+- **No pinning.** The "things I look at" list is recents, which nobody curates;
+  there is no way to keep a kind at the top that you have not opened lately, and
+  no way to remove one from the list short of opening six others.
+- **Recents are per cluster, and only per cluster.** Two clusters that serve the
+  same kinds keep two lists, and a context renamed in kubeconfig starts empty.
+- **Nothing else about a session is remembered.** Not the window size, not which
+  cluster was focused (kubeconfig's current context wins, deliberately), not the
+  namespace or selector a pane was filtered by, not the split, and not the text
+  in the kind filter box — a filter restored at startup would hide most of the
+  sidebar with no obvious cause.
+- **No type-to-jump inside a table.** `⌘K` finds an object by name across every
+  warm cluster, which is the same job done better; a second, weaker search that
+  only looked at the rows on screen would be one more thing to learn.
 
 ## Phase 4 scope
 

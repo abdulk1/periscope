@@ -140,6 +140,16 @@ cert-manager's `certificates` sit under `CERT-MANAGER.IO`. Only workloads is
 open at first; a section opens by itself when it holds whatever you have
 selected, and the filter box above them narrows across all of them at once.
 
+**RECENT** sits above the rest and holds the last six kinds you opened on the
+cluster you are looking at, most recent first. It needs no curating — opening a
+kind is the only thing that puts one there — and it is per cluster, because half
+of what one cluster serves does not exist on the next. Which sections you left
+open, and which kind each cluster was on, are remembered: reopening Periscope
+puts a cluster back on the kind you left it on, or on pods if that kind is gone.
+Which *cluster* you start on is still kubeconfig's current context, not the last
+one you clicked — `kubectl config use-context` is a statement about where you
+are, and this does not argue with it.
+
 A custom resource shows the columns its own CustomResourceDefinition declares,
 which are the ones `kubectl` prints for it: `certificates` come out as READY and
 SECRET, Argo CD's `applications` as SYNC STATUS and HEALTH STATUS. Columns the
@@ -150,8 +160,12 @@ Click a column heading to sort by it, again to reverse, and a third time to put
 the natural order back — numbers sort as numbers, so RESTARTS does not put 10
 before 2.
 
-Moving through a table is `j`/`k` or the arrows, `g`/`G` for the ends, and
-`enter` to open what you are on. The **All namespaces** button beside the
+Moving through a table is `j`/`k` or the arrows, `ctrl-d`/`ctrl-u` for half a
+screen, `g`/`G` for the ends, and `enter` to open what you are on. Half a screen
+is half of what actually fits, so it keeps a few rows of context rather than
+replacing everything you were reading. Finding an object by name is `⌘K`, which
+searches every warm cluster; there is deliberately no second, weaker
+type-to-jump inside the table. The **All namespaces** button beside the
 namespace field lists the namespaces the loaded rows are in, so narrowing to one
 does not mean knowing its name first; the field is still there for a namespace
 nothing has been loaded from yet. The cursor is a highlight; the object the
@@ -272,6 +286,8 @@ row-down = ["j", "down"]
 row-up = ["k", "up"]
 row-top = ["g", "home"]
 row-bottom = ["shift-g", "end"]
+half-page-down = ["ctrl-d"]
+half-page-up = ["ctrl-u"]
 open-row = ["enter"]
 ```
 
@@ -292,6 +308,33 @@ is ignored rather than fatal — column sets differ between Kubernetes versions
 and between CRDs — and if none of the names match, the kind keeps all of its
 columns, because a table with nothing in it looks like a bug rather than a
 setting.
+
+### `state.toml`
+
+`settings.toml` is yours; `state.toml` is Periscope's. It lives in the data
+directory beside `audit.log` — never in the config directory, because a program
+that rewrites a hand-edited config file loses the comments in it — and it holds
+what the sidebar looked like when you last closed the window:
+
+```toml
+# Written by Periscope. Settings live in settings.toml; this is
+# remembered session state and is safe to delete.
+
+[sections]
+CLUSTER = true
+WORKLOADS = false
+
+[[recent]]
+context = "kind-periscope"
+kind = "deployments.apps"
+```
+
+Sections list only the headings you clicked; everything else follows its own
+default. `recent` is the last thirty-two kinds opened, newest first, and each
+cluster's sidebar reads its own entries out of it. Context names and kind names
+are all that is in there — no server addresses, no namespaces, no object names,
+nothing from a credential — and deleting the file simply starts a fresh session,
+which is also what happens if it is ever unreadable.
 
 ## Port forwards and commands
 

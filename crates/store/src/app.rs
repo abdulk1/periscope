@@ -804,6 +804,21 @@ impl AppState {
         true
     }
 
+    /// Moves the cursor half a screen, the way `ctrl-d` and `ctrl-u` do.
+    ///
+    /// Half rather than a whole screen because the point of the key is to keep
+    /// your place: a full page replaces everything you were reading, and there
+    /// is nothing left on screen to tell you where you landed.
+    ///
+    /// `visible` is how many rows fit, which only the view knows and only after
+    /// it has been laid out once. Zero means "not measured yet", and a key that
+    /// does nothing at all until the first frame has been painted would be a
+    /// worse answer than moving one row.
+    pub fn move_cursor_half_page(&mut self, down: bool, visible: usize) -> bool {
+        let half = (visible / 2).max(1) as isize;
+        self.move_cursor(if down { half } else { -half })
+    }
+
     /// Puts the cursor on the last row.
     pub fn cursor_to_end(&mut self) -> bool {
         let last = self.panes[self.focus].rows.len().saturating_sub(1);
@@ -2316,6 +2331,30 @@ mod tests {
         // about row 3 of deployments.
         state.select_kind(deployments());
         assert_eq!(state.cursor(), 0);
+    }
+
+    #[test]
+    fn half_a_page_is_half_of_what_fits_on_screen() {
+        let mut state = state_with_contexts();
+        let rows: Vec<ResourceRow> = (0..100)
+            .map(|index| row("default", &index.to_string()))
+            .collect();
+        state.apply_batch(&[reset("prod", pods(), &rows)], Instant::now());
+
+        assert!(state.move_cursor_half_page(true, 20));
+        assert_eq!(state.cursor(), 10);
+        assert!(state.move_cursor_half_page(false, 20));
+        assert_eq!(state.cursor(), 0);
+
+        // Before the first layout nothing has been measured, and a key that
+        // did nothing at all would read as broken.
+        assert!(state.move_cursor_half_page(true, 0));
+        assert_eq!(state.cursor(), 1);
+
+        // It stops at the ends like every other cursor move.
+        assert!(state.move_cursor_half_page(true, 1_000));
+        assert_eq!(state.cursor(), 99);
+        assert!(!state.move_cursor_half_page(true, 20));
     }
 
     #[test]

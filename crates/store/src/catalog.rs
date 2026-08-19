@@ -149,6 +149,31 @@ pub fn sections(kinds: &[KindInfo]) -> Vec<(Category, Vec<KindInfo>)> {
     sections
 }
 
+/// How many recently opened kinds the sidebar offers.
+///
+/// Short on purpose. A recents list long enough to need scrolling is a second
+/// copy of the thing sections exist to make navigable.
+pub const RECENT_SHOWN: usize = 6;
+
+/// The recently opened kinds a cluster still serves, most recent first.
+///
+/// Recency is decided elsewhere — this only turns remembered names back into
+/// kinds. Everything the cluster no longer serves, or never did, is dropped
+/// silently: a cluster's recents are only meaningful on that cluster, and an
+/// entry that cannot be opened is worse than a shorter list.
+pub fn recent<'a>(kinds: &[KindInfo], visited: impl IntoIterator<Item = &'a str>) -> Vec<KindInfo> {
+    visited
+        .into_iter()
+        .filter_map(|label| {
+            kinds
+                .iter()
+                .find(|info| info.watchable && info.id.label() == label)
+        })
+        .take(RECENT_SHOWN)
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +318,59 @@ mod tests {
         let names: Vec<String> = workloads.iter().map(|info| info.id.label()).collect();
 
         assert_eq!(names, ["deployments.apps", "pods", "statefulsets.apps"]);
+    }
+
+    #[test]
+    fn recents_come_back_in_the_order_they_were_visited() {
+        let kinds = vec![
+            kind("", "pods"),
+            kind("apps", "deployments"),
+            custom("cert-manager.io", "certificates"),
+        ];
+
+        let recent = recent(
+            &kinds,
+            ["certificates.cert-manager.io", "pods", "deployments.apps"],
+        );
+        let names: Vec<String> = recent.iter().map(|info| info.id.label()).collect();
+
+        assert_eq!(
+            names,
+            ["certificates.cert-manager.io", "pods", "deployments.apps"]
+        );
+    }
+
+    #[test]
+    fn a_recent_kind_this_cluster_does_not_serve_is_dropped() {
+        // Switching to a cluster without cert-manager must not offer a jump
+        // that lands nowhere.
+        let kinds = vec![kind("", "pods")];
+
+        let recent = recent(&kinds, ["certificates.cert-manager.io", "pods"]);
+        let names: Vec<String> = recent.iter().map(|info| info.id.label()).collect();
+
+        assert_eq!(names, ["pods"]);
+    }
+
+    #[test]
+    fn a_recent_kind_that_cannot_be_watched_is_not_offered_either() {
+        let kinds = vec![KindInfo {
+            watchable: false,
+            ..kind("", "componentstatuses")
+        }];
+
+        assert!(recent(&kinds, ["componentstatuses"]).is_empty());
+    }
+
+    #[test]
+    fn the_recent_list_is_short_however_much_is_remembered() {
+        let kinds: Vec<KindInfo> = (0..RECENT_SHOWN * 2)
+            .map(|index| kind("", &format!("kind{index}")))
+            .collect();
+        let labels: Vec<String> = kinds.iter().map(|info| info.id.label()).collect();
+
+        let recent = recent(&kinds, labels.iter().map(String::as_str));
+        assert_eq!(recent.len(), RECENT_SHOWN);
     }
 
     #[test]

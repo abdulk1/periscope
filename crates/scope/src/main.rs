@@ -52,6 +52,15 @@ fn main() -> Result<()> {
     // written a read-only rule would be the worst possible failure here.
     let settings = periscope_config::Settings::read().context("could not read settings")?;
     let audit = periscope_config::AuditLog::open().context("could not open the audit log")?;
+    // Remembered UI state, which is the opposite of settings in every way that
+    // matters here: the app writes it, and losing it costs a collapsed section
+    // rather than a safety rule, so nothing about it is fatal.
+    let state_file = periscope_config::StateFile::open()
+        .context("could not decide where to remember the sidebar")?;
+    let (ui_state, state_problem) = state_file.read();
+    if let Some(problem) = state_problem {
+        tracing::warn!(%problem, "starting with a fresh sidebar");
+    }
     // Logged in full because "the setting had no effect" is otherwise
     // indistinguishable from "the file was never read".
     tracing::info!(
@@ -62,6 +71,9 @@ fn main() -> Result<()> {
         row_budget = settings.limits.row_budget,
         log_buffer = settings.limits.log_buffer,
         audit = %audit.path().display(),
+        state = %state_file.path().display(),
+        sections_remembered = ui_state.sections.len(),
+        kinds_remembered = ui_state.recent.len(),
         "settings loaded"
     );
 
@@ -136,6 +148,7 @@ fn main() -> Result<()> {
                         workspace.set_permissions(permissions.clone());
                         workspace.set_limits(limits);
                         workspace.set_columns(columns.clone());
+                        workspace.restore(ui_state.clone(), state_file.clone());
                         workspace.set_theme(theme, window, cx);
                         if let Some(problem) = keymap_problems.first() {
                             workspace.report(problem.clone());

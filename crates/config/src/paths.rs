@@ -49,6 +49,15 @@ pub fn settings_file() -> Result<PathBuf> {
     Ok(project_dirs()?.config_dir().join("settings.toml"))
 }
 
+/// Path to the remembered UI state.
+///
+/// Beside the audit log for the same reason it is: the app writes this one, the
+/// user writes `settings.toml`, and the two must not share a file that either
+/// of them may overwrite. See [`crate::state`].
+pub fn state_file() -> Result<PathBuf> {
+    Ok(project_dirs()?.data_local_dir().join("state.toml"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +98,20 @@ mod tests {
     fn settings_live_next_to_other_app_config() {
         let file = settings_file().expect("home directory resolves in tests");
         assert_eq!(file.file_name().unwrap(), "settings.toml");
+    }
+
+    #[test]
+    fn remembered_state_is_a_file_of_its_own_beside_the_audit_log() {
+        // The app writes this one and the user writes settings.toml; a session
+        // that rewrote a hand-edited config file would lose its comments. On
+        // macOS the two directories are the same path, which is exactly why the
+        // separation has to be in the file name.
+        let state = state_file().expect("home directory resolves in tests");
+        let settings = settings_file().expect("home directory resolves in tests");
+        let audit = audit_file().expect("home directory resolves in tests");
+
+        assert_eq!(state.file_name().unwrap(), "state.toml");
+        assert_ne!(state, settings);
+        assert_eq!(state.parent(), audit.parent());
     }
 }
