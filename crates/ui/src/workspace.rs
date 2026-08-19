@@ -261,38 +261,63 @@ impl BridgeStats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Proposal {
     /// A change to an object.
-    Mutation(Arc<Mutation>),
+    Mutation {
+        /// The cluster the sentence named.
+        cluster: ClusterId,
+        /// What it does.
+        mutation: Arc<Mutation>,
+    },
     /// A command to run in a container.
-    Command(Arc<ExecTarget>),
+    Command {
+        /// The cluster the sentence named.
+        cluster: ClusterId,
+        /// What will be run.
+        target: Arc<ExecTarget>,
+    },
+}
+
+impl Proposal {
+    /// The cluster this was proposed against.
+    ///
+    /// Captured when it was proposed rather than read again when it is
+    /// confirmed. The palette can change the active cluster while the dialog is
+    /// open, and resolving it twice meant the sentence could name one cluster
+    /// and the request go to another — which is the single thing ADR-0030
+    /// exists to make impossible.
+    fn cluster(&self) -> &ClusterId {
+        match self {
+            Self::Mutation { cluster, .. } | Self::Command { cluster, .. } => cluster,
+        }
+    }
 }
 
 impl Proposal {
     /// The sentence the dialog shows.
-    fn confirmation(&self, cluster: &ClusterId) -> String {
+    fn confirmation(&self) -> String {
         match self {
-            Self::Mutation(mutation) => mutation.confirmation(cluster),
-            Self::Command(target) => target.confirmation(cluster),
+            Self::Mutation { cluster, mutation } => mutation.confirmation(cluster),
+            Self::Command { cluster, target } => target.confirmation(cluster),
         }
     }
 
     /// Whether the confirm button is the red one.
     fn is_destructive(&self) -> bool {
         match self {
-            Self::Mutation(mutation) => mutation.is_destructive(),
+            Self::Mutation { mutation, .. } => mutation.is_destructive(),
             // A command can be anything, and Periscope cannot tell `ls` from
             // `rm -rf /`. Treating every one as destructive is the honest
             // reading, and it is the safe one.
-            Self::Command(_) => true,
+            Self::Command { .. } => true,
         }
     }
 
     /// The line under the sentence, when there is something more to say.
     fn warning(&self) -> Option<&'static str> {
         match self {
-            Self::Mutation(mutation) => mutation
+            Self::Mutation { mutation, .. } => mutation
                 .is_destructive()
                 .then_some("This cannot be undone."),
-            Self::Command(_) => {
+            Self::Command { .. } => {
                 Some("Periscope cannot tell what a command does before it runs it.")
             }
         }
@@ -301,7 +326,7 @@ impl Proposal {
     /// What the confirm button says.
     fn verb(&self) -> &'static str {
         match self {
-            Self::Mutation(mutation) => match &**mutation {
+            Self::Mutation { mutation, .. } => match &**mutation {
                 Mutation::Delete { .. } => "Delete",
                 Mutation::Scale { .. } => "Scale",
                 Mutation::Restart { .. } => "Restart",
@@ -311,7 +336,7 @@ impl Proposal {
                 Mutation::Apply { dry_run: true, .. } => "Dry run",
                 Mutation::Apply { .. } => "Apply",
             },
-            Self::Command(_) => "Run",
+            Self::Command { .. } => "Run",
         }
     }
 }
@@ -999,7 +1024,8 @@ impl Workspace {
         // says nothing about this one, and Events is empty for most objects.
         self.detail_tab = DetailTab::default();
         self.forget_containers();
-        self.state.open_detail(kind.clone(), key.clone());
+        self.state
+            .open_detail(cluster.clone(), kind.clone(), key.clone());
         self.send(ClusterCommand::FetchObject {
             cluster,
             kind,
@@ -1032,7 +1058,8 @@ impl Workspace {
         let (kind, key) = (detail.kind().clone(), detail.key().clone());
 
         tracing::info!(%cluster, %kind, %key, "revealing secret values");
-        self.state.open_detail(kind.clone(), key.clone());
+        self.state
+            .open_detail(cluster.clone(), kind.clone(), key.clone());
         self.yaml_showing = None;
         self.send(ClusterCommand::FetchObject {
             cluster,
@@ -1052,7 +1079,8 @@ impl Workspace {
 
         if let Some(cluster) = self.state.active().cloned() {
             self.forget_containers();
-            self.state.open_detail(kind.clone(), key.clone());
+            self.state
+                .open_detail(cluster.clone(), kind.clone(), key.clone());
             self.send(ClusterCommand::FetchObject {
                 cluster,
                 kind,
@@ -1067,7 +1095,13 @@ impl Workspace {
 
     /// Puts a mutation in front of the user. Nothing is sent until they agree.
     fn propose(&mut self, mutation: Mutation, cx: &mut Context<Self>) {
-        self.pending = Some(Proposal::Mutation(Arc::new(mutation)));
+        let Some(cluster) = self.state.active().cloned() else {
+            return;
+        };
+        self.pending = Some(Proposal::Mutation {
+            cluster,
+            mutation: Arc::new(mutation),
+        });
         cx.notify();
     }
 
@@ -1079,14 +1113,16 @@ impl Workspace {
 
     /// Sends whatever was proposed, if the store allows it.
     fn confirm_mutation(&mut self, cx: &mut Context<Self>) {
-        let (Some(pending), Some(cluster)) = (self.pending.take(), self.state.active().cloned())
-        else {
+        let Some(pending) = self.pending.take() else {
             return;
         };
 
+        // The cluster comes from the proposal, not from whatever is selected
+        // now. Both gates check it again, and the store's gate refuses a
+        // cluster that is no longer connected.
         match pending {
-            Proposal::Mutation(mutation) => self.send_mutation(cluster, mutation),
-            Proposal::Command(target) => self.send_command(cluster, target),
+            Proposal::Mutation { cluster, mutation } => self.send_mutation(cluster, mutation),
+            Proposal::Command { cluster, target } => self.send_command(cluster, target),
         }
         cx.notify();
     }
@@ -1218,7 +1254,13 @@ impl Workspace {
             return;
         };
 
-        self.pending = Some(Proposal::Command(Arc::new(target)));
+        let Some(cluster) = self.state.active().cloned() else {
+            return;
+        };
+        self.pending = Some(Proposal::Command {
+            cluster,
+            target: Arc::new(target),
+        });
         cx.notify();
     }
 
@@ -3726,8 +3768,8 @@ impl Workspace {
     /// confirm is the only red thing on screen.
     fn confirmation(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let pending = self.pending.clone()?;
-        let cluster = self.state.active()?.clone();
-        let sentence = pending.confirmation(&cluster);
+        let cluster = pending.cluster().clone();
+        let sentence = pending.confirmation();
         let destructive = pending.is_destructive();
 
         let connection = self.state.connection(&cluster);
@@ -6513,6 +6555,72 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_confirmed_mutation_goes_to_the_cluster_the_sentence_named(cx: &mut TestAppContext) {
+        // The palette is reachable while a proposal is open, and it changes the
+        // active cluster. Resolving the cluster again at confirm time meant the
+        // dialog could say prod and the delete could land on staging — the one
+        // thing ADR-0030 exists to make impossible.
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod", "staging"], "prod"), kinds_event("prod")],
+        );
+        apply(
+            &harness,
+            cx,
+            vec![
+                ClusterEvent::Status {
+                    cluster: "prod".into(),
+                    state: ConnectionState::Connected,
+                },
+                ClusterEvent::Status {
+                    cluster: "staging".into(),
+                    state: ConnectionState::Connected,
+                },
+            ],
+        );
+        drain(&rx);
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.propose(
+                Mutation::Delete {
+                    kind: pods(),
+                    key: ResourceKey::new("default", "api-0"),
+                    grace_period: None,
+                },
+                cx,
+            );
+            // The user wanders off to another cluster with the dialog open.
+            workspace.select_cluster(ClusterId::new("staging"), cx);
+        });
+        drain(&rx);
+
+        harness.read(cx, |workspace| {
+            let sentence = workspace
+                .pending
+                .as_ref()
+                .expect("still pending")
+                .confirmation();
+            assert!(sentence.contains("prod"), "{sentence}");
+            assert!(!sentence.contains("staging"), "{sentence}");
+        });
+
+        harness.update(cx, |workspace, _window, cx| workspace.confirm_mutation(cx));
+
+        match drain(&rx).as_slice() {
+            [ClusterCommand::Mutate { cluster, .. }] => {
+                assert_eq!(
+                    cluster,
+                    &ClusterId::new("prod"),
+                    "sent to the wrong cluster"
+                );
+            }
+            other => panic!("expected one mutation, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
     fn a_mutation_is_not_sent_until_it_is_confirmed(cx: &mut TestAppContext) {
         let (harness, rx) = workspace(cx);
         apply(
@@ -6642,7 +6750,7 @@ mod tests {
                 .pending
                 .as_ref()
                 .expect("a command is waiting")
-                .confirmation(&ClusterId::new("prod"));
+                .confirmation();
             assert!(sentence.contains("prod"), "{sentence}");
             assert!(sentence.contains("api-0"), "{sentence}");
             assert!(sentence.contains("ls -la /etc"), "{sentence}");
@@ -6920,7 +7028,7 @@ mod tests {
                 .pending
                 .as_ref()
                 .expect("a command is waiting")
-                .confirmation(&ClusterId::new("prod"));
+                .confirmation();
             assert!(sentence.contains("container envoy"), "{sentence}");
         });
 
@@ -7203,8 +7311,7 @@ mod tests {
                 cx,
             );
 
-            let cluster = workspace.state().active().unwrap().clone();
-            let sentence = workspace.pending.as_ref().unwrap().confirmation(&cluster);
+            let sentence = workspace.pending.as_ref().unwrap().confirmation();
 
             assert!(sentence.contains("prod"), "{sentence}");
             assert!(sentence.contains("payments"), "{sentence}");

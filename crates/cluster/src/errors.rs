@@ -20,10 +20,22 @@ pub enum Failure {
 
 impl Failure {
     /// The message, whichever kind of failure this is.
+    ///
+    /// For the screen. Anything written to a file goes through
+    /// [`Failure::redacted`] instead.
     pub fn message(&self) -> &str {
         match self {
             Self::Auth(message) | Self::Other(message) => message,
         }
+    }
+
+    /// The message with hostnames and anything token-shaped removed.
+    ///
+    /// The person at the keyboard already holds the credentials, so the full
+    /// text is theirs to read; a log file outlives the session and gets shared,
+    /// so it gets this one.
+    pub fn redacted(&self) -> String {
+        crate::redact::text(self.message())
     }
 
     /// Whether this is an authentication problem.

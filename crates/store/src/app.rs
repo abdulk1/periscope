@@ -66,10 +66,19 @@ impl ExecSession {
 }
 
 /// What the detail pane is showing.
+///
+/// Every variant names the cluster as well as the kind and the object. Two
+/// clusters routinely hold objects with the same namespace and name — that is
+/// what `kube-root-ca.crt` and `default/api-0` are — so an answer matched on
+/// kind and key alone can be the right object from the wrong cluster. In a
+/// split view that put one cluster's YAML under the other's heading, and the
+/// reveal path is the same path, so it could do it with a Secret's values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Detail {
     /// A fetch is in flight.
     Loading {
+        /// Which cluster it was asked of.
+        cluster: ClusterId,
         /// Kind of the object being fetched.
         kind: KindId,
         /// Which object.
@@ -77,6 +86,8 @@ pub enum Detail {
     },
     /// The object, its events and its owners.
     Ready {
+        /// Which cluster it came from.
+        cluster: ClusterId,
         /// Kind of the object.
         kind: KindId,
         /// What was fetched.
@@ -84,6 +95,8 @@ pub enum Detail {
     },
     /// The fetch failed. Shown in place of the object, never as a blank pane.
     Failed {
+        /// Which cluster it was asked of.
+        cluster: ClusterId,
         /// Kind of the object.
         kind: KindId,
         /// Which object.
@@ -108,6 +121,15 @@ impl Detail {
             Self::Loading { kind, .. } | Self::Failed { kind, .. } | Self::Ready { kind, .. } => {
                 kind
             }
+        }
+    }
+
+    /// The cluster it belongs to.
+    pub fn cluster(&self) -> &ClusterId {
+        match self {
+            Self::Loading { cluster, .. }
+            | Self::Failed { cluster, .. }
+            | Self::Ready { cluster, .. } => cluster,
         }
     }
 }
@@ -478,13 +500,15 @@ impl AppState {
             }
 
             ClusterEvent::Object {
+                cluster,
                 kind,
                 detail: object,
-                ..
             } => {
-                // Ignore an answer to a question the user has moved on from.
-                if self.awaiting(kind, &object.key) {
+                // Ignore an answer to a question the user has moved on from —
+                // including one from a cluster they have moved away from.
+                if self.awaiting(cluster, kind, &object.key) {
                     self.detail = Some(Detail::Ready {
+                        cluster: cluster.clone(),
                         kind: kind.clone(),
                         object: Arc::clone(object),
                     });
@@ -493,10 +517,14 @@ impl AppState {
             }
 
             ClusterEvent::ObjectFailed {
-                kind, key, reason, ..
+                cluster,
+                kind,
+                key,
+                reason,
             } => {
-                if self.awaiting(kind, key) {
+                if self.awaiting(cluster, kind, key) {
                     self.detail = Some(Detail::Failed {
+                        cluster: cluster.clone(),
                         kind: kind.clone(),
                         key: key.clone(),
                         reason: reason.clone(),
@@ -1148,8 +1176,8 @@ impl AppState {
     }
 
     /// Records that a detail fetch is in flight.
-    pub fn open_detail(&mut self, kind: KindId, key: ResourceKey) {
-        self.detail = Some(Detail::Loading { kind, key });
+    pub fn open_detail(&mut self, cluster: ClusterId, kind: KindId, key: ResourceKey) {
+        self.detail = Some(Detail::Loading { cluster, kind, key });
     }
 
     /// Closes the detail pane.
@@ -1311,10 +1339,10 @@ impl AppState {
     }
 
     /// Whether a detail event answers the fetch that is actually in flight.
-    fn awaiting(&self, kind: &KindId, key: &ResourceKey) -> bool {
-        self.detail
-            .as_ref()
-            .is_some_and(|detail| detail.kind() == kind && detail.key() == key)
+    fn awaiting(&self, cluster: &ClusterId, kind: &KindId, key: &ResourceKey) -> bool {
+        self.detail.as_ref().is_some_and(|detail| {
+            detail.cluster() == cluster && detail.kind() == kind && detail.key() == key
+        })
     }
 
     /// Reports a table change, and whether any pane can see it.
@@ -1714,7 +1742,7 @@ mod tests {
     fn a_detail_fetch_is_shown_only_while_it_is_still_wanted() {
         let mut state = state_with_contexts();
         let key = ResourceKey::new("default", "api-0");
-        state.open_detail(pods(), key.clone());
+        state.open_detail(ClusterId::new("prod"), pods(), key.clone());
 
         let object = Arc::new(ObjectDetail {
             key: key.clone(),
@@ -1751,7 +1779,7 @@ mod tests {
     fn a_failed_fetch_replaces_the_spinner_with_the_reason() {
         let mut state = state_with_contexts();
         let key = ResourceKey::new("default", "api-0");
-        state.open_detail(pods(), key.clone());
+        state.open_detail(ClusterId::new("prod"), pods(), key.clone());
 
         state.apply_batch(
             &[ClusterEvent::ObjectFailed {
@@ -1772,12 +1800,20 @@ mod tests {
     #[test]
     fn changing_what_is_being_viewed_closes_the_detail_pane() {
         let mut state = state_with_contexts();
-        state.open_detail(pods(), ResourceKey::new("default", "api-0"));
+        state.open_detail(
+            ClusterId::new("prod"),
+            pods(),
+            ResourceKey::new("default", "api-0"),
+        );
 
         state.select_kind(deployments());
         assert!(state.detail().is_none());
 
-        state.open_detail(deployments(), ResourceKey::new("default", "api"));
+        state.open_detail(
+            ClusterId::new("prod"),
+            deployments(),
+            ResourceKey::new("default", "api"),
+        );
         state.select_cluster(ClusterId::new("staging"));
         assert!(state.detail().is_none());
     }
@@ -2477,6 +2513,55 @@ mod tests {
 
         state.focus_pane(0);
         assert_eq!(state.cursor(), 2);
+    }
+
+    #[test]
+    fn an_object_from_another_cluster_never_lands_in_the_detail_pane() {
+        // Two clusters routinely hold the same namespace and name — that is
+        // what `default/api-0` and `kube-root-ca.crt` are. Matching an answer on
+        // kind and key alone showed one cluster's object, and one cluster's
+        // revealed Secret, under the other's heading.
+        let mut state = state_with_contexts();
+        let key = ResourceKey::new("default", "api-0");
+        state.open_detail(ClusterId::new("prod"), pods(), key.clone());
+
+        let intruder = ClusterEvent::Object {
+            cluster: "staging".into(),
+            kind: pods(),
+            detail: Arc::new(ObjectDetail {
+                key: key.clone(),
+                yaml: Arc::from("kind: Pod\n"),
+                maskable: false,
+                revealed: false,
+                events: Arc::from([]),
+                owners: Arc::from([]),
+            }),
+        };
+        state.apply(&intruder, Instant::now());
+
+        assert!(
+            matches!(state.detail(), Some(Detail::Loading { .. })),
+            "an answer from another cluster replaced the pane"
+        );
+    }
+
+    #[test]
+    fn a_failure_from_another_cluster_does_not_replace_the_pane_either() {
+        let mut state = state_with_contexts();
+        let key = ResourceKey::new("default", "api-0");
+        state.open_detail(ClusterId::new("prod"), pods(), key.clone());
+
+        state.apply(
+            &ClusterEvent::ObjectFailed {
+                cluster: "staging".into(),
+                kind: pods(),
+                key,
+                reason: "not found".to_owned(),
+            },
+            Instant::now(),
+        );
+
+        assert!(matches!(state.detail(), Some(Detail::Loading { .. })));
     }
 
     #[test]

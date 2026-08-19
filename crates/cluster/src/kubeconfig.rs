@@ -192,7 +192,9 @@ pub async fn connect(context: &ClusterId, source: Source) -> Result<Connection, 
 
     tracing::info!(
         cluster = %context,
-        server = %config.cluster_url,
+        // The server URL is deliberately absent: on EKS it carries the account
+        // id and the region, and this line is written on every connect at the
+        // default verbosity. The context name identifies the cluster already.
         namespace = %config.default_namespace,
         credential_plugin = plugin.as_deref().unwrap_or("none"),
         "building client"

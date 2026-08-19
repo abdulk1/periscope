@@ -86,7 +86,7 @@ fn record(
         "exec",
     )
     .detail(target.command_line())
-    .outcome(outcome, reason);
+    .outcome(outcome, crate::redact::text(reason));
 
     if let Err(error) = audit.append(&entry) {
         // Never fatal — but never silent either.

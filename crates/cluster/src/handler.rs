@@ -348,7 +348,7 @@ async fn connect(
         Ok(connection) => connection,
         Err(error) => {
             let failure = error.failure();
-            tracing::warn!(%cluster, reason = failure.message(), "connection failed");
+            tracing::warn!(%cluster, reason = failure.redacted(), "connection failed");
             report(cluster, failure, &events);
             return;
         }
@@ -387,7 +387,7 @@ async fn connect(
                 )),
                 other => other,
             };
-            tracing::warn!(%cluster, reason = failure.message(), "discovery failed");
+            tracing::warn!(%cluster, reason = failure.redacted(), "discovery failed");
             sessions.disconnect(&cluster);
             report(cluster, failure, &events);
         }

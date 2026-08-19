@@ -14,6 +14,7 @@ jsonpath-rust.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 periscope-bridge.workspace = true
+regex.workspace = true
 periscope-config.workspace = true
 # `preserve_order` is what keeps the detail pane's YAML in the order the
 # apiserver sent it rather than alphabetised. It arrives transitively today;

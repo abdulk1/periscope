@@ -344,7 +344,15 @@ pub async fn run(
             }
             Err(error) => {
                 let (event, after) = translator.on_error(&error);
-                tracing::warn!(%cluster, %kind, %error, ?after, "watch failed");
+                // The raw error can carry the apiserver's host and, for an auth
+                // failure, a credential plugin's own output.
+                tracing::warn!(
+                    %cluster,
+                    %kind,
+                    reason = crate::redact::text(&error.to_string()),
+                    ?after,
+                    "watch failed"
+                );
 
                 if events.send(event).is_closed() {
                     return;

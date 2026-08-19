@@ -118,6 +118,9 @@ fn record(
         MutationOutcome::Failed { reason } => (AuditOutcome::Failed, reason.clone()),
     };
 
+    // Redacted here rather than at the source: the outcome on screen keeps the
+    // apiserver's exact words, and only the copy that outlives the session is
+    // stripped of hostnames and anything token-shaped.
     let entry = AuditEntry::new(
         cluster.as_str(),
         &*key.namespace,
@@ -126,7 +129,7 @@ fn record(
         mutation.verb(),
     )
     .detail(mutation.detail())
-    .outcome(result, reason);
+    .outcome(result, crate::redact::text(&reason));
 
     if let Err(error) = audit.append(&entry) {
         // Never fatal — but never silent either.

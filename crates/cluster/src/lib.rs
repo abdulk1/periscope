@@ -25,6 +25,7 @@ pub mod logs;
 pub mod mutate;
 pub mod pods;
 pub mod printer;
+pub mod redact;
 pub mod watch;
 pub mod yaml;
 
