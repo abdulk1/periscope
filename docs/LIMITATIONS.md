@@ -151,6 +151,24 @@ Smaller gaps in what *is* built:
 - **Settings are read once at startup.** Editing `settings.toml` while the app
   runs has no effect until it is restarted.
 
+## Navigation
+
+Kinds are grouped into sections — workloads, networking, configuration, storage,
+access control, cluster, one per custom API group — with a filter box, and the
+table can be driven from the keyboard (`j`/`k`, `g`/`G`, `enter`).
+
+What is **not** there:
+
+- **The section layout is not configurable.** The rules are in the code
+  (`crates/store/src/catalog.rs`); a kind cannot be moved to another section, and
+  a section cannot be renamed, pinned or hidden.
+- **Which sections are open is not remembered** between runs. It is in-memory
+  state, not settings.
+- **No favourites or recents.** Every console eventually grows a "things I look
+  at" list; there is none here.
+- **No `ctrl-d`/`ctrl-u` half-page movement**, and no type-to-jump inside a
+  table — the palette covers finding an object by name.
+
 ## Phase 4 scope
 
 Several clusters at once: lazy connect when a pane first points at one, warm
@@ -207,8 +225,13 @@ namespace and label-selector filters, the ⌘K palette, and a detail pane with
 YAML, events and owner-reference navigation. Its gaps are still:
 
 - No CRD printer columns (custom resources use the generic `STATUS`/`READY`
-  fallback).
-- No sorting controls, no column configuration, no describe-style prose.
+  fallback). A CRD can declare the columns `kubectl` prints for it; Periscope
+  does not read them yet, so a custom resource shows the fallback rather than
+  the columns its author chose.
+- No describe-style prose. The detail pane has YAML, events and owners on tabs;
+  there is no `kubectl describe`-shaped summary of an object.
+- Sorting is by one column at a time, and it is not remembered: switching kind
+  or cluster returns to name order.
 - Reveal for Secrets is per-open, deliberately.
 
 ## Measured against the budgets
