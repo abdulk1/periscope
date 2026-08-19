@@ -289,6 +289,36 @@ impl Proposal {
     }
 }
 
+/// Which part of an object the detail pane is showing.
+///
+/// The pane used to stack all three: YAML in the middle, events squeezed into
+/// 180 pixels at the bottom, owners in a strip at the top. Every other console
+/// tabs them, and for the same reason — the YAML of a real object is longer
+/// than a screen, and so is the event list of anything that is misbehaving.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DetailTab {
+    /// The object itself.
+    #[default]
+    Yaml,
+    /// What has happened to it.
+    Events,
+    /// What owns it.
+    Related,
+}
+
+impl DetailTab {
+    /// The label on the tab, with a count when there is something to count.
+    fn label(self, events: usize, owners: usize) -> String {
+        match self {
+            Self::Yaml => "YAML".to_owned(),
+            Self::Events if events > 0 => format!("Events ({events})"),
+            Self::Events => "Events".to_owned(),
+            Self::Related if owners > 0 => format!("Related ({owners})"),
+            Self::Related => "Related".to_owned(),
+        }
+    }
+}
+
 /// The application's root view.
 pub struct Workspace {
     commands: CommandSender,
@@ -364,6 +394,8 @@ pub struct Workspace {
     forwards_open: bool,
     /// Whether the namespace list is showing.
     namespace_menu_open: bool,
+    /// Which tab the detail pane is on.
+    detail_tab: DetailTab,
     /// How many lines a session keeps before dropping the oldest.
     log_capacity: usize,
     /// Which columns each kind shows.
@@ -553,6 +585,7 @@ impl Workspace {
             exec_input,
             forwards_open: false,
             namespace_menu_open: false,
+            detail_tab: DetailTab::default(),
             log_capacity: periscope_store::logs::DEFAULT_CAPACITY,
             columns: periscope_store::Layout::default(),
             exports: 0,
@@ -806,6 +839,9 @@ impl Workspace {
             return;
         };
 
+        // A new object starts on YAML: the tab you were on for the last one
+        // says nothing about this one, and Events is empty for most objects.
+        self.detail_tab = DetailTab::default();
         self.state.open_detail(kind.clone(), key.clone());
         self.send(ClusterCommand::FetchObject {
             cluster,
@@ -1448,6 +1484,12 @@ impl Workspace {
             return;
         };
         self.open_object(key, window, cx);
+    }
+
+    /// Switches which part of the object the detail pane shows.
+    fn show_detail_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
+        self.detail_tab = tab;
+        cx.notify();
     }
 
     /// Shows or hides the namespace list.
@@ -2697,16 +2739,16 @@ impl Workspace {
                     .events
                     .iter()
                     .rev()
-                    .take(20)
                     .map(|event| {
                         h_flex()
                             .w_full()
                             .gap_2()
                             .items_start()
+                            .py_0p5()
                             .text_xs()
                             .child(
                                 div()
-                                    .w(px(70.))
+                                    .w(px(90.))
                                     .flex_none()
                                     .text_color(if event.is_warning() {
                                         cx.theme().danger
@@ -2730,54 +2772,77 @@ impl Workspace {
                     })
                     .collect();
 
+                // One tab at a time, each with the whole pane: an object's YAML
+                // is longer than a screen, and so is the event list of anything
+                // that is misbehaving.
+                let tabs = [DetailTab::Yaml, DetailTab::Events, DetailTab::Related].map(|tab| {
+                    let active = self.detail_tab == tab;
+                    Button::new(SharedString::from(format!("detail-tab-{tab:?}")))
+                        .small()
+                        .when(active, gpui_component::button::ButtonVariants::primary)
+                        .when(!active, gpui_component::button::ButtonVariants::ghost)
+                        .label(tab.label(object.events.len(), object.owners.len()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.show_detail_tab(tab, cx)))
+                });
+
+                let content = match self.detail_tab {
+                    DetailTab::Yaml => div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .p_2()
+                        .child(Input::new(&self.yaml_view).h_full())
+                        .into_any_element(),
+                    DetailTab::Events if events.is_empty() => div()
+                        .p_4()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Nothing has happened to this object recently.")
+                        .into_any_element(),
+                    DetailTab::Events => v_flex()
+                        .id("events")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .gap_1()
+                        .px_3()
+                        .py_2()
+                        .children(events)
+                        .into_any_element(),
+                    DetailTab::Related if owners.is_empty() => div()
+                        .p_4()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Nothing owns this object.")
+                        .into_any_element(),
+                    DetailTab::Related => v_flex()
+                        .flex_1()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("OWNED BY"),
+                        )
+                        .children(owners)
+                        .into_any_element(),
+                };
+
                 v_flex()
                     .flex_1()
                     .overflow_hidden()
-                    .children((!owners.is_empty()).then(|| {
+                    .child(
                         h_flex()
                             .w_full()
                             .flex_none()
-                            .gap_2()
-                            .items_center()
-                            .px_3()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("OWNED BY"),
-                            )
-                            .children(owners)
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .p_2()
-                            .child(Input::new(&self.yaml_view).h_full()),
-                    )
-                    .children((!events.is_empty()).then(|| {
-                        v_flex()
-                            .w_full()
-                            .flex_none()
-                            .max_h(px(180.))
-                            .id("events")
-                            .overflow_y_scroll()
                             .gap_1()
                             .px_3()
-                            .py_2()
-                            .border_t_1()
+                            .py_1()
+                            .border_b_1()
                             .border_color(cx.theme().border)
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("EVENTS"),
-                            )
-                            .children(events)
-                    }))
+                            .children(tabs),
+                    )
+                    .child(content)
                     .into_any_element()
             }
         };
@@ -3812,6 +3877,46 @@ mod tests {
                 kind("cert-manager.io", "certificates", true),
             ]),
         }
+    }
+
+    #[gpui::test]
+    fn the_detail_pane_tabs_and_starts_on_yaml(cx: &mut TestAppContext) {
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        drain(&rx);
+
+        harness.read(cx, |workspace| {
+            assert_eq!(workspace.detail_tab, DetailTab::Yaml);
+        });
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.show_detail_tab(DetailTab::Events, cx);
+        });
+        harness.read(cx, |workspace| {
+            assert_eq!(workspace.detail_tab, DetailTab::Events);
+        });
+
+        // Opening another object goes back to YAML: which tab you were on for
+        // the last one says nothing about this one.
+        open_pod_detail(&harness, cx, "api-1");
+        harness.read(cx, |workspace| {
+            assert_eq!(workspace.detail_tab, DetailTab::Yaml);
+        });
+    }
+
+    #[test]
+    fn a_detail_tab_counts_what_it_holds() {
+        assert_eq!(DetailTab::Yaml.label(3, 1), "YAML");
+        assert_eq!(DetailTab::Events.label(3, 1), "Events (3)");
+        assert_eq!(DetailTab::Related.label(3, 1), "Related (1)");
+        // Nothing to count, nothing in brackets.
+        assert_eq!(DetailTab::Events.label(0, 0), "Events");
+        assert_eq!(DetailTab::Related.label(0, 0), "Related");
     }
 
     #[gpui::test]

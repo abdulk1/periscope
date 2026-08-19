@@ -165,6 +165,10 @@ you where.
 
 ## Changing things
 
+The detail pane is tabbed — **YAML**, **Events**, **Related** — with counts on
+the tabs that have something in them, so a misbehaving object's event list gets
+the whole pane rather than 180 pixels at the bottom.
+
 Open an object and the detail pane offers what its kind supports: **Scale**,
 **Restart**, **Cordon**, **Drain**, **Dry run**, **Apply** and **Delete**.
 Nothing happens until you confirm a sentence that names the cluster, the
