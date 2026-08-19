@@ -143,6 +143,14 @@ jobs:
       # The ingest-rate budget needs the unthrottled producer, so it runs on its
       # own after everything else — including the drain test, which evicts every
       # pod on the one node this cluster has.
+      #
+      # Its `kubectl wait` is the slowest thing left in this job, ~3 minutes for
+      # four busybox pods, and that is a cost of the job getting faster rather
+      # than a fault: the suite used to take ten minutes after seeding, which
+      # gave the kubelet ten minutes to catch up with 10,000 new pods before
+      # anything else asked it to schedule. It now takes under one. Applying
+      # firehose earlier is not the fix — it saturates the CPU by design, which
+      # is why it is down here away from every timing-sensitive test.
       - name: Ingest-rate budget
         env:
           PERISCOPE_E2E_REQUIRE_FIXTURES: "1"
