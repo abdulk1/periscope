@@ -18,6 +18,9 @@ use kube::{Api, Client};
 use periscope_bridge::{
     ClusterEvent, ClusterId, EventSink, ForwardId, ForwardInfo, ForwardState, ForwardTarget,
 };
+use periscope_config::{AuditEntry, AuditLog, AuditOutcome};
+
+use crate::mutate::WritePolicy;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -29,14 +32,36 @@ use tokio::net::{TcpListener, TcpStream};
 const BIND_ADDRESS: &str = "127.0.0.1";
 
 /// Runs a forward until the task is cancelled.
+///
+/// A forward changes nothing in the cluster, which is why it needs no
+/// confirmation — but `pods/portforward` is the same `create` verb `pods/exec`
+/// is, and a tunnel to a production database is not something a cluster marked
+/// read-only should hand out. So it passes the same gate exec does and is
+/// recorded the same way. See `docs/DECISIONS.md` ADR-0040.
 pub async fn run(
     cluster: ClusterId,
     id: ForwardId,
     client: Client,
     target: Arc<ForwardTarget>,
+    policy: &WritePolicy,
+    audit: Option<&AuditLog>,
     events: EventSink,
 ) {
     let mut info = ForwardInfo::starting(id, Arc::clone(&target));
+
+    if !policy.may_mutate(&cluster) {
+        let reason = format!("{cluster} is read-only; no port is forwarded from it");
+        tracing::warn!(%cluster, %id, target = %target.label(), "refused: cluster is read-only");
+        record(&cluster, &target, AuditOutcome::Refused, &reason, audit);
+
+        info.state = ForwardState::Failed { reason };
+        report(&cluster, &info, &events);
+        return;
+    }
+
+    // Recorded when it opens rather than when it closes: a tunnel that is still
+    // up is the one worth being able to prove afterwards.
+    record(&cluster, &target, AuditOutcome::Applied, "", audit);
     report(&cluster, &info, &events);
 
     let listener = match TcpListener::bind((BIND_ADDRESS, target.local_port.unwrap_or(0))).await {
@@ -154,6 +179,33 @@ async fn forward_one(
     copied.map(|_| ()).map_err(|error| error.to_string())
 }
 
+/// Writes one line of the audit log for a forward.
+fn record(
+    cluster: &ClusterId,
+    target: &ForwardTarget,
+    outcome: AuditOutcome,
+    reason: &str,
+    audit: Option<&AuditLog>,
+) {
+    let Some(audit) = audit else {
+        return;
+    };
+
+    let entry = AuditEntry::new(
+        cluster.as_str(),
+        &*target.namespace,
+        "pods",
+        &*target.pod,
+        "port-forward",
+    )
+    .detail(format!("port {}", target.remote_port))
+    .outcome(outcome, crate::redact::text(reason));
+
+    if let Err(error) = audit.append(&entry) {
+        tracing::error!(%cluster, %error, "could not write the audit log");
+    }
+}
+
 fn report(cluster: &ClusterId, info: &ForwardInfo, events: &EventSink) {
     events.send(ClusterEvent::ForwardChanged {
         cluster: cluster.clone(),
@@ -164,12 +216,68 @@ fn report(cluster: &ClusterId, info: &ForwardInfo, events: &EventSink) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forward;
 
     #[test]
     fn forwards_bind_loopback_only() {
         // Binding anything else would put a cluster-internal service on the
         // network the laptop happens to be attached to.
         assert_eq!(BIND_ADDRESS, "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_cluster_forwards_nothing_and_records_the_refusal() {
+        // `pods/portforward` is the same `create` verb `pods/exec` is, and a
+        // tunnel to a production database is not something a cluster somebody
+        // marked read-only should hand out. This runs with a client that would
+        // fail if it were ever used, so a gate that stopped refusing fails here
+        // rather than reaching the network.
+        let (sink, stream) = periscope_bridge::event_channel(16);
+        let scratch = std::env::temp_dir().join(format!(
+            "periscope-forward-audit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch directory");
+        let audit = periscope_config::AuditLog::at(scratch.join("audit.log"));
+
+        let mut policy = WritePolicy::permissive();
+        policy.deny(ClusterId::new("prod"));
+
+        forward::run(
+            "prod".into(),
+            ForwardId(1),
+            Client::try_default()
+                .await
+                .unwrap_or_else(|_| unreachable!("a client is only built, never used")),
+            Arc::new(ForwardTarget::new("payments", "db-0", 5432)),
+            &policy,
+            Some(&audit),
+            sink,
+        )
+        .await;
+
+        let reported = std::iter::from_fn(|| stream.try_recv())
+            .filter_map(|event| match event {
+                ClusterEvent::ForwardChanged { forward, .. } => Some(forward),
+                _ => None,
+            })
+            .last()
+            .expect("the refusal is reported");
+        assert!(
+            matches!(&reported.state, ForwardState::Failed { reason } if reason.contains("read-only")),
+            "{:?}",
+            reported.state
+        );
+
+        let entries = audit.read().expect("the audit log is readable");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].action, "port-forward");
+        assert_eq!(entries[0].outcome, periscope_config::AuditOutcome::Refused);
+        assert_eq!(entries[0].name, "db-0");
+        assert!(entries[0].detail.contains("5432"), "{}", entries[0].detail);
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[tokio::test]

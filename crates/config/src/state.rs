@@ -169,7 +169,8 @@ impl StateFile {
         }
 
         let body = toml::to_string(state).map_err(std::io::Error::other)?;
-        std::fs::write(&self.path, format!("{HEADER}{body}"))
+        std::fs::write(&self.path, format!("{HEADER}{body}"))?;
+        crate::paths::restrict(&self.path)
     }
 }
 

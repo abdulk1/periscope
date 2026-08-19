@@ -1,0 +1,32 @@
+# What `cargo audit` is allowed to pass over.
+#
+# Vulnerabilities are never ignored. Everything below is an *unmaintained* or
+# *unsound* advisory against a crate this project does not choose and cannot
+# replace: each one arrives through GPUI or `kube`, and the only fix available
+# here is an upgrade of those. They are listed rather than silenced wholesale so
+# the list itself is reviewable, and so a new one shows up as a failure instead
+# of joining an invisible pile.
+#
+# Re-check this list whenever GPUI or kube is upgraded.
+
+[advisories]
+ignore = [
+    # `async-std`, discontinued. Reaches us through gpui's async plumbing.
+    "RUSTSEC-2025-0052",
+    # `instant`, unmaintained. Transitive through gpui's animation timing.
+    "RUSTSEC-2024-0384",
+    # `paste`, unmaintained. A proc-macro helper, build-time only.
+    "RUSTSEC-2024-0436",
+    # `proc-macro-error2`, unmaintained. Build-time only.
+    "RUSTSEC-2026-0173",
+    # `git2` unsoundness in APIs this project never calls: the crate is present
+    # through an optional feature of a dependency and no code here uses it.
+    "RUSTSEC-2026-0183",
+    "RUSTSEC-2026-0184",
+    "RUSTSEC-2026-0192",
+    # `rustls-pemfile`, unmaintained; its API moved into `rustls-pki-types`.
+    # Reaches us through the TLS stack `kube` and the update client share.
+    "RUSTSEC-2025-0134",
+    # `rustybuzz`, unmaintained. Text shaping, pulled in by GPUI.
+    "RUSTSEC-2026-0206",
+]

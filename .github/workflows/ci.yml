@@ -268,3 +268,44 @@ jobs:
 
       - name: Test the layers that do not need a window
         run: cargo test -p periscope-store -p periscope-config -p periscope-bridge
+
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # gitleaks needs history to scan what was committed, not only the tip:
+          # a credential removed in the last commit is still in the repository.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      # RUSTSEC advisories against the exact versions in Cargo.lock. This is the
+      # check that notices a dependency became vulnerable while nobody touched
+      # this repository.
+      # Vulnerabilities fail the build. Unmaintained-crate warnings do not:
+      # every one of them arrives through GPUI or kube and cannot be fixed
+      # here, so they are listed with their reasons in `.cargo/audit.toml`
+      # rather than silenced — a new one still shows up as a failure.
+      - name: Known vulnerabilities
+        run: cargo audit
+
+      # Licences, duplicate versions and unmaintained crates. Kept separate from
+      # `audit` so a licence question never masks a vulnerability.
+      - name: Dependency policy
+        run: cargo deny check
+
+      # The invariants that no type can express: what is written to a log, an
+      # audit entry, or a file. Each test names the incident it exists for.
+      - name: Guardrails
+        run: cargo test -p periscope-guardrails
+
+      - name: Secrets in the history
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

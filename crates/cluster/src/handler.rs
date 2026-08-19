@@ -616,13 +616,20 @@ impl CommandHandler for KubeHandler {
                         return;
                     };
 
-                    let task = tokio::spawn(forward::run(
-                        cluster.clone(),
-                        id,
-                        session.client,
-                        Arc::clone(&target),
-                        events,
-                    ));
+                    let forwarded = cluster.clone();
+                    let forward_target = Arc::clone(&target);
+                    let task = tokio::spawn(async move {
+                        forward::run(
+                            forwarded,
+                            id,
+                            session.client,
+                            forward_target,
+                            &policy,
+                            audit.as_deref(),
+                            events,
+                        )
+                        .await;
+                    });
                     sessions.insert_forward(cluster, id, task, target);
                 }
 

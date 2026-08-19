@@ -52,6 +52,9 @@ fn main() -> Result<()> {
     // written a read-only rule would be the worst possible failure here.
     let settings = periscope_config::Settings::read().context("could not read settings")?;
     let audit = periscope_config::AuditLog::open().context("could not open the audit log")?;
+    // The store refuses before anything is sent, so the cluster layer never
+    // sees a refusal; the window needs its own handle to record one.
+    let refusals = audit.clone();
     // Remembered UI state, which is the opposite of settings in every way that
     // matters here: the app writes it, and losing it costs a collapsed section
     // rather than a safety rule, so nothing about it is fatal.
@@ -146,6 +149,7 @@ fn main() -> Result<()> {
                             cx,
                         );
                         workspace.set_permissions(permissions.clone());
+                        workspace.set_audit(refusals.clone());
                         workspace.set_limits(limits);
                         workspace.set_columns(columns.clone());
                         workspace.restore(ui_state.clone(), state_file.clone());

@@ -217,6 +217,9 @@ impl AuditLog {
             .create(true)
             .append(true)
             .open(&self.path)?;
+        // Every append, not only the create: a log that was already there with
+        // the wrong mode is the case that matters.
+        crate::paths::restrict(&self.path)?;
         file.write_all(line.as_bytes())
     }
 
@@ -349,6 +352,26 @@ mod tests {
             k8s_time::format_epoch(1_709_164_800),
             "2024-02-29T00:00:00Z"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_log_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // It records what was done to which cluster and why it failed. Other
+        // local accounts have no business in it, and the platform default is
+        // world-readable.
+        let file = TempFile::new("modes");
+        let log = AuditLog::at(file.0.clone());
+        log.append(&Entry::new("prod", "default", "pods", "api-0", "delete"))
+            .expect("appended");
+
+        let mode = std::fs::metadata(log.path())
+            .expect("the log exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "mode {:o}", mode & 0o777);
     }
 
     #[test]

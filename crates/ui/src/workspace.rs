@@ -494,6 +494,13 @@ pub struct Workspace {
     /// Rows that changed recently, refreshed once per frame rather than looked
     /// up per row: the table is virtualised but the map is one allocation.
     changed: Arc<std::collections::BTreeMap<ResourceKey, Instant>>,
+    /// Where refusals are written.
+    ///
+    /// The cluster layer records everything it is asked to do, but a refusal by
+    /// the store's gate is never sent, so the cluster layer never sees it — and
+    /// a read-only cluster turning down a delete is the single event the audit
+    /// log exists to be able to prove afterwards. `None` only in tests.
+    audit: Option<Arc<periscope_config::AuditLog>>,
     /// Counts exports, so two in one session do not overwrite each other.
     exports: u32,
     /// Frame timing, collected only under `--perf`.
@@ -709,6 +716,7 @@ impl Workspace {
             log_capacity: periscope_store::logs::DEFAULT_CAPACITY,
             columns: periscope_store::Layout::default(),
             changed: Arc::default(),
+            audit: None,
             exports: 0,
             frames: FrameMeter::new(perf),
             _subscriptions: subscriptions,
@@ -774,6 +782,50 @@ impl Workspace {
     /// Sets which clusters may be changed, from settings.
     pub fn set_permissions(&mut self, permissions: periscope_store::Permissions) {
         self.state.set_permissions(permissions);
+    }
+
+    /// Sets where refusals are recorded.
+    pub fn set_audit(&mut self, audit: periscope_config::AuditLog) {
+        self.audit = Some(Arc::new(audit));
+    }
+
+    /// Writes a refusal to the audit log.
+    ///
+    /// The store refuses before anything is sent, so this is the only place
+    /// that can record it. Failing to write is never fatal and never silent,
+    /// exactly as the cluster layer treats it.
+    fn audit_refusal(
+        &self,
+        cluster: &ClusterId,
+        key: &ResourceKey,
+        kind: &str,
+        verb: &str,
+        detail: String,
+        reason: String,
+    ) {
+        let Some(audit) = self.audit.as_ref() else {
+            return;
+        };
+
+        let entry = periscope_config::AuditEntry::new(
+            cluster.as_str(),
+            &*key.namespace,
+            kind,
+            &*key.name,
+            verb,
+        )
+        .detail(detail)
+        // Ours today — "prod is read-only" — but the rule is that nothing
+        // reaches this file unredacted, so that it stays true when the reason
+        // one day comes from the apiserver.
+        .outcome(
+            periscope_config::AuditOutcome::Refused,
+            periscope_cluster::redact::text(&reason),
+        );
+
+        if let Err(error) = audit.append(&entry) {
+            tracing::error!(%cluster, %error, "could not write the audit log");
+        }
     }
 
     /// Applies the configured appearance.
@@ -1144,6 +1196,14 @@ impl Workspace {
                 // A refusal the user cannot see is indistinguishable from a
                 // bug, so it joins the activity list like any other outcome.
                 tracing::warn!(%cluster, reason = refusal.reason(), "mutation refused");
+                self.audit_refusal(
+                    &cluster,
+                    &mutation.key(),
+                    &mutation.kind().label(),
+                    mutation.verb(),
+                    mutation.detail(),
+                    refusal.reason(),
+                );
                 self.state
                     .record_refusal(cluster, mutation, &refusal, Instant::now());
             }
@@ -1266,6 +1326,9 @@ impl Workspace {
 
     /// Sends an authorised command, or says why it was refused.
     fn send_command(&mut self, cluster: ClusterId, target: Arc<ExecTarget>) {
+        // Kept for the refusal path: `authorize_exec` takes the target, and a
+        // refusal still has to say what was asked for.
+        let asked = Arc::clone(&target);
         match self.state.authorize_exec(&cluster, target) {
             Ok(authorized) => {
                 let (cluster, target) = authorized.into_parts();
@@ -1292,6 +1355,14 @@ impl Workspace {
             }
             Err(refusal) => {
                 tracing::warn!(%cluster, reason = refusal.reason(), "command refused");
+                self.audit_refusal(
+                    &cluster,
+                    &ResourceKey::new(&*asked.namespace, &*asked.pod),
+                    "pods",
+                    "exec",
+                    asked.command_line(),
+                    refusal.reason(),
+                );
                 self.last_error = Some(SharedString::from(refusal.reason()));
             }
         }
@@ -1685,6 +1756,9 @@ impl Workspace {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&path, text)?;
+                // An export is a cluster's logs verbatim, sitting in a file
+                // that outlives the session.
+                periscope_config::paths::restrict(&path)?;
                 Ok(path)
             });
 
@@ -3316,8 +3390,17 @@ impl Workspace {
                 );
             }
 
+            // Applying a masked Secret would send `<hidden, 7 bytes>` as the
+            // value. The apiserver rejects it — it is not base64 — so this is a
+            // confusing failure rather than a destroyed secret, but offering a
+            // button whose only outcome is an error is its own defect.
+            let editable = !matches!(
+                detail,
+                Detail::Ready { object, .. } if object.maskable && !object.revealed
+            );
+
             let (dry_kind, dry_key) = (kind.clone(), key.clone());
-            actions.push(
+            actions.extend(editable.then(|| {
                 Button::new("dry-run")
                     .outline()
                     .small()
@@ -3333,11 +3416,11 @@ impl Workspace {
                             },
                             cx,
                         );
-                    })),
-            );
+                    }))
+            }));
 
             let (apply_kind, apply_key) = (kind.clone(), key.clone());
-            actions.push(
+            actions.extend(editable.then(|| {
                 Button::new("apply")
                     .outline()
                     .small()
@@ -3353,8 +3436,8 @@ impl Workspace {
                             },
                             cx,
                         );
-                    })),
-            );
+                    }))
+            }));
 
             let (delete_kind, delete_key) = (kind.clone(), key.clone());
             actions.push(

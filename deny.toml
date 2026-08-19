@@ -1,0 +1,42 @@
+# What is acceptable to depend on.
+#
+# `cargo audit` answers "is anything we depend on known to be vulnerable".
+# This answers the slower questions: are we shipping a licence we cannot, is a
+# dependency unmaintained, and are we carrying three copies of one crate.
+
+[advisories]
+# Unmaintained crates are a warning here and a failure in `cargo audit`, so the
+# two checks do not report the same thing twice.
+unmaintained = "workspace"
+yanked = "deny"
+
+[licenses]
+# Apache-2.0 is what this project ships under; the rest are the permissive
+# licences its dependency tree already carries.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicates are a fact of a large graph; this is here to stop them growing
+# silently rather than to forbid them today.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

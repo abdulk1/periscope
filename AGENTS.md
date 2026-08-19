@@ -93,6 +93,42 @@ feature usually belongs.
 never *what*; test names are sentences about behaviour; no `unwrap()` outside
 tests; every error says what failed, which cluster or object, and what to try.
 
+## Security is enforced, not remembered
+
+Four of the eight invariants above were held by discipline alone until a review
+found two of them already broken. They are now held by code, and the code is
+checked on every push:
+
+```sh
+cargo test -p periscope-guardrails   # the invariants no type can express
+cargo audit                          # RUSTSEC advisories against Cargo.lock
+cargo deny check                     # licences, unmaintained crates, duplicates
+```
+
+`tests/guardrails` reads the source and fails the build when a shape that has
+already leaked reappears — a `tracing::` call carrying a cluster URL or a token,
+an audit entry written without `redact::text`, a file written without
+`paths::restrict`. Each test names the incident it exists for.
+
+Before you commit anything that touches a cluster, a credential, or a file:
+
+- **Does it write anything down?** Log lines, audit entries and exported files
+  outlive the session and get attached to bug reports. Everything persisted goes
+  through `periscope_cluster::redact`; what is on screen does not, because the
+  person at the keyboard already holds the credentials.
+- **Does it reach the apiserver?** If it can change anything — including
+  `pods/exec` and `pods/portforward`, which are `create` verbs — it passes the
+  store's gate *and* the cluster layer's `WritePolicy`, and it is audited,
+  including when it is refused.
+- **Does it name a cluster?** Capture the `ClusterId` where the decision is
+  made, not where it is executed. A mutation that resolves its cluster twice
+  can be confirmed against one and sent to another.
+- **Did you add a dependency?** `cargo audit` and `cargo deny check` before you
+  commit, not after CI says so.
+
+If a guardrail fails, the fix is almost never to relax it. If it is genuinely
+wrong, fix the rule and say why in the commit message.
+
 ## When you finish something
 
 1. `docs/LIMITATIONS.md` — rewrite what your change made true or false. This
@@ -140,3 +176,7 @@ The rules that made parallel work land cleanly here:
 - **Never drive the running application with synthetic keystrokes.** One agent
   did; the focus went somewhere else and it typed into the operator's session.
   Use the test harness, or `tools/winid` and a screenshot.
+- **Read-only means do not author changes *and* do not undo them.** A reviewer
+  ran concurrently with a writer, decided the writer's uncommitted work was a
+  rogue agent, and reverted the tree four times. Say so explicitly when you ask
+  for a review, and expect a writer's edits to be in the tree while it runs.

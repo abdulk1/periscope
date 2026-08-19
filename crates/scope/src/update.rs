@@ -21,6 +21,12 @@ use periscope_config::{Release, Updates, Version};
 /// not keep a runtime task alive for the life of the session.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The most of an answer that will be read.
+///
+/// GitHub's release document for a large project is tens of kilobytes; this is
+/// generous and still bounded.
+const MAX_ANSWER: usize = 512 * 1024;
+
 /// What GitHub wants callers to identify themselves as. It carries the version
 /// and nothing else — no machine, no user, no cluster.
 fn user_agent() -> String {
@@ -70,7 +76,7 @@ async fn fetch(endpoint: &str) -> Result<String, String> {
         .build()
         .map_err(|error| error.to_string())?;
 
-    let response = client
+    let mut response = client
         .get(endpoint)
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -81,7 +87,21 @@ async fn fetch(endpoint: &str) -> Result<String, String> {
         return Err(format!("{} answered {}", endpoint, response.status()));
     }
 
-    response.text().await.map_err(|error| error.to_string())
+    // A release document is a few kilobytes. Reading an unbounded body from a
+    // configurable endpoint means a misconfigured or hostile one can stream
+    // until the process dies, so the answer is read in chunks and abandoned the
+    // moment it stops being plausible.
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if body.len() + chunk.len() > MAX_ANSWER {
+            return Err(format!(
+                "{endpoint} answered with more than {MAX_ANSWER} bytes"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

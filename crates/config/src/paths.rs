@@ -13,6 +13,28 @@ const QUALIFIER: &str = "dev";
 const ORGANIZATION: &str = "periscope";
 const APPLICATION: &str = "Periscope";
 
+/// Restricts a path to its owner.
+///
+/// The audit log records what was done to which cluster, exported buffers hold
+/// production logs verbatim, and `state.toml` says what somebody has been
+/// looking at. None of that is other local accounts' business, and the default
+/// on macOS and most Linux distributions is world-readable.
+///
+/// A no-op off Unix, where the equivalent is an ACL this project does not set.
+pub fn restrict(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = if path.is_dir() { 0o700 } else { 0o600 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+
+    Ok(())
+}
+
 /// Resolves the platform's project directories.
 fn project_dirs() -> Result<ProjectDirs> {
     ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
