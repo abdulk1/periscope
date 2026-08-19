@@ -110,6 +110,16 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
 ```
 
+The YAML the detail pane shows is pinned by golden files in
+`crates/cluster/tests/golden/`: a JSON object, and the exact text it must render
+as. After a deliberate change to the writer, rewrite them and read the diff —
+an expectation updated without being read records the bug instead of catching
+it.
+
+```sh
+PERISCOPE_UPDATE_GOLDEN=1 cargo test -p periscope-cluster --test golden
+```
+
 The end-to-end suite needs a real cluster and is skipped unless asked for:
 
 ```sh

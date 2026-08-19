@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  creationTimestamp: 2026-05-11T08:02:19Z
+  finalizers: []
+  labels: {}
+  name: awkward
+  namespace: payments
+data:
+  enabled: "true"
+  disabled: "False"
+  absent: "null"
+  tilde: "~"
+  norwegian-country-code: "NO"
+  file-mode: "0755"
+  version: "1.10"
+  negative: "-1"
+  exponent: "1e6"
+  empty: ""
+  port: "8080"
+  percentage: 25%
+  duration: 30s
+  colon-terminated: "note:"
+  colon-inside: host:port
+  url: https://example.com:8443/healthz?retries=3
+  flow-sequence: "[a, b]"
+  flow-mapping: "{ replicas: 3 }"
+  leading-dash: "- not a list item"
+  just-a-dash: "-"
+  leading-hash: "# not a comment"
+  trailing-comment: "value # not a comment either"
+  leading-space: " padded"
+  trailing-space: "padded "
+  tab-separated: "left\tright"
+  quoted-and-colonned: "he said \"go: now\""
+  backslash: C:\Users\api\config
+  unicode: café — naïve ✅
+  one-very-long-line: kubectl get pods --all-namespaces -o jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{.status.phase}{"\n"}{end} | sort | uniq -c | sort -rn | head -40
+binaryData: {}
+immutable: false

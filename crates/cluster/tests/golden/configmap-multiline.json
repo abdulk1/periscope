@@ -1,0 +1,18 @@
+{
+  "apiVersion": "v1",
+  "kind": "ConfigMap",
+  "metadata": {
+    "name": "envoy",
+    "namespace": "payments",
+    "creationTimestamp": "2026-05-11T08:02:19Z"
+  },
+  "data": {
+    "nginx.conf": "server {\n  listen 80;\n  location /healthz {\n    return 200 \"ok\";\n  }\n}",
+    "entrypoint.sh": "#!/bin/sh\nset -eu\n\nexec /usr/local/bin/envoy \\\n  -c /etc/envoy/envoy.yaml \\\n  --log-level \"${LOG_LEVEL:-warn}\"\n",
+    "ca.crt": "-----BEGIN CERTIFICATE-----\nMIIC0DCCAbigAwIBAgIUZ0Q9r3nRLZ3sB0kK1mVQnHhFqXwwDQYJKoZIhvcNAQEL\nBQAwDzENMAsGA1UEAwwEcm9vdDAeFw0yNjA1MTEwODAyMTlaFw0zNjA1MDgwODAy\n-----END CERTIFICATE-----\n",
+    "indented-first-line": "    this file starts indented\nand the second line does not",
+    "trailing-blank-line": "one\ntwo\n\n",
+    "windows-line-endings": "first\r\nsecond\r\n",
+    "single-line": "log_level = warn"
+  }
+}

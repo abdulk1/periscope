@@ -414,7 +414,7 @@ async fn apply(
     match api.patch(&key.name, &params, &Patch::Apply(&object)).await {
         Ok(result) => {
             if dry_run {
-                let preview = crate::detail::to_yaml_public(&result)
+                let preview = crate::detail::to_yaml(&result, false)
                     .unwrap_or_else(|error| format!("could not render the result: {error}"));
                 MutationOutcome::DryRun {
                     preview: Arc::from(preview.as_str()),

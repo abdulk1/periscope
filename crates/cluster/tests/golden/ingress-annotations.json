@@ -1,0 +1,55 @@
+{
+  "apiVersion": "networking.k8s.io/v1",
+  "kind": "Ingress",
+  "metadata": {
+    "name": "api",
+    "namespace": "payments",
+    "creationTimestamp": "2026-03-04T11:45:02Z",
+    "generation": 4,
+    "resourceVersion": "7710455",
+    "managedFields": [
+      { "manager": "kubectl-client-side-apply", "operation": "Update", "apiVersion": "networking.k8s.io/v1" }
+    ],
+    "annotations": {
+      "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"networking.k8s.io/v1\",\"kind\":\"Ingress\",\"metadata\":{\"name\":\"api\"}}",
+      "nginx.ingress.kubernetes.io/configuration-snippet": "more_set_headers \"X-Frame-Options: DENY\";\nmore_set_headers \"X-Request-Id: $request_id\";\n",
+      "nginx.ingress.kubernetes.io/server-snippet": "location = /metrics {\n  deny all;\n  return 403;\n}\n",
+      "nginx.ingress.kubernetes.io/proxy-body-size": "8m",
+      "nginx.ingress.kubernetes.io/ssl-redirect": "true",
+      "nginx.ingress.kubernetes.io/whitelist-source-range": "10.0.0.0/8,192.168.0.0/16",
+      "cert-manager.io/cluster-issuer": "letsencrypt-prod",
+      "field.cattle.io/description": "the team calls this \"the front door\": do not delete",
+      "meta.helm.sh/release-namespace": "payments",
+      "argocd.argoproj.io/sync-options": "Prune=false,Validate=false"
+    }
+  },
+  "spec": {
+    "ingressClassName": "nginx",
+    "tls": [
+      { "hosts": ["api.example.com"], "secretName": "api-tls" }
+    ],
+    "rules": [
+      {
+        "host": "api.example.com",
+        "http": {
+          "paths": [
+            {
+              "path": "/",
+              "pathType": "Prefix",
+              "backend": {
+                "service": { "name": "api", "port": { "number": 8080 } }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "status": {
+    "loadBalancer": {
+      "ingress": [
+        { "hostname": "a1b2c3.elb.eu-west-1.amazonaws.com" }
+      ]
+    }
+  }
+}
