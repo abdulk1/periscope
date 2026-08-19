@@ -528,9 +528,16 @@ pub struct Workspace {
     log_capacity: usize,
     /// Which columns each kind shows.
     columns: periscope_store::Layout,
-    /// Rows that changed recently, refreshed once per frame rather than looked
-    /// up per row: the table is virtualised but the map is one allocation.
-    changed: Arc<std::collections::BTreeMap<ResourceKey, Instant>>,
+    /// Rows that changed recently, per pane, refreshed once per frame rather
+    /// than looked up per row: the table is virtualised but the map is one
+    /// allocation.
+    ///
+    /// Per pane because a split shows two different tables. One map, taken from
+    /// the focused pane and handed to both, flashed rows in the other pane
+    /// whenever an object with the same namespace and name changed over here —
+    /// two clusters running the same workloads is the normal case, so it
+    /// mostly looked plausible.
+    changed: Vec<Arc<std::collections::BTreeMap<ResourceKey, Instant>>>,
     /// The namespaces the focused table's rows live in, refreshed once per
     /// frame for the same reason `changed` is: the toolbar wants a count and
     /// the menu wants the list, and neither should walk the rows to get one.
@@ -763,7 +770,7 @@ impl Workspace {
             detail_tab: DetailTab::default(),
             log_capacity: periscope_store::logs::DEFAULT_CAPACITY,
             columns: periscope_store::Layout::default(),
-            changed: Arc::default(),
+            changed: Vec::new(),
             namespaces: Arc::from([] as [Arc<str>; 0]),
             log_lines: Arc::from([] as [Arc<periscope_bridge::LogLine>; 0]),
             exec_lines: Arc::from([] as [Arc<periscope_bridge::LogLine>; 0]),
@@ -1090,6 +1097,13 @@ impl Workspace {
     /// Points the focused pane at a cluster, connecting if this session has not
     /// yet.
     fn select_cluster(&mut self, cluster: ClusterId, cx: &mut Context<Self>) {
+        // The store drops a tail and a running command when the pane moves —
+        // lines from another cluster on screen would relate to nothing — but
+        // dropping the view never stopped the work. The streams stayed open on
+        // the old cluster and the command went on running in the container,
+        // both of them producing events for a session nobody could see.
+        self.stop_sessions_before_leaving(&cluster);
+
         self.state.select_cluster(cluster.clone());
         self.state.touch_cluster(&cluster, Instant::now());
         self.connect_once(cluster.clone());
@@ -1103,6 +1117,37 @@ impl Workspace {
         }
         self.ensure_watches();
         cx.notify();
+    }
+
+    /// Stops any tail or command belonging to a cluster the focused pane is
+    /// about to leave.
+    ///
+    /// Only for a genuine move: selecting the cluster already shown is a no-op
+    /// in the store, and must be one here too, or clicking the current context
+    /// would kill the tail it is showing.
+    fn stop_sessions_before_leaving(&mut self, next: &ClusterId) {
+        if self.state.active() == Some(next) {
+            return;
+        }
+
+        if let Some(cluster) = self
+            .state
+            .logs()
+            .map(|session| session.cluster.clone())
+            .filter(|cluster| cluster != next)
+        {
+            self.send(ClusterCommand::StopLogs { cluster });
+        }
+
+        if let Some(cluster) = self
+            .state
+            .exec()
+            .filter(|session| session.is_running())
+            .map(|session| session.cluster.clone())
+            .filter(|cluster| cluster != next)
+        {
+            self.send(ClusterCommand::CancelExec { cluster });
+        }
     }
 
     /// Switches which kind the table shows.
@@ -1496,6 +1541,8 @@ impl Workspace {
     /// table's filters describe.
     fn open_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cluster) = self.state.active().cloned() else {
+            self.log_notice = Some(SharedString::from("Select a context before tailing logs."));
+            cx.notify();
             return;
         };
 
@@ -2652,8 +2699,24 @@ impl Workspace {
         )
     }
 
+    /// A notice with no log pane to render it.
+    ///
+    /// `log_notice` is drawn by the log pane, and every reason `cmd-l` declines
+    /// to open one is a reason there is no log pane — so each explanation of
+    /// why nothing happened went into a field nobody drew. This is what puts it
+    /// in the footer instead, where it outranks the last mutation, being the
+    /// newer answer to the newer question.
+    fn orphaned_notice(&self) -> Option<SharedString> {
+        match self.state.logs() {
+            Some(_) => None,
+            None => self.log_notice.clone(),
+        }
+    }
+
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let connection = self.state.active_connection();
+
+        let orphaned = self.orphaned_notice();
 
         let stale = connection
             .filter(|connection| connection.is_stale())
@@ -2675,20 +2738,28 @@ impl Workspace {
             .border_color(crate::style::hairline(cx))
             .text_xs()
             .text_color(crate::style::text_faint(cx))
-            .children(self.state.last_activity().map(|activity| {
+            .children(orphaned.clone().map(|said| {
                 div()
                     .text_xs()
-                    .text_color(if activity.outcome.is_problem() {
-                        cx.theme().danger
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .child(format!(
-                        "{} {} · {}",
-                        activity.mutation.verb(),
-                        activity.mutation.key(),
-                        activity.outcome.message()
-                    ))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(said)
+            }))
+            .children(orphaned.is_none().then_some(()).and_then(|()| {
+                self.state.last_activity().map(|activity| {
+                    div()
+                        .text_xs()
+                        .text_color(if activity.outcome.is_problem() {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(format!(
+                            "{} {} · {}",
+                            activity.mutation.verb(),
+                            activity.mutation.key(),
+                            activity.outcome.message()
+                        ))
+                })
             }))
             .child(
                 h_flex()
@@ -2805,7 +2876,7 @@ impl Workspace {
                 namespaced,
                 opened: self.state.detail().map(|detail| detail.key().clone()),
                 cursor: pane.cursor(),
-                changed: Arc::clone(&self.changed),
+                changed: self.changed.get(index).cloned().unwrap_or_default(),
                 scroll: self.table_scroll[index.min(1)].clone(),
                 now: SystemTime::now(),
             })
@@ -4271,10 +4342,10 @@ impl Render for Workspace {
 
         // Which rows changed lately, read once for the frame. Reading it also
         // prunes it, which is why it happens here rather than per row.
-        let focus = self.state.focus();
-        self.changed = self
-            .state
-            .changed_recently(focus, Instant::now(), crate::style::FLASH);
+        let now = Instant::now();
+        self.changed = (0..self.state.panes().len())
+            .map(|pane| self.state.changed_recently(pane, now, crate::style::FLASH))
+            .collect();
         self.namespaces = self.state.namespaces();
         self.log_lines = self
             .state
@@ -6366,6 +6437,69 @@ mod tests {
             other => panic!("expected a log session, got {other:?}"),
         }
         assert!(harness.read(cx, |workspace| workspace.state().logs().is_some()));
+    }
+
+    #[gpui::test]
+    fn a_reason_cmd_l_did_nothing_reaches_somewhere_it_is_drawn(cx: &mut TestAppContext) {
+        // The reason was written to `log_notice`, which only the log pane
+        // renders — and there is no log pane precisely when tailing was
+        // refused. The message existed and nobody could see it.
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+        drain(&rx);
+
+        harness.keys(cx, "cmd-l");
+
+        harness.read(cx, |workspace| {
+            assert!(workspace.state().logs().is_none(), "nothing opened");
+            let shown = workspace
+                .orphaned_notice()
+                .expect("the refusal is rendered somewhere");
+            assert!(
+                shown.contains("selector") || shown.contains("namespace"),
+                "{shown}"
+            );
+        });
+
+        // Once a session exists the pane carries it, and the footer does not
+        // repeat what is already on screen.
+        open_pod_detail(&harness, cx, "api-0");
+        harness.keys(cx, "cmd-l");
+        harness.read(cx, |workspace| {
+            assert!(workspace.state().logs().is_some());
+            assert!(workspace.orphaned_notice().is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn leaving_a_cluster_stops_the_tail_it_was_showing(cx: &mut TestAppContext) {
+        // The store drops the session so the pane does not show another
+        // cluster's lines. Nothing stopped the work behind it, so the pods went
+        // on streaming to a view that had been thrown away.
+        let (harness, rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod", "staging"], "prod"), kinds_event("prod")],
+        );
+        open_pod_detail(&harness, cx, "api-0");
+        harness.keys(cx, "cmd-l");
+        drain(&rx);
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.select_cluster(ClusterId::new("staging"), cx);
+        });
+
+        assert!(
+            drain(&rx).contains(&ClusterCommand::StopLogs {
+                cluster: ClusterId::new("prod")
+            }),
+            "the tail was left running on the cluster we walked away from"
+        );
     }
 
     #[gpui::test]

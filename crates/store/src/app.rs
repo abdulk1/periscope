@@ -870,10 +870,12 @@ impl AppState {
 
     // --- mutations ----------------------------------------------------------
 
-    /// When each visible row of the focused pane last changed.
+    /// When each visible row of a given pane last changed.
     ///
     /// The view uses it to mark what just moved: a watch stream rewrites rows
-    /// under the reader with nothing else to say that anything happened.
+    /// under the reader with nothing else to say that anything happened. Per
+    /// pane, because a split shows two tables and a row that changed in one of
+    /// them says nothing about a row of the same name in the other.
     pub fn changed_recently(
         &mut self,
         pane: usize,
@@ -1882,6 +1884,49 @@ mod tests {
             Instant::now(),
         );
         assert!(matches!(state.detail(), Some(Detail::Ready { .. })));
+    }
+
+    #[test]
+    fn each_pane_flashes_its_own_rows() {
+        // Two clusters running the same workloads have rows with the same
+        // namespace and name, so one change map shared between the panes lit
+        // up the other pane's rows and looked entirely plausible doing it.
+        let mut state = state_with_contexts();
+        state.split();
+        state.focus_pane(1);
+        state.select_cluster(ClusterId::new("staging"));
+        state.select_kind(pods());
+        state.focus_pane(0);
+
+        let start = Instant::now();
+        state.apply_batch(
+            &[
+                reset("prod", pods(), &[row("default", "api-0")]),
+                reset("staging", pods(), &[row("default", "api-0")]),
+            ],
+            start,
+        );
+
+        // The same object name changes on prod, and only on prod.
+        let later = start + std::time::Duration::from_millis(10);
+        state.apply_batch(
+            &[ClusterEvent::ResourceApplied {
+                cluster: "prod".into(),
+                kind: pods(),
+                row: Arc::new(ResourceRow {
+                    cells: Arc::from([Arc::from("CrashLoopBackOff")]),
+                    ..row("default", "api-0")
+                }),
+            }],
+            later,
+        );
+
+        let window = std::time::Duration::from_secs(1);
+        assert_eq!(state.changed_recently(0, later, window).len(), 1);
+        assert!(
+            state.changed_recently(1, later, window).is_empty(),
+            "the other cluster's pane flashed a row that did not change"
+        );
     }
 
     #[test]
