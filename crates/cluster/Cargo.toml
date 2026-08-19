@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 futures.workspace = true
+jsonpath-rust.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 periscope-bridge.workspace = true

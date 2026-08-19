@@ -264,10 +264,33 @@ including CRDs, generic tables driven by columns that travel with the data,
 namespace and label-selector filters, the ⌘K palette, and a detail pane with
 YAML, events and owner-reference navigation. Its gaps are still:
 
-- No CRD printer columns (custom resources use the generic `STATUS`/`READY`
-  fallback). A CRD can declare the columns `kubectl` prints for it; Periscope
-  does not read them yet, so a custom resource shows the fallback rather than
-  the columns its author chose.
+- CRD printer columns are read, with four things they do not cover yet:
+  - **No wide listing.** A column whose CRD gives it a priority above zero is
+    hidden, as `kubectl` hides one until asked for `-o wide`. There is no `-o
+    wide` here, so those columns cannot be seen at all — cert-manager's ISSUER
+    and STATUS, Argo CD's REVISION and PROJECT.
+  - **Escaped keys are not supported.** `kubectl`'s JSONPath dialect escapes a
+    dot inside a key name with a backslash —
+    `.metadata.labels.app\.kubernetes\.io/name` — and the RFC 9535 parser this
+    uses spells that with brackets instead. A column written the first way is
+    dropped, with a warning in the log naming the kind and the column. Nothing
+    in the test cluster's nine CRDs writes one.
+  - **A `date` column is a snapshot.** It renders as an age, and that age is
+    computed when the row is projected, so it only advances when the object
+    changes. The AGE column at the end of every table is recomputed each frame
+    and does not have this problem. It costs little in practice: a CRD's own
+    `Age` column is dropped as a duplicate of that one, and the remaining `date`
+    columns are renewal and expiry times that are read once.
+  - **A row's colour is not from the columns.** Healthy, transient and failing
+    still come from the conventional `status.phase` and `Ready` condition;
+    printer columns say what to print, not how the object is doing, so a CRD
+    with a `Phase` column of its own and no `status.phase` renders a neutral row
+    with a filled-in table.
+
+  A CRD that declares no columns still gets the generic `STATUS`/`READY`
+  fallback, and so does every kind on a cluster whose
+  `customresourcedefinitions` the credential may not read — that failure is
+  logged with its reason and costs nothing but the columns.
 - No describe-style prose. The detail pane has YAML, events and owners on tabs;
   there is no `kubectl describe`-shaped summary of an object.
 - Sorting is by one column at a time, and it is not remembered: switching kind

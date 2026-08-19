@@ -150,6 +150,93 @@ fn a_custom_resource_lists_through_the_same_path_as_pods() {
     assert_eq!(&*state.rows()[0].key.name, "sprocket");
 }
 
+/// The headings a kind's table arrives with.
+fn headings(event: &ClusterEvent) -> Vec<String> {
+    let ClusterEvent::ResourceReset { columns, .. } = event else {
+        panic!("expected a listing, got {event:?}")
+    };
+    columns.iter().map(|c| c.name.to_string()).collect()
+}
+
+/// Watches one kind and returns the listing the apiserver answered with.
+fn listing(kind: KindId) -> ClusterEvent {
+    let (_runtime, stream, _cluster) = watching(kind.clone(), TIMEOUT);
+
+    wait_for(
+        &stream,
+        TIMEOUT,
+        |event| matches!(event, ClusterEvent::ResourceReset { kind: listed, .. } if listed == &kind),
+    )
+    .unwrap_or_else(|seen| panic!("no {kind} listing; saw: {}", describe(&seen)))
+    .0
+}
+
+/// cert-manager's Certificate CRD declares five printer columns: READY and
+/// SECRET, ISSUER and STATUS at priority 1, and an AGE of its own. `kubectl get
+/// certificates` prints NAME READY SECRET AGE, and so does this — the two
+/// low-priority columns wait for a wide listing, and the CRD's AGE is the same
+/// field as the AGE every table already ends with.
+#[test]
+#[ignore = "needs a cluster with cert-manager installed"]
+fn a_crd_renders_the_printer_columns_its_author_declared() {
+    let certificates = KindId::new("cert-manager.io", "v1", "Certificate", "certificates");
+    let event = listing(certificates);
+
+    assert_eq!(
+        headings(&event),
+        ["READY", "SECRET"],
+        "cert-manager's own columns should be read from its CRD"
+    );
+
+    // The columns are declared whether or not anything has been issued, so the
+    // headings are the assertion that always holds. Where a certificate does
+    // exist, its cells are the proof that the JSONPaths were evaluated and not
+    // merely parsed: READY comes from a filter over `status.conditions`, which
+    // is the expression form worth having a real cluster for.
+    let ClusterEvent::ResourceReset { rows, .. } = &event else {
+        unreachable!()
+    };
+    for row in rows.iter() {
+        assert!(
+            matches!(row.cell(0), "True" | "False" | "Unknown" | "<none>"),
+            "{}: READY should be a condition status, got {:?}",
+            row.key,
+            row.cell(0)
+        );
+        assert!(
+            !row.cell(1).is_empty(),
+            "{}: SECRET should name a secret or say <none>",
+            row.key
+        );
+    }
+}
+
+/// Argo CD's Application CRD, for a second vendor's declarations and a heading
+/// with a space in it.
+#[test]
+#[ignore = "needs a cluster with Argo CD installed"]
+fn a_second_vendors_crd_renders_its_columns_too() {
+    let applications = KindId::new("argoproj.io", "v1alpha1", "Application", "applications");
+    let headings = headings(&listing(applications));
+
+    assert_eq!(headings, ["SYNC STATUS", "HEALTH STATUS"]);
+    // REVISION and PROJECT are priority 10; `kubectl get applications` hides
+    // both until asked for `-o wide`.
+    assert!(!headings.contains(&"REVISION".to_owned()), "{headings:?}");
+    assert!(!headings.contains(&"PROJECT".to_owned()), "{headings:?}");
+}
+
+/// A CRD may declare nothing, and most do. The generic table is still there for
+/// them; it is simply no longer every custom resource's answer.
+#[test]
+#[ignore = "needs a cluster"]
+fn a_crd_that_declares_no_printer_columns_falls_back_to_the_generic_table() {
+    let widgets = KindId::new("example.com", "v1", "Widget", "widgets");
+    let headings = headings(&listing(widgets));
+
+    assert_eq!(headings, ["STATUS", "READY"]);
+}
+
 #[test]
 #[ignore = "needs a cluster"]
 fn deployments_render_the_columns_kubectl_prints() {

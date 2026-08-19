@@ -22,7 +22,7 @@ for the same one-node cluster.
 | `tests/kind.rs` | Listing pods, live create/delete latency, disconnect, and the 10k-pod list budget |
 | `tests/auth.rs` | A credential the apiserver rejects, a missing kubeconfig, and a context that does not exist |
 | `tests/exec_auth.rs` | Exec credential plugins shaped like EKS's and GKE's, including the real `aws` CLI |
-| `tests/discovery.rs` | Discovery with CRDs, generic tables, filters, secret masking, and the detail fetch |
+| `tests/discovery.rs` | Discovery with CRDs, printer columns read from real CRDs, generic tables, filters, secret masking, and the detail fetch |
 | `tests/logs.rs` | Tailing one pod and fifty, merging, re-attach after a restart, and the ingest-rate budget |
 | `tests/multicluster.rs` | Five clusters at once, the row budget, warm switching, and one unreachable cluster |
 | `tests/mutations.rs` | Delete, scale, restart, cordon, drain, apply and dry run — plus a read-only cluster refusing, and the audit log |
@@ -101,6 +101,11 @@ cargo run --release -p periscope-e2e --bin seed-pods -- --large-config-map
 
 A megabyte of generated text does not belong in git, so the fixture generator
 makes it.
+
+The two printer-column tests want cert-manager and Argo CD for the same reason:
+they assert that `certificates` and `applications` come out with the headings
+their own CRDs declare, and those are read from the cluster, so there is nothing
+to fake.
 
 The multi-cluster suite writes its own kubeconfig with five contexts pointing at
 the test cluster and one pointing at a closed port; nothing extra is needed.

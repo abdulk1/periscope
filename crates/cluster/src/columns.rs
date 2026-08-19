@@ -1,10 +1,12 @@
 //! What each kind's table looks like, and how to fill it in.
 //!
 //! A kind is projected by a plain function from the object to a row of cells
-//! plus a state. Core kinds get the columns `kubectl` prints; everything else —
-//! including every CRD — falls back to a listing that works without knowing
-//! anything about the kind. That fallback is what makes "lists all custom
-//! resources without special-casing" true rather than aspirational.
+//! plus a state. Core kinds get the columns `kubectl` prints. A CRD gets the
+//! columns its own CustomResourceDefinition declares, read by [`crate::printer`]
+//! and evaluated here. Everything else — a kind neither this module nor its CRD
+//! has anything to say about — falls back to a listing that works without
+//! knowing anything about the kind. That fallback is what makes "lists all
+//! custom resources without special-casing" true rather than aspirational.
 //!
 //! Columns are data, not code in the UI: they travel with the rows, so a kind
 //! this module has never heard of still renders correctly.
@@ -18,6 +20,7 @@ use periscope_bridge::{ColumnSpec, KindId, ResourceKey, ResourceRow, RowState};
 use serde_json::Value;
 
 use crate::pods;
+use crate::printer::{self, PrinterColumn};
 
 /// How to render one kind.
 #[derive(Clone)]
@@ -25,7 +28,20 @@ pub struct KindColumns {
     /// The kind-specific columns, between NAME and AGE.
     pub columns: Arc<[ColumnSpec]>,
     /// Fills those columns in for one object.
-    project: fn(&DynamicObject) -> (Vec<Arc<str>>, RowState),
+    project: Projection,
+}
+
+/// Where a row's cells come from.
+///
+/// Built-ins stay a bare function pointer — a projector this module wrote has
+/// nothing to capture — while a CRD's columns carry the parsed JSONPaths they
+/// are evaluated from, which a function pointer cannot.
+#[derive(Clone)]
+enum Projection {
+    /// A kind this module knows the fields of.
+    BuiltIn(fn(&DynamicObject) -> (Vec<Arc<str>>, RowState)),
+    /// The printer columns a CustomResourceDefinition declared.
+    Declared(Arc<[PrinterColumn]>),
 }
 
 impl std::fmt::Debug for KindColumns {
@@ -39,7 +55,21 @@ impl std::fmt::Debug for KindColumns {
 impl KindColumns {
     /// Projects one object into a table row.
     pub fn row(&self, object: &DynamicObject) -> ResourceRow {
-        let (cells, state) = (self.project)(object);
+        self.row_at(object, SystemTime::now())
+    }
+
+    /// Projects one object into a table row, as of `now`.
+    ///
+    /// The clock is a parameter because a CRD may declare a `date` column, and
+    /// a cell that renders an age is only reproducible against a fixed one.
+    pub fn row_at(&self, object: &DynamicObject, now: SystemTime) -> ResourceRow {
+        let (cells, state) = match &self.project {
+            Projection::BuiltIn(project) => project(object),
+            Projection::Declared(columns) => (
+                printer::cells(columns, &object.data, now),
+                conventional_state(&object.data),
+            ),
+        };
 
         ResourceRow {
             key: key_of(object),
@@ -64,7 +94,7 @@ pub fn key_of(object: &DynamicObject) -> ResourceKey {
 }
 
 /// Converts a Kubernetes timestamp to a `SystemTime`.
-fn to_system_time(time: &Time) -> SystemTime {
+pub(crate) fn to_system_time(time: &Time) -> SystemTime {
     let seconds = time.0.as_second();
     if seconds >= 0 {
         SystemTime::UNIX_EPOCH + Duration::from_secs(seconds as u64)
@@ -133,7 +163,7 @@ fn pods_columns() -> KindColumns {
             ColumnSpec::fixed("RESTARTS", 90),
             ColumnSpec::fixed("NODE", 200),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let counts = pods::counts(&object.data);
             let status = pods::status(object);
             let state = pod_state(&status, counts.ready == counts.total);
@@ -147,7 +177,7 @@ fn pods_columns() -> KindColumns {
                 ],
                 state,
             )
-        },
+        }),
     }
 }
 
@@ -195,7 +225,7 @@ fn deployment_columns() -> KindColumns {
             ColumnSpec::fixed("UP-TO-DATE", 110),
             ColumnSpec::fixed("AVAILABLE", 110),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let desired = number(data, &["spec", "replicas"]);
             let (ready, state) = ratio(number(data, &["status", "readyReplicas"]), desired);
@@ -208,21 +238,21 @@ fn deployment_columns() -> KindColumns {
                 ],
                 state,
             )
-        },
+        }),
     }
 }
 
 fn statefulset_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([ColumnSpec::fixed("READY", 90)]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let (ready, state) = ratio(
                 number(data, &["status", "readyReplicas"]),
                 number(data, &["spec", "replicas"]),
             );
             (vec![ready], state)
-        },
+        }),
     }
 }
 
@@ -233,7 +263,7 @@ fn replicaset_columns() -> KindColumns {
             ColumnSpec::fixed("CURRENT", 90),
             ColumnSpec::fixed("READY", 90),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let desired = number(data, &["spec", "replicas"]);
             let ready = number(data, &["status", "readyReplicas"]);
@@ -247,7 +277,7 @@ fn replicaset_columns() -> KindColumns {
                 ],
                 state,
             )
-        },
+        }),
     }
 }
 
@@ -258,7 +288,7 @@ fn daemonset_columns() -> KindColumns {
             ColumnSpec::fixed("READY", 90),
             ColumnSpec::fixed("AVAILABLE", 110),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let desired = number(data, &["status", "desiredNumberScheduled"]);
             let ready = number(data, &["status", "numberReady"]);
@@ -272,7 +302,7 @@ fn daemonset_columns() -> KindColumns {
                 ],
                 state,
             )
-        },
+        }),
     }
 }
 
@@ -284,7 +314,7 @@ fn service_columns() -> KindColumns {
             ColumnSpec::fixed("EXTERNAL-IP", 160),
             ColumnSpec::fixed("PORTS", 180),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let kind = text(data, &["spec", "type"]);
             let ports: Vec<String> = data["spec"]["ports"]
@@ -322,7 +352,7 @@ fn service_columns() -> KindColumns {
                 ],
                 state,
             )
-        },
+        }),
     }
 }
 
@@ -372,7 +402,7 @@ fn node_columns() -> KindColumns {
             ColumnSpec::fixed("ROLES", 160),
             ColumnSpec::fixed("VERSION", 120),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let ready = condition_is_true(data, "Ready");
             let schedulable = !data["spec"]["unschedulable"].as_bool().unwrap_or(false);
@@ -417,7 +447,7 @@ fn node_columns() -> KindColumns {
                 ],
                 state,
             )
-        },
+        }),
     }
 }
 
@@ -427,7 +457,7 @@ fn job_columns() -> KindColumns {
             ColumnSpec::fixed("COMPLETIONS", 130),
             ColumnSpec::fixed("STATUS", 130),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let succeeded = number(data, &["status", "succeeded"]);
             let wanted = match number(data, &["spec", "completions"]) {
@@ -448,7 +478,7 @@ fn job_columns() -> KindColumns {
                 vec![cell(format!("{succeeded}/{wanted}")), cell(status)],
                 state,
             )
-        },
+        }),
     }
 }
 
@@ -459,7 +489,7 @@ fn cronjob_columns() -> KindColumns {
             ColumnSpec::fixed("SUSPEND", 90),
             ColumnSpec::fixed("ACTIVE", 90),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let suspended = data["spec"]["suspend"].as_bool().unwrap_or(false);
 
@@ -477,20 +507,20 @@ fn cronjob_columns() -> KindColumns {
                     RowState::Neutral
                 },
             )
-        },
+        }),
     }
 }
 
 fn configmap_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([ColumnSpec::fixed("DATA", 90)]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let keys = object.data["data"].as_object().map_or(0, |data| data.len())
                 + object.data["binaryData"]
                     .as_object()
                     .map_or(0, |data| data.len());
             (vec![cell(keys.to_string())], RowState::Neutral)
-        },
+        }),
     }
 }
 
@@ -500,7 +530,7 @@ fn secret_columns() -> KindColumns {
             ColumnSpec::fixed("TYPE", 240),
             ColumnSpec::fixed("DATA", 90),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             // Only the key count, never a value: secrets are masked by default
             // and the table is not where a reveal belongs.
             let keys = object.data["data"].as_object().map_or(0, |data| data.len());
@@ -508,7 +538,7 @@ fn secret_columns() -> KindColumns {
                 vec![cell(text(&object.data, &["type"])), cell(keys.to_string())],
                 RowState::Neutral,
             )
-        },
+        }),
     }
 }
 
@@ -519,7 +549,7 @@ fn ingress_columns() -> KindColumns {
             ColumnSpec::fixed("HOSTS", 220),
             ColumnSpec::fixed("ADDRESS", 180),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let hosts: Vec<&str> = data["spec"]["rules"]
                 .as_array()
@@ -557,7 +587,7 @@ fn ingress_columns() -> KindColumns {
                 ],
                 RowState::Neutral,
             )
-        },
+        }),
     }
 }
 
@@ -569,7 +599,7 @@ fn pvc_columns() -> KindColumns {
             ColumnSpec::fixed("CAPACITY", 110),
             ColumnSpec::fixed("STORAGECLASS", 160),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let phase = text(data, &["status", "phase"]);
             let state = match phase {
@@ -588,7 +618,7 @@ fn pvc_columns() -> KindColumns {
                 ],
                 state,
             )
-        },
+        }),
     }
 }
 
@@ -600,7 +630,7 @@ fn event_columns() -> KindColumns {
             ColumnSpec::fixed("OBJECT", 240),
             ColumnSpec::flexible("MESSAGE"),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
             let kind = text(data, &["type"]);
             let involved = format!(
@@ -622,14 +652,14 @@ fn event_columns() -> KindColumns {
                     RowState::Neutral
                 },
             )
-        },
+        }),
     }
 }
 
 fn namespace_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([ColumnSpec::fixed("STATUS", 140)]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let phase = text(&object.data, &["status", "phase"]);
             let state = match phase {
                 "Active" => RowState::Healthy,
@@ -637,50 +667,83 @@ fn namespace_columns() -> KindColumns {
                 _ => RowState::Neutral,
             };
             (vec![cell(phase)], state)
-        },
+        }),
     }
 }
 
-/// The fallback for kinds this module knows nothing about, CRDs included.
+/// The `Ready` condition's status, when the object carries one.
+fn ready_condition(data: &Value) -> Option<&str> {
+    data["status"]["conditions"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .find(|condition| text(condition, &["type"]) == "Ready")
+        .map(|condition| text(condition, &["status"]))
+}
+
+/// How a row reads when no projector knows what the kind's fields mean.
+///
+/// Two conventions are worth trying — `status.phase` and a `Ready` condition —
+/// and anything else is [`RowState::Neutral`] rather than guessed at. A CRD's
+/// own printer columns say what to *print*, never how healthy the object is, so
+/// a row built from them takes its colour from here.
+fn conventional_state(data: &Value) -> RowState {
+    match (text(data, &["status", "phase"]), ready_condition(data)) {
+        (_, Some("True")) => RowState::Healthy,
+        (_, Some("False")) => RowState::Failing,
+        ("Active" | "Bound" | "Running" | "Succeeded", _) => RowState::Healthy,
+        ("Pending" | "Terminating", _) => RowState::Transient,
+        ("Failed" | "Lost", _) => RowState::Failing,
+        _ => RowState::Neutral,
+    }
+}
+
+/// The fallback for kinds this module knows nothing about.
 ///
 /// It shows what every object has — namespace, name, age — plus two fields that
 /// are conventional enough to be worth trying: `status.phase`, and whether a
 /// `Ready` condition is true. Both render empty when absent, which is honest.
+///
+/// This is what a CRD gets when it declares no printer columns of its own, and
+/// what every CRD got before those were read.
 fn generic_columns() -> KindColumns {
     KindColumns {
         columns: Arc::from([
             ColumnSpec::fixed("STATUS", 140),
             ColumnSpec::fixed("READY", 90),
         ]),
-        project: |object| {
+        project: Projection::BuiltIn(|object| {
             let data = &object.data;
-            let phase = text(data, &["status", "phase"]);
-
-            let ready = data["status"]["conditions"]
-                .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-                .iter()
-                .find(|condition| text(condition, &["type"]) == "Ready")
-                .map(|condition| text(condition, &["status"]).to_owned());
-
-            let state = match (phase, ready.as_deref()) {
-                (_, Some("True")) => RowState::Healthy,
-                (_, Some("False")) => RowState::Failing,
-                ("Active" | "Bound" | "Running" | "Succeeded", _) => RowState::Healthy,
-                ("Pending" | "Terminating", _) => RowState::Transient,
-                ("Failed" | "Lost", _) => RowState::Failing,
-                _ => RowState::Neutral,
-            };
-
-            (vec![cell(phase), cell(ready.unwrap_or_default())], state)
-        },
+            (
+                vec![
+                    cell(text(data, &["status", "phase"])),
+                    cell(ready_condition(data).unwrap_or_default()),
+                ],
+                conventional_state(data),
+            )
+        }),
     }
 }
 
-/// The table definition for a kind.
-pub fn for_kind(kind: &KindId) -> KindColumns {
-    match (&*kind.group, &*kind.kind) {
+/// The table a CRD's own printer columns describe.
+///
+/// `None` when the CRD declared none that survived [`crate::printer::compile`],
+/// which is the caller's cue to fall back to [`for_kind`].
+pub fn from_printer_columns(columns: Arc<[PrinterColumn]>) -> Option<KindColumns> {
+    if columns.is_empty() {
+        return None;
+    }
+
+    Some(KindColumns {
+        columns: printer::specs(&columns),
+        project: Projection::Declared(columns),
+    })
+}
+
+/// The projector written for this kind, if this module has one.
+fn built_in(kind: &KindId) -> Option<KindColumns> {
+    Some(match (&*kind.group, &*kind.kind) {
         ("", "Pod") => pods_columns(),
         ("", "Service") => service_columns(),
         ("", "Node") => node_columns(),
@@ -696,8 +759,26 @@ pub fn for_kind(kind: &KindId) -> KindColumns {
         ("batch", "Job") => job_columns(),
         ("batch", "CronJob") => cronjob_columns(),
         ("networking.k8s.io", "Ingress") => ingress_columns(),
-        _ => generic_columns(),
-    }
+        _ => return None,
+    })
+}
+
+/// The table definition for a kind, ignoring anything its CRD declared.
+pub fn for_kind(kind: &KindId) -> KindColumns {
+    built_in(kind).unwrap_or_else(generic_columns)
+}
+
+/// The table definition for a kind, given the printer columns its CRD declared.
+///
+/// A projector written for the kind wins over declared columns: that only
+/// arises when an aggregated apiserver serves a kind this module also knows,
+/// and a hand-written projection of a Pod is better than any CRD's. Discovery
+/// hands over an empty slice for every kind that has no CRD, so the ordinary
+/// case falls straight through to [`for_kind`]'s answer.
+pub fn for_kind_with(kind: &KindId, printer_columns: Arc<[PrinterColumn]>) -> KindColumns {
+    built_in(kind)
+        .or_else(|| from_printer_columns(printer_columns))
+        .unwrap_or_else(generic_columns)
 }
 
 #[cfg(test)]
@@ -994,6 +1075,83 @@ mod tests {
         assert_eq!(row.state, RowState::Healthy);
     }
 
+    /// Argo CD's Application columns, as its CRD declares them: two ordinary
+    /// ones and two the CRD marks as only worth showing in a wide listing.
+    fn application_columns() -> Arc<[PrinterColumn]> {
+        let column = |name: &str, json_path: &str, priority| {
+            k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceColumnDefinition {
+                name: name.to_owned(),
+                type_: "string".to_owned(),
+                json_path: json_path.to_owned(),
+                priority,
+                ..Default::default()
+            }
+        };
+
+        printer::compile(
+            &applications(),
+            &[
+                column("Sync Status", ".status.sync.status", None),
+                column("Health Status", ".status.health.status", None),
+                column("Revision", ".status.sync.revision", Some(10)),
+                column("Project", ".spec.project", Some(10)),
+            ],
+        )
+    }
+
+    fn applications() -> KindId {
+        KindId::new("argoproj.io", "v1alpha1", "Application", "applications")
+    }
+
+    #[test]
+    fn a_crd_renders_the_columns_its_own_definition_declared() {
+        let table = for_kind_with(&applications(), application_columns());
+        let row = table.row(&object(json!({
+            "metadata": { "name": "web", "namespace": "argocd" },
+            "spec": { "project": "default" },
+            "status": {
+                "sync": { "status": "Synced", "revision": "0f9a2c1" },
+                "health": { "status": "Healthy" }
+            }
+        })));
+
+        let headings: Vec<String> = table.columns.iter().map(|c| c.name.to_string()).collect();
+        assert_eq!(headings, ["SYNC STATUS", "HEALTH STATUS"]);
+        assert_eq!(cells(&row), ["Synced", "Healthy"]);
+    }
+
+    #[test]
+    fn a_crd_that_declares_nothing_still_gets_the_generic_columns() {
+        // The fallback is not gone, it is just no longer everybody's answer.
+        let table = for_kind_with(&applications(), Arc::from([]));
+        let headings: Vec<String> = table.columns.iter().map(|c| c.name.to_string()).collect();
+
+        assert_eq!(headings, ["STATUS", "READY"]);
+    }
+
+    #[test]
+    fn a_kind_with_a_projector_of_its_own_ignores_declared_columns() {
+        // Only reachable through an aggregated apiserver serving a kind this
+        // module also knows; a hand-written projection of a Pod beats any
+        // declaration.
+        let table = for_kind_with(&kind("", "Pod", "pods"), application_columns());
+        let headings: Vec<String> = table.columns.iter().map(|c| c.name.to_string()).collect();
+
+        assert_eq!(headings, ["READY", "STATUS", "RESTARTS", "NODE"]);
+    }
+
+    #[test]
+    fn a_row_built_from_declared_columns_still_reads_as_healthy_or_not() {
+        // Printer columns say what to print, never how the object is doing.
+        let table = for_kind_with(&applications(), application_columns());
+        let failing = table.row(&object(json!({
+            "metadata": { "name": "web", "namespace": "argocd" },
+            "status": { "conditions": [{ "type": "Ready", "status": "False" }] }
+        })));
+
+        assert_eq!(failing.state, RowState::Failing);
+    }
+
     #[test]
     fn an_unknown_kind_with_nothing_conventional_renders_empty_cells() {
         let row = row_of(
@@ -1042,5 +1200,11 @@ mod tests {
                 table.columns.len()
             );
         }
+
+        // And a CRD's declared columns, against an object with none of the
+        // fields they name.
+        let declared = for_kind_with(&applications(), application_columns());
+        let row = declared.row(&object(empty));
+        assert_eq!(row.cells.len(), declared.columns.len());
     }
 }

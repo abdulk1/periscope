@@ -13,13 +13,14 @@ use futures::future::BoxFuture;
 use kube::Client;
 use periscope_bridge::{
     ClusterCommand, ClusterEvent, ClusterId, ColumnSpec, CommandHandler, ConnectionState,
-    EventSink, KindId, KindInfo, ResourceRow,
+    EventSink, KindId, ResourceRow,
 };
 use tokio::task::JoinHandle;
 
+use crate::discovery::Catalog;
 use crate::errors::Failure;
 use crate::mutate::WritePolicy;
-use crate::watch::Filter;
+use crate::watch::{Filter, Watched};
 use crate::{detail, discovery, exec, forward, kubeconfig, logs, mutate, watch};
 
 /// Connects to clusters, discovers what they serve, and streams it.
@@ -41,8 +42,9 @@ pub struct KubeHandler {
 struct Session {
     client: Client,
     credential_plugin: Option<String>,
-    /// What discovery said, so a watch knows whether its kind is namespaced.
-    kinds: Arc<Vec<KindInfo>>,
+    /// What discovery said, so a watch knows whether its kind is namespaced and
+    /// which columns the kind's CRD asked for.
+    catalog: Arc<Catalog>,
 }
 
 /// The live sessions and watches.
@@ -109,9 +111,9 @@ impl Sessions {
     }
 
     /// Records what discovery found.
-    fn set_kinds(&self, cluster: &ClusterId, kinds: Vec<KindInfo>) {
+    fn set_catalog(&self, cluster: &ClusterId, catalog: Arc<Catalog>) {
         if let Some(session) = guard(&self.clusters).get_mut(cluster) {
-            session.kinds = Arc::new(kinds);
+            session.catalog = catalog;
         }
     }
 
@@ -357,19 +359,20 @@ async fn connect(
         Session {
             client: connection.client.clone(),
             credential_plugin: connection.credential_plugin.clone(),
-            kinds: Arc::default(),
+            catalog: Arc::default(),
         },
     );
 
     // Discovery is the first request the client makes, so it is also where a
     // credential that will not work shows up.
-    match discovery::kinds(connection.client).await {
-        Ok(kinds) => {
-            tracing::info!(%cluster, kinds = kinds.len(), "discovered");
-            sessions.set_kinds(&cluster, kinds.clone());
+    match discovery::catalog(connection.client).await {
+        Ok(catalog) => {
+            tracing::info!(%cluster, kinds = catalog.kinds.len(), "discovered");
+            let catalog = Arc::new(catalog);
+            sessions.set_catalog(&cluster, Arc::clone(&catalog));
             events.send(ClusterEvent::Kinds {
                 cluster: cluster.clone(),
-                kinds: Arc::from(kinds),
+                kinds: Arc::from(catalog.kinds.clone()),
             });
             events.send(ClusterEvent::Status {
                 cluster,
@@ -398,10 +401,20 @@ async fn connect(
 /// be.
 fn is_namespaced(session: &Session, kind: &KindId) -> bool {
     session
+        .catalog
         .kinds
         .iter()
         .find(|known| &known.id == kind)
         .is_none_or(|info| info.namespaced)
+}
+
+/// Everything a watch needs to know about the kind it is about to stream.
+fn watched(session: &Session, kind: KindId) -> Watched {
+    Watched {
+        namespaced: is_namespaced(session, &kind),
+        printer_columns: session.catalog.printer_columns(&kind),
+        kind,
+    }
 }
 
 impl CommandHandler for KubeHandler {
@@ -441,12 +454,13 @@ impl CommandHandler for KubeHandler {
                         return;
                     };
 
-                    match discovery::kinds(session.client).await {
-                        Ok(kinds) => {
-                            sessions.set_kinds(&cluster, kinds.clone());
+                    match discovery::catalog(session.client).await {
+                        Ok(catalog) => {
+                            let catalog = Arc::new(catalog);
+                            sessions.set_catalog(&cluster, Arc::clone(&catalog));
                             events.send(ClusterEvent::Kinds {
                                 cluster,
-                                kinds: Arc::from(kinds),
+                                kinds: Arc::from(catalog.kinds.clone()),
                             });
                         }
                         Err(error) => report(cluster, crate::errors::classify(&error), &events),
@@ -464,12 +478,10 @@ impl CommandHandler for KubeHandler {
                         return;
                     };
 
-                    let namespaced = is_namespaced(&session, &kind);
                     let task = tokio::spawn(watch::run(
                         cluster.clone(),
-                        kind.clone(),
+                        watched(&session, kind.clone()),
                         session.client,
-                        namespaced,
                         Filter {
                             namespace,
                             selector,
