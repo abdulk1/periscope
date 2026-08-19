@@ -132,7 +132,7 @@ cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fi
 
 | Document | For |
 |---|---|
-| [`CLAUDE.md`](CLAUDE.md) | Anyone changing this repository — the invariants, the loop, the traps |
+| [`AGENTS.md`](AGENTS.md) | Anyone changing this repository, human or otherwise — the invariants, the loop, the traps |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | How the six crates fit together, and where a new feature goes |
 | [`docs/STYLE.md`](docs/STYLE.md) | How the code, tests and commit messages are written |
 | [`docs/TESTING.md`](docs/TESTING.md) | The six kinds of test, and which one you need |
