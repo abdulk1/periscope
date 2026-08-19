@@ -12,4 +12,21 @@ publish = false
 
 [dependencies]
 core-foundation = "0.9"
+# For `Boolean` and the CFNumber type constants, so the one framework call this
+# tool makes itself is declared with the types the C header actually uses.
+core-foundation-sys = "0.8"
 core-graphics = "0.23"
+
+# The workspace forbids `unsafe` outright, and this crate is outside it — which
+# is how five undocumented `unsafe` lines ended up here unnoticed. It cannot
+# forbid: CoreFoundation is a C API. So it denies instead, and the two functions
+# in `main.rs` that genuinely need it say so with `#[expect]` and a reason.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+# An `unsafe` block without a SAFETY comment is the thing this crate got wrong.
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"

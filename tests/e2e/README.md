@@ -3,8 +3,10 @@
 `kind`-based integration tests, plus the fixture generator that seeds a cluster
 with 10,000 pods for the Phase 1 load budget.
 
-Every test here needs a real apiserver, so all of them are `#[ignore]`d and never
-run as part of `cargo test`.
+Every test that needs a real apiserver is `#[ignore]`d and never runs as part of
+`cargo test`. The exception is `tests/harness.rs`, which tests the harness rather
+than the app — what the fixtures leave on disk, and what they hand to a shell —
+and needs nothing but a Unix machine.
 
 ```sh
 kind create cluster --name periscope
@@ -29,6 +31,7 @@ for the same one-node cluster.
 | `tests/forwards.rs` | Real HTTP traffic through a forward, several connections, teardown closing the port, a dead port reported, and recovery after a broken connection |
 | `tests/exec.rs` | Running a command, its exit code, stdout and stderr kept apart, a command that does not exist, cancellation, the container it runs in, and the audit log |
 | `tests/faults.rs` | The apiserver going away mid-watch: the break is reported with a reason, the rows are kept, and the watch recovers by itself when it comes back |
+| `tests/harness.rs` | The harness's own promises: scratch directories and the files in them are owner-only, a `$TMPDIR` containing a quote cannot inject a command into a stub plugin, and a relative `PATH` entry is never searched for `kubectl` |
 
 `tests/mutations.rs` **changes the cluster**: each test creates the deployment it
 acts on and deletes it afterwards, the cordon test always uncordons, and the
@@ -42,6 +45,13 @@ would write anything is in the read-only test, which asserts it never ran.
 The auth tests write a throwaway kubeconfig into the temp directory and point the
 app at it with `--kubeconfig`'s programmatic equivalent, so the developer's own
 kubeconfig is never touched.
+
+Those throwaway kubeconfigs, and the stub plugins the exec tests generate, are
+copies of the test context's credentials — on `kind` that is the cluster's admin
+certificate and key. So they are written mode 0600 into a `Scratch` directory
+that this process created exclusively at mode 0700 with a random name, and the
+suite resolves `kubectl` and `aws` to absolute paths rather than asking `PATH`
+what to run. `tests/harness.rs` holds all of that in place.
 
 `tests/faults.rs` does **not** stop the apiserver — that would take the cluster
 down for every other test in the run. It puts a TCP proxy

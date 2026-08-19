@@ -15,6 +15,8 @@
 pub mod exec;
 pub mod proxy;
 
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use periscope_bridge::{
@@ -28,6 +30,69 @@ pub const CONTEXT_VAR: &str = "PERISCOPE_E2E_CONTEXT";
 /// The context these tests use unless told otherwise.
 pub fn context() -> ClusterId {
     ClusterId::new(std::env::var(CONTEXT_VAR).unwrap_or_else(|_| "kind-periscope".to_owned()))
+}
+
+/// The absolute path of an external tool this harness shells out to.
+///
+/// Panics naming the tool and the `PATH` that was searched, which is the whole
+/// point: `Command::new("kubectl")` asks `PATH` for something to run and then
+/// hands it the developer's kubeconfig — `kubectl config view --raw` prints
+/// credentials, and a stub plugin is invoked with a cluster's admin key. A
+/// directory earlier on `PATH` that anyone can write to therefore gets code
+/// execution with all of that in scope.
+///
+/// Resolving first does not make `PATH` trustworthy, and it is not meant to:
+/// this is a harness a developer runs deliberately on their own machine, so
+/// nothing here is a boundary. What it buys is that the *silent* half is gone —
+/// a relative entry (the classic `.`, or an empty entry, which means the
+/// working directory) is never searched, and a missing tool says so instead of
+/// letting whatever else answers to the name run. Refusing group- or
+/// world-writable directories was considered and rejected: `/usr/local/bin` is
+/// group-writable by design on macOS, so the check would fail on the machines
+/// this suite is run from and be worked around rather than heeded.
+pub fn tool(name: &str) -> PathBuf {
+    find_tool(name).unwrap_or_else(|| {
+        let path = std::env::var("PATH").unwrap_or_default();
+        panic!(
+            "`{name}` is not in any absolute entry of PATH, and these tests need it. PATH={path}"
+        )
+    })
+}
+
+/// The absolute path of an external tool, or `None` when it is not installed.
+///
+/// For the callers that treat a missing tool as a skipped check rather than a
+/// failure. See [`tool`] for why bare names are not spawned.
+pub fn find_tool(name: &str) -> Option<PathBuf> {
+    find_tool_on(&std::env::var_os("PATH")?, name)
+}
+
+/// [`find_tool`], against a `PATH` given rather than inherited.
+///
+/// Split out so the rule that relative entries are skipped can be tested
+/// without a test mutating the environment of every other test in the process.
+pub fn find_tool_on(path: &OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Whether a path is a file this process could run.
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
 }
 
 /// Starts the cluster runtime with the real kube handler.
@@ -239,7 +304,10 @@ pub fn kubectl_apply(manifest: &str) -> bool {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    let Ok(mut child) = Command::new("kubectl")
+    let Some(kubectl) = find_tool("kubectl") else {
+        return false;
+    };
+    let Ok(mut child) = Command::new(kubectl)
         .args(["apply", "-f", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -256,7 +324,10 @@ pub fn kubectl_apply(manifest: &str) -> bool {
 
 /// Whether the cluster serves a kind, by the label `kubectl` prints.
 pub fn serves_kind(label: &str) -> bool {
-    let output = std::process::Command::new("kubectl")
+    let Some(kubectl) = find_tool("kubectl") else {
+        return false;
+    };
+    let output = std::process::Command::new(kubectl)
         .args(["api-resources", "--no-headers", "-o", "name"])
         .output();
 
@@ -270,10 +341,12 @@ pub fn serves_kind(label: &str) -> bool {
 
 /// Whether a named object exists.
 pub fn object_exists(kind: &str, namespace: &str, name: &str) -> bool {
-    std::process::Command::new("kubectl")
-        .args(["get", kind, name, "-n", namespace])
-        .output()
-        .is_ok_and(|output| output.status.success())
+    find_tool("kubectl").is_some_and(|kubectl| {
+        std::process::Command::new(kubectl)
+            .args(["get", kind, name, "-n", namespace])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
 }
 
 /// Deletes a pod, so its replacement can be watched for.

@@ -68,10 +68,7 @@ fn multi_kubeconfig(directory: &std::path::Path) -> std::path::PathBuf {
         "users": [{ "name": "test-user", "user": user_credentials(&context_name) }]
     });
 
-    let path = directory.join("multi.kubeconfig");
-    std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap())
-        .expect("the fixture kubeconfig is written");
-    path
+    periscope_e2e::exec::write_kubeconfig(directory, "multi.kubeconfig", &config)
 }
 
 /// The credentials the real context authenticates with, copied verbatim.

@@ -43,7 +43,9 @@ const CONTEXT: &str = "through-proxy";
 ///
 /// Everything but the server address is copied from the real context, so this
 /// is the same cluster, the same CA and the same credentials — reached over a
-/// socket the test can cut.
+/// socket the test can cut. Those credentials are `kind`'s admin certificate
+/// and key, which is why this goes through `write_kubeconfig` rather than
+/// `std::fs::write`.
 fn kubeconfig_through(directory: &Path, port: u16) -> PathBuf {
     let mut cluster = periscope_e2e::exec::test_cluster();
     cluster["name"] = serde_json::json!(CONTEXT);
@@ -70,13 +72,7 @@ fn kubeconfig_through(directory: &Path, port: u16) -> PathBuf {
         }]
     });
 
-    let path = directory.join("proxied.kubeconfig");
-    std::fs::write(
-        &path,
-        serde_json::to_vec_pretty(&config).expect("valid JSON"),
-    )
-    .expect("the fixture kubeconfig is written");
-    path
+    periscope_e2e::exec::write_kubeconfig(directory, "proxied.kubeconfig", &config)
 }
 
 /// Connects through the proxy and watches pods until rows arrive.

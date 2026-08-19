@@ -12,6 +12,7 @@ use periscope_bridge::{
     ClusterCommand, ClusterEvent, ClusterId, ClusterRuntime, ConnectionState, RuntimeConfig,
 };
 use periscope_cluster::KubeHandler;
+use periscope_e2e::exec::{Scratch, write_kubeconfig};
 use periscope_e2e::{context, describe, wait_for};
 
 /// A rejected credential must be reported, not retried into a hang.
@@ -53,18 +54,14 @@ fn kubeconfig_with_a_bad_token(directory: &std::path::Path) -> std::path::PathBu
         }]
     });
 
-    let path = directory.join("kubeconfig-bad-token.json");
-    std::fs::write(&path, serde_json::to_vec_pretty(&doctored).unwrap())
-        .expect("the fixture kubeconfig is written");
-    path
+    write_kubeconfig(directory, "kubeconfig-bad-token.json", &doctored)
 }
 
 #[test]
 #[ignore = "needs a cluster"]
 fn a_credential_the_cluster_rejects_produces_an_auth_failed_state() {
-    let directory = std::env::temp_dir().join(format!("periscope-e2e-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).expect("temp directory");
-    let path = kubeconfig_with_a_bad_token(&directory);
+    let scratch = Scratch::new("bad-token");
+    let path = kubeconfig_with_a_bad_token(scratch.path());
 
     let (runtime, stream) = ClusterRuntime::start(
         KubeHandler::with_kubeconfig(&path),
@@ -113,8 +110,6 @@ fn a_credential_the_cluster_rejects_produces_an_auth_failed_state() {
         "reported connected despite a rejected credential: {}",
         describe(&seen)
     );
-
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]
@@ -147,15 +142,12 @@ fn a_missing_kubeconfig_is_reported_rather_than_silently_empty() {
 #[test]
 #[ignore = "needs a cluster"]
 fn connecting_to_a_context_missing_from_a_kubeconfig_names_the_context() {
-    let directory =
-        std::env::temp_dir().join(format!("periscope-e2e-empty-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).expect("temp directory");
-    let path = directory.join("empty.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!({ "apiVersion": "v1", "kind": "Config" })).unwrap(),
-    )
-    .expect("the fixture kubeconfig is written");
+    let scratch = Scratch::new("empty-kubeconfig");
+    let path = write_kubeconfig(
+        scratch.path(),
+        "empty.json",
+        &serde_json::json!({ "apiVersion": "v1", "kind": "Config" }),
+    );
 
     let (runtime, stream) = ClusterRuntime::start(
         KubeHandler::with_kubeconfig(&path),
@@ -190,6 +182,4 @@ fn connecting_to_a_context_missing_from_a_kubeconfig_names_the_context() {
             .is_some_and(|reason| reason.contains("ghost")),
         "the missing context should be named: {state:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&directory);
 }

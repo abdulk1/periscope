@@ -310,14 +310,10 @@ fn an_expiring_credential_is_re_fetched_without_the_user_doing_anything() {
 #[test]
 #[ignore = "needs a cluster and the real aws CLI"]
 fn the_real_aws_cli_is_run_and_the_token_it_mints_is_sent() {
-    if std::process::Command::new("aws")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    let Some(aws) = periscope_e2e::find_tool("aws") else {
         eprintln!("skipping: the aws CLI is not installed");
         return;
-    }
+    };
 
     let scratch = Scratch::new("aws-real");
     // The real binary, with a real EKS stanza. `aws eks get-token` signs a
@@ -325,9 +321,12 @@ fn the_real_aws_cli_is_run_and_the_token_it_mints_is_sent() {
     // a cluster that does not exist — which makes it a clean way to prove the
     // plugin is actually run and its token actually sent, without a cloud
     // cluster. The apiserver then rejects the token, as it should.
+    //
+    // The absolute path goes into the kubeconfig: a bare `aws` would leave the
+    // choice of what gets the credential to whatever is first on `PATH`.
     let kubeconfig = kubeconfig_with_exec(
         scratch.path(),
-        Path::new("aws"),
+        &aws,
         "client.authentication.k8s.io/v1beta1",
         &[
             "--region",
