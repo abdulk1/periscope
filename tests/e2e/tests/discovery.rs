@@ -28,10 +28,13 @@ fn discovery_lists_built_in_kinds_and_custom_resources() {
     }
 
     // The CRD installed by the test fixture, discovered without special-casing.
-    assert!(
+    if !periscope_e2e::require(
         labels.contains(&"widgets.example.com".to_owned()),
-        "custom resources should be discovered: {labels:?}"
-    );
+        "widgets",
+        "kubectl apply -f tests/e2e/fixtures/widgets.yaml",
+    ) {
+        return;
+    }
     let widget = kinds
         .iter()
         .find(|info| info.id.label() == "widgets.example.com")
@@ -54,6 +57,15 @@ fn discovery_lists_built_in_kinds_and_custom_resources() {
 #[test]
 #[ignore = "needs a cluster with cert-manager and Argo CD installed"]
 fn a_crd_heavy_cluster_lists_every_custom_resource() {
+    if !periscope_e2e::require(
+        periscope_e2e::serves_kind("certificates.cert-manager.io")
+            && periscope_e2e::serves_kind("applications.argoproj.io"),
+        "cert-manager and Argo CD",
+        "see tests/e2e/README.md",
+    ) {
+        return;
+    }
+
     let (_runtime, stream, _cluster) = connected();
 
     let (event, _) = wait_for(&stream, TIMEOUT, |event| {
@@ -96,6 +108,14 @@ fn a_crd_heavy_cluster_lists_every_custom_resource() {
 #[test]
 #[ignore = "needs a cluster"]
 fn a_custom_resource_lists_through_the_same_path_as_pods() {
+    if !periscope_e2e::require(
+        periscope_e2e::serves_kind("widgets.example.com"),
+        "widgets",
+        "kubectl apply -f tests/e2e/fixtures/widgets.yaml",
+    ) {
+        return;
+    }
+
     let widgets = KindId::new("example.com", "v1", "Widget", "widgets");
     let (_runtime, stream, cluster) = watching(widgets.clone(), TIMEOUT);
 
@@ -312,6 +332,14 @@ fn a_kind_that_does_not_exist_degrades_rather_than_hanging() {
 #[test]
 #[ignore = "needs a cluster with the large ConfigMap fixture"]
 fn a_large_config_map_renders_to_yaml_well_inside_a_frame() {
+    if !periscope_e2e::require(
+        periscope_e2e::object_exists("configmap", "default", "periscope-large"),
+        "the large ConfigMap",
+        "cargo run -p periscope-e2e --bin seed-pods -- --large-config-map",
+    ) {
+        return;
+    }
+
     let config_maps = KindId::new("", "v1", "ConfigMap", "configmaps");
     let (runtime, stream, cluster) = watching(config_maps.clone(), TIMEOUT);
 

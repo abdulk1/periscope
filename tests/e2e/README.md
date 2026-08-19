@@ -79,8 +79,28 @@ PERISCOPE_E2E_REQUIRE_FIXTURES=1 cargo test -p periscope-e2e -- --ignored --test
 `chatty` scales up for the "tail fifty pods" measurement:
 `kubectl scale deployment chatty --replicas=50`.
 
-The CRD-heavy discovery test needs cert-manager and Argo CD installed; the test
-says so when they are missing.
+The CRD tests need custom resources to look at:
+
+```sh
+kubectl apply -f tests/e2e/fixtures/widgets.yaml   # our own CRD, no operator needed
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+```
+
+`widgets` is ours, so the basic custom-resource path does not depend on anyone
+else's release cadence; the CRD-heavy discovery test wants the other two, which
+is what a real cluster looks like. All three tests skip with instructions when
+they are missing, and fail under `PERISCOPE_E2E_REQUIRE_FIXTURES`.
+
+The YAML-rendering budget needs a large object:
+
+```sh
+cargo run --release -p periscope-e2e --bin seed-pods -- --large-config-map
+```
+
+A megabyte of generated text does not belong in git, so the fixture generator
+makes it.
 
 The multi-cluster suite writes its own kubeconfig with five contexts pointing at
 the test cluster and one pointing at a closed port; nothing extra is needed.

@@ -53,25 +53,36 @@ pub fn settings_file() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Whether a path is inside a directory belonging to this application.
+    ///
+    /// Case-insensitively, because the platforms disagree and both are right:
+    /// macOS uses `~/Library/Application Support/dev.periscope.Periscope`, and
+    /// XDG on Linux uses `~/.local/share/periscope`. Asserting the capitalised
+    /// form passed on the machine these were written on and failed the first
+    /// time CI ran them on Linux.
+    fn is_ours(path: &std::path::Path) -> bool {
+        path.to_string_lossy().to_lowercase().contains("periscope")
+    }
+
     #[test]
     fn log_dir_is_under_an_app_specific_directory() {
         let dir = log_dir().expect("home directory resolves in tests");
         assert!(dir.ends_with("logs"));
-        assert!(dir.to_string_lossy().contains("Periscope"));
+        assert!(is_ours(&dir), "{}", dir.display());
     }
 
     #[test]
     fn exports_land_in_the_apps_own_directory() {
         let dir = export_dir().expect("home directory resolves in tests");
         assert!(dir.ends_with("exports"));
-        assert!(dir.to_string_lossy().contains("Periscope"));
+        assert!(is_ours(&dir), "{}", dir.display());
     }
 
     #[test]
     fn the_audit_log_lives_with_the_apps_data() {
         let path = audit_file().expect("home directory resolves in tests");
         assert_eq!(path.file_name().unwrap(), "audit.log");
-        assert!(path.to_string_lossy().contains("Periscope"));
+        assert!(is_ours(&path), "{}", path.display());
     }
 
     #[test]

@@ -202,14 +202,55 @@ pub fn fixture(name: &str, selector: &str) -> Option<String> {
     }
 
     let instructions = format!("kubectl apply -f tests/e2e/fixtures/{name}.yaml");
+    require(
+        false,
+        &format!("{name} (no pod matches `{selector}`)"),
+        &instructions,
+    );
+    None
+}
+
+/// Whether a fixture is in place, saying what to do when it is not.
+///
+/// Returns `present` so a test can `if !require(..) { return; }`. When the
+/// fixture is missing it either skips with instructions or, under
+/// `PERISCOPE_E2E_REQUIRE_FIXTURES`, fails — the same rule
+/// [`fixture`] follows, for the fixtures that are not pods.
+pub fn require(present: bool, name: &str, instructions: &str) -> bool {
+    if present {
+        return true;
+    }
+
     assert!(
         std::env::var_os(REQUIRE_FIXTURES_VAR).is_none(),
-        "the {name} fixture is required here but no pod matches `{selector}` \
+        "the {name} fixture is required here but is not installed \
          ({REQUIRE_FIXTURES_VAR} is set). Install it with: {instructions}"
     );
 
     eprintln!("skipping: the {name} fixture is not installed ({instructions})");
-    None
+    false
+}
+
+/// Whether the cluster serves a kind, by the label `kubectl` prints.
+pub fn serves_kind(label: &str) -> bool {
+    let output = std::process::Command::new("kubectl")
+        .args(["api-resources", "--no-headers", "-o", "name"])
+        .output();
+
+    match output {
+        Ok(output) => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == label),
+        Err(_) => false,
+    }
+}
+
+/// Whether a named object exists.
+pub fn object_exists(kind: &str, namespace: &str, name: &str) -> bool {
+    std::process::Command::new("kubectl")
+        .args(["get", kind, name, "-n", namespace])
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Deletes a pod, so its replacement can be watched for.

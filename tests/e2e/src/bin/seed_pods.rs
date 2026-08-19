@@ -9,8 +9,12 @@
 //! that writes to a cluster.** It refuses to touch anything outside the
 //! namespace it creates.
 //!
+//! It also creates the large ConfigMap the YAML-rendering budget is measured
+//! against, because a megabyte of generated text does not belong in git.
+//!
 //! ```text
 //! cargo run -p periscope-e2e --bin seed-pods -- --count 10000
+//! cargo run -p periscope-e2e --bin seed-pods -- --large-config-map
 //! cargo run -p periscope-e2e --bin seed-pods -- --delete
 //! ```
 
@@ -43,6 +47,12 @@ struct Cli {
     #[arg(long, default_value_t = 32)]
     concurrency: usize,
 
+    /// Create the ~1MiB `periscope-large` ConfigMap in `default` instead of
+    /// pods. That is the fixture `a_large_config_map_renders_to_yaml_well_inside_a_frame`
+    /// measures against.
+    #[arg(long)]
+    large_config_map: bool,
+
     /// Delete the namespace and everything in it instead of creating pods.
     #[arg(long)]
     delete: bool,
@@ -73,7 +83,64 @@ async fn main() -> Result<()> {
     if cli.delete {
         return delete(client, &cli.namespace).await;
     }
+    if cli.large_config_map {
+        return seed_large_config_map(client).await;
+    }
     seed(client, &cli).await
+}
+
+/// Creates the ConfigMap the YAML-rendering budget is measured against.
+///
+/// Twenty keys of 48 KiB each: about a megabyte, which is the size the budget
+/// names, and split across keys because that is what a real ConfigMap full of
+/// configuration files looks like.
+async fn seed_large_config_map(client: Client) -> Result<()> {
+    use k8s_openapi::api::core::v1::ConfigMap;
+
+    const KEYS: usize = 20;
+    const BYTES_PER_KEY: usize = 48_000;
+
+    let data: std::collections::BTreeMap<String, String> = (0..KEYS)
+        .map(|index| {
+            // Text rather than one repeated byte: a compressible blob would
+            // measure the wire and not the rendering.
+            let mut value = String::with_capacity(BYTES_PER_KEY);
+            let mut line = 0_usize;
+            while value.len() < BYTES_PER_KEY {
+                value.push_str(&format!(
+                    "file-{index:02} line {line:05}: the quick brown fox jumps over the lazy dog\n"
+                ));
+                line += 1;
+            }
+            (format!("file-{index:02}.txt"), value)
+        })
+        .collect();
+
+    let manifest: ConfigMap = serde_json::from_value(serde_json::json!({
+        "metadata": {
+            "name": "periscope-large",
+            "namespace": "default",
+            "labels": { "app.kubernetes.io/managed-by": "periscope-e2e" }
+        },
+        "data": data,
+    }))?;
+
+    let api: Api<ConfigMap> = Api::namespaced(client, "default");
+    let size: usize = manifest
+        .data
+        .as_ref()
+        .map(|data| data.values().map(String::len).sum())
+        .unwrap_or_default();
+
+    match api.create(&PostParams::default(), &manifest).await {
+        Ok(_) => println!("created configmap/periscope-large ({size} bytes)"),
+        // Re-running the seeder should leave the fixture as it is.
+        Err(kube::Error::Api(status)) if status.code == 409 => {
+            println!("configmap/periscope-large already exists");
+        }
+        Err(error) => return Err(error).context("creating configmap/periscope-large"),
+    }
+    Ok(())
 }
 
 async fn delete(client: Client, namespace: &str) -> Result<()> {
