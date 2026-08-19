@@ -293,6 +293,8 @@ pub struct Pane {
     cursor: usize,
     /// What this pane's table is sorted by.
     sort: Sort,
+    /// Why this pane's kind cannot be listed, if it cannot.
+    unavailable: Option<Arc<str>>,
 }
 
 impl Pane {
@@ -339,6 +341,15 @@ impl Pane {
     /// The columns those rows carry cells for.
     pub fn columns(&self) -> &[ColumnSpec] {
         &self.columns
+    }
+
+    /// Why this kind cannot be listed here, if it cannot.
+    ///
+    /// Set when the apiserver refuses the kind rather than the credential —
+    /// RBAC, almost always. The table must say so: no rows and "you may not
+    /// see these" are different facts and only one of them is reassuring.
+    pub fn unavailable(&self) -> Option<&Arc<str>> {
+        self.unavailable.as_ref()
     }
 
     /// Whether this pane shows a given cluster and kind.
@@ -514,6 +525,15 @@ impl AppState {
                     });
                     changed = true;
                 }
+            }
+
+            ClusterEvent::KindFailed {
+                cluster,
+                kind,
+                reason,
+            } => {
+                let touched = self.table_mut(cluster, kind).refuse(reason);
+                changed |= self.touch(cluster, kind, touched);
             }
 
             ClusterEvent::ObjectFailed {
@@ -1355,7 +1375,10 @@ impl AppState {
         let kind = match event {
             ClusterEvent::ResourceReset { kind, .. }
             | ClusterEvent::ResourceApplied { kind, .. }
-            | ClusterEvent::ResourceDeleted { kind, .. } => kind,
+            | ClusterEvent::ResourceDeleted { kind, .. }
+            // A refusal empties the table, which is a change to what the pane
+            // renders exactly like a delete is.
+            | ClusterEvent::KindFailed { kind, .. } => kind,
             _ => return Vec::new(),
         };
         let Some(cluster) = event.cluster() else {
@@ -1390,11 +1413,13 @@ impl AppState {
             if let Some(pane) = self.panes.get_mut(index) {
                 pane.rows = Arc::from([] as [Arc<ResourceRow>; 0]);
                 pane.columns = Arc::from([] as [ColumnSpec; 0]);
+                pane.unavailable = None;
             }
             return;
         };
 
         let columns = Arc::clone(table.columns());
+        let unavailable = table.unavailable().map(Arc::clone);
         let filters = self.panes[index].filters.clone();
         let rows: Vec<_> = table
             .iter()
@@ -1417,6 +1442,7 @@ impl AppState {
 
         let pane = &mut self.panes[index];
         pane.columns = columns;
+        pane.unavailable = unavailable;
         pane.rows = Arc::from(rows);
         // A row can disappear under the cursor at any moment — that is what a
         // watch stream does — so the cursor follows the list rather than the
@@ -1773,6 +1799,71 @@ mod tests {
             Instant::now(),
         );
         assert!(matches!(state.detail(), Some(Detail::Ready { .. })));
+    }
+
+    #[test]
+    fn a_forbidden_kind_says_so_instead_of_looking_empty() {
+        // "No pods here" and "you may not list pods" are different facts, and
+        // only one of them means the namespace is safe to walk away from.
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[reset("prod", pods(), &[row("default", "api-0")])],
+            Instant::now(),
+        );
+        assert_eq!(row_names(&state).len(), 1);
+
+        state.apply_batch(
+            &[ClusterEvent::KindFailed {
+                cluster: "prod".into(),
+                kind: pods(),
+                reason: "pods is forbidden: User \"dev\" cannot list resource".to_owned(),
+            }],
+            Instant::now(),
+        );
+
+        // The rows are gone — nobody may refresh them, so keeping them would be
+        // showing a listing that quietly stops being true.
+        assert!(row_names(&state).is_empty());
+        let reason = state.panes()[0]
+            .unavailable()
+            .expect("the pane says why it is empty");
+        assert!(reason.contains("forbidden"), "{reason}");
+
+        // And a kind that becomes readable again stops explaining itself.
+        state.apply_batch(
+            &[reset("prod", pods(), &[row("default", "api-0")])],
+            Instant::now(),
+        );
+        assert!(state.panes()[0].unavailable().is_none());
+        assert_eq!(row_names(&state).len(), 1);
+    }
+
+    #[test]
+    fn a_forbidden_kind_does_not_report_the_cluster_as_broken() {
+        // The point of the whole split: one denied kind must leave the
+        // connection exactly as it was.
+        let mut state = state_with_contexts();
+        state.apply_batch(
+            &[ClusterEvent::Status {
+                cluster: "prod".into(),
+                state: ConnectionState::Connected,
+            }],
+            Instant::now(),
+        );
+
+        state.apply_batch(
+            &[ClusterEvent::KindFailed {
+                cluster: "prod".into(),
+                kind: pods(),
+                reason: "secrets is forbidden".to_owned(),
+            }],
+            Instant::now(),
+        );
+
+        let connection = state
+            .connection(&ClusterId::new("prod"))
+            .expect("the cluster is still known");
+        assert_eq!(connection.state, ConnectionState::Connected);
     }
 
     #[test]

@@ -218,6 +218,43 @@ const RECENT_HEADING: &str = "RECENT";
 
 /// Whether the sidebar's kind filter matches a kind. An empty filter matches
 /// everything, which is what makes the box narrow rather than select.
+/// What to say in place of a table with no rows in it.
+///
+/// Never just "empty". Every reason a table has nothing in it is a different
+/// thing to do next, and the one that used to be invisible matters most: an
+/// RBAC refusal looks exactly like an empty namespace, and only one of the two
+/// means the answer is "there are none".
+fn empty_message(
+    unavailable: Option<&str>,
+    kind: Option<&KindId>,
+    state: Option<&ConnectionState>,
+) -> String {
+    // A refusal outranks every other explanation: the cluster is connected, the
+    // kind exists, and the reason there is nothing here is that this identity
+    // is not allowed to know.
+    if let Some(reason) = unavailable {
+        return match kind {
+            Some(kind) => format!("Not allowed to list {kind} here — {reason}"),
+            None => reason.to_owned(),
+        };
+    }
+
+    match state {
+        None => "Select a context to connect.".to_owned(),
+        Some(ConnectionState::Connecting) => "Connecting…".to_owned(),
+        Some(ConnectionState::Idle) => "Not connected.".to_owned(),
+        // A failure is already in the banner; do not repeat the reason, but
+        // never leave the table looking merely empty.
+        Some(state) if state.is_problem() => {
+            format!("No rows to show — the cluster is {}.", state.label())
+        }
+        Some(_) => match kind {
+            Some(kind) => format!("No {kind} here."),
+            None => "No kind selected.".to_owned(),
+        },
+    }
+}
+
 fn matches_filter(info: &periscope_bridge::KindInfo, filter: &str) -> bool {
     filter.is_empty() || info.id.label().to_lowercase().contains(filter)
 }
@@ -2723,20 +2760,11 @@ impl Workspace {
             .and_then(|cluster| self.state.connection(cluster));
 
         let body = if rows.is_empty() {
-            let message = match connection.map(|connection| &connection.state) {
-                None => "Select a context to connect.".to_owned(),
-                Some(ConnectionState::Connecting) => "Connecting…".to_owned(),
-                Some(ConnectionState::Idle) => "Not connected.".to_owned(),
-                // A failure is already in the banner; do not repeat the reason,
-                // but never leave the table looking merely empty.
-                Some(state) if state.is_problem() => {
-                    format!("No rows to show — the cluster is {}.", state.label())
-                }
-                Some(_) => match pane.kind() {
-                    Some(kind) => format!("No {kind} here."),
-                    None => "No kind selected.".to_owned(),
-                },
-            };
+            let message = empty_message(
+                pane.unavailable().map(|reason| &**reason),
+                pane.kind(),
+                connection.map(|connection| &connection.state),
+            );
             table::placeholder(message, cx).into_any_element()
         } else {
             table::body(table::View {
@@ -4628,6 +4656,29 @@ mod tests {
 
     fn drain(rx: &CommandReceiver) -> Vec<ClusterCommand> {
         std::iter::from_fn(|| rx.try_recv()).collect()
+    }
+
+    #[test]
+    fn a_refused_kind_is_explained_rather_than_looking_empty() {
+        // "No secrets here." is a reassuring sentence and, for somebody whose
+        // role does not grant secrets, a false one.
+        let kind = KindId::new("", "v1", "Secret", "secrets");
+        let refused = empty_message(
+            Some("secrets is forbidden: User \"dev\" cannot list resource"),
+            Some(&kind),
+            Some(&ConnectionState::Connected),
+        );
+
+        assert!(refused.contains("Not allowed"), "{refused}");
+        assert!(refused.contains("forbidden"), "{refused}");
+        assert!(!refused.contains("No secrets here"), "{refused}");
+
+        // A refusal outranks the connection state, which is the whole point:
+        // the cluster is fine.
+        assert_eq!(
+            empty_message(None, Some(&kind), Some(&ConnectionState::Connected)),
+            "No secrets here."
+        );
     }
 
     #[gpui::test]

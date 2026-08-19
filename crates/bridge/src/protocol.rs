@@ -418,6 +418,21 @@ pub enum ClusterEvent {
         /// Verbatim underlying reason.
         reason: String,
     },
+    /// One kind cannot be watched, but the cluster is fine.
+    ///
+    /// Almost always RBAC: a role that grants `pods` and not `secrets` answers
+    /// 403 for the one and streams the other. That is a fact about a kind, not
+    /// about the credential, so it must not be reported as the connection
+    /// failing — and it must not leave an empty table, which would read as "no
+    /// secrets exist here".
+    KindFailed {
+        /// Cluster the kind belongs to.
+        cluster: ClusterId,
+        /// The kind that cannot be listed.
+        kind: KindId,
+        /// Verbatim underlying reason.
+        reason: String,
+    },
 }
 
 /// Identity used to collapse superseded events during coalescing.
@@ -504,6 +519,11 @@ impl ClusterEvent {
             Self::ObjectFailed {
                 cluster, kind, key, ..
             } => Some(EventKey::Object(cluster.clone(), kind.clone(), key.clone())),
+            // A kind's availability and its listing answer the same question,
+            // so a fresh listing supersedes the refusal and vice versa.
+            Self::KindFailed { cluster, kind, .. } => {
+                Some(EventKey::ResourceReset(cluster.clone(), kind.clone()))
+            }
             // Dropping a batch would lose lines outright, so batches are never
             // collapsed into one another.
             Self::LogBatch { .. } => None,
@@ -533,6 +553,7 @@ impl ClusterEvent {
             | Self::ResourceDeleted { cluster, .. }
             | Self::Object { cluster, .. }
             | Self::ObjectFailed { cluster, .. }
+            | Self::KindFailed { cluster, .. }
             | Self::LogBatch { cluster, .. }
             | Self::LogSourceChanged { cluster, .. }
             | Self::LogsFailed { cluster, .. }

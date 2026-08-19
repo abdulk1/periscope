@@ -14,6 +14,15 @@ use kube::runtime::watcher;
 pub enum Failure {
     /// The credentials were rejected, expired, or could not be obtained.
     Auth(String),
+    /// The credentials are fine; this identity may not do this.
+    ///
+    /// Separate from [`Failure::Auth`] because the blast radius is different.
+    /// 401 says the apiserver does not know who you are, which is true of
+    /// everything you will ask it next. 403 says it knows exactly who you are
+    /// and this particular request is not allowed — the usual case being a role
+    /// that grants `pods` and not `secrets`. Treating the second as the first
+    /// turns one denied kind into a cluster that appears to have logged you out.
+    Forbidden(String),
     /// Anything else: network, TLS, API errors, malformed config.
     Other(String),
 }
@@ -25,7 +34,7 @@ impl Failure {
     /// [`Failure::redacted`] instead.
     pub fn message(&self) -> &str {
         match self {
-            Self::Auth(message) | Self::Other(message) => message,
+            Self::Auth(message) | Self::Forbidden(message) | Self::Other(message) => message,
         }
     }
 
@@ -41,6 +50,11 @@ impl Failure {
     /// Whether this is an authentication problem.
     pub fn is_auth(&self) -> bool {
         matches!(self, Self::Auth(_))
+    }
+
+    /// Whether this identity is known and simply not permitted.
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, Self::Forbidden(_))
     }
 }
 
@@ -86,9 +100,11 @@ pub fn classify(error: &kube::Error) -> Failure {
     let message = describe(error);
 
     match error {
-        // 401 and 403 are the two the apiserver returns for a credential it
-        // will not accept. Everything else is a real API error.
-        kube::Error::Api(status) if matches!(status.code, 401 | 403) => Failure::Auth(message),
+        // 401 is the apiserver saying it does not know who this is; 403 is it
+        // saying it does and the answer is still no. Only the first is a
+        // statement about the credential.
+        kube::Error::Api(status) if status.code == 401 => Failure::Auth(message),
+        kube::Error::Api(status) if status.code == 403 => Failure::Forbidden(message),
         kube::Error::Auth(_) => Failure::Auth(message),
         _ => Failure::Other(message),
     }
@@ -100,8 +116,9 @@ pub fn classify_watch(error: &watcher::Error) -> Failure {
         watcher::Error::InitialListFailed(inner)
         | watcher::Error::WatchStartFailed(inner)
         | watcher::Error::WatchFailed(inner) => classify(inner),
-        watcher::Error::WatchError(status) if matches!(status.code, 401 | 403) => {
-            Failure::Auth(describe(error))
+        watcher::Error::WatchError(status) if status.code == 401 => Failure::Auth(describe(error)),
+        watcher::Error::WatchError(status) if status.code == 403 => {
+            Failure::Forbidden(describe(error))
         }
         _ => Failure::Other(describe(error)),
     }
@@ -137,8 +154,15 @@ mod tests {
     }
 
     #[test]
-    fn a_forbidden_response_is_an_auth_failure_too() {
-        assert!(classify(&api_error(403, "pods is forbidden")).is_auth());
+    fn a_forbidden_response_is_about_the_request_not_the_credential() {
+        // The incident this prevents: a role granting `pods` and not `secrets`
+        // opened the Secrets table, the 403 was reported as the credential
+        // failing, and every watch on the cluster stopped.
+        let failure = classify(&api_error(403, "secrets is forbidden"));
+
+        assert!(failure.is_forbidden());
+        assert!(!failure.is_auth(), "403 must not condemn the credential");
+        assert!(failure.message().contains("forbidden"), "{failure:?}");
     }
 
     #[test]

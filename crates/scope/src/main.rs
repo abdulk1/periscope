@@ -33,6 +33,48 @@ struct PumpHandle(#[allow(dead_code)] gpui::Task<()>);
 
 impl Global for PumpHandle {}
 
+/// The message a panic carried, however it was raised.
+fn payload_of(payload: &(dyn std::any::Any + Send)) -> String {
+    // `panic!("literal")` gives a `&str`; `panic!("{x}")` and `expect` give a
+    // `String`; a panic carrying anything else gives neither.
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_owned())
+}
+
+/// Sends panics to the log as well as to stderr.
+///
+/// Most of this program's work happens on tokio tasks and GPUI's executors,
+/// where a panic unwinds one task and is otherwise silent — the window stays
+/// up, the watch is simply gone, and the log file that gets attached to the bug
+/// report says nothing at all. Every panic now leaves a record.
+///
+/// The payload is redacted on the way to the file and left intact on stderr: a
+/// panic message can carry whatever was being processed, which for this program
+/// can be an object's contents, and the file outlives the session.
+fn record_panics() {
+    let default = std::panic::take_hook();
+
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = payload_of(info.payload());
+        let at = info
+            .location()
+            .map(|location| location.to_string())
+            .unwrap_or_else(|| "an unknown location".to_owned());
+
+        tracing::error!(
+            at,
+            thread = std::thread::current().name().unwrap_or("unnamed"),
+            payload = periscope_cluster::redact::text(&payload),
+            "panicked"
+        );
+
+        default(info);
+    }));
+}
+
 fn main() -> Result<()> {
     let started = Instant::now();
     let cli = Cli::parse();
@@ -40,6 +82,7 @@ fn main() -> Result<()> {
     // Logging first, so a failure anywhere below is recorded.
     let log_guard = periscope_config::logging::init(cli.verbosity(), cli.verbose)
         .context("could not initialise logging")?;
+    record_panics();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         log_dir = %log_guard.directory().display(),
@@ -245,5 +288,32 @@ fn window_options() -> WindowOptions {
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_message_survives_however_it_was_raised() {
+        // `panic!("literal")`, `panic!("{x}")` and a payload that is neither.
+        assert_eq!(payload_of(&"boom"), "boom");
+        assert_eq!(payload_of(&"boom".to_owned()), "boom");
+        assert_eq!(payload_of(&7u32), "a panic with no message");
+    }
+
+    #[test]
+    fn a_panic_does_not_write_a_hostname_into_the_log() {
+        // A panic message carries whatever was being handled when it happened,
+        // and the log file outlives the session.
+        let payload = payload_of(
+            &"assertion failed: response from https://A1B2C3.gr7.us-east-1.eks.amazonaws.com"
+                .to_owned(),
+        );
+        let logged = periscope_cluster::redact::text(&payload);
+
+        assert!(!logged.contains("eks.amazonaws.com"), "{logged}");
+        assert!(logged.contains("assertion failed"), "{logged}");
     }
 }

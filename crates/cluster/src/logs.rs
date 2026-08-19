@@ -277,9 +277,7 @@ pub async fn run(cluster: ClusterId, client: Client, target: Arc<LogTarget>, eve
             let pod = match api.get(name).await {
                 Ok(pod) => pod,
                 Err(error) => {
-                    let reason = match classify(&error) {
-                        crate::Failure::Auth(reason) | crate::Failure::Other(reason) => reason,
-                    };
+                    let reason = classify(&error).message().to_owned();
                     events.send(ClusterEvent::LogsFailed { cluster, reason });
                     pump.abort();
                     return;

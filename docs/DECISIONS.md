@@ -1168,3 +1168,60 @@ Recents cover the underlying need better than a custom layout would: the reason
 anybody wants to move six kinds to the top is that those six are what they open,
 and that list now builds itself. `docs/LIMITATIONS.md` says the layout is fixed
 and points here.
+
+## ADR-0040 — 403 is about the request, 401 is about the credential
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+`classify` treated 401 and 403 as one thing — "a credential the apiserver will
+not accept" — and a watch that got either reported `AuthFailed` for the cluster
+and stopped. That is right for 401 and badly wrong for 403.
+
+A 403 means the apiserver knows exactly who you are and will not do this
+particular thing. The common shape is a role that grants `pods` and not
+`secrets`: perfectly healthy credentials, one denied kind. Under the old
+classification, opening the Secrets table put the whole cluster into
+`AuthFailed`, stopped the watch that produced the 403, and left every other
+watch to be torn down with the connection — one click, and a connected cluster
+appeared to have logged the user out. Anybody working under namespace-scoped
+RBAC could reproduce it on their first session.
+
+So `Failure` gained a third variant, `Forbidden`, and the two paths diverge:
+
+* **On a watch**, a 403 is now `ClusterEvent::KindFailed` and `AfterError::StopKind`.
+  The connection state is not touched. That kind's watch ends — RBAC will not
+  change because we ask again in a second, and retrying is just load — and every
+  other watch continues.
+* **On the connect path**, a 403 from discovery is still fatal for the session,
+  because everything else depends on discovery. It reports `Disconnected` with
+  the reason rather than `AuthFailed`, because offering re-authentication for a
+  permissions problem sends the user to fix the wrong thing.
+
+The store drops the rows it was holding for a refused kind rather than keeping
+them: nobody is allowed to refresh them, and a listing that quietly stops being
+true is worse than no listing. The table says why — "Not allowed to list secrets
+here — …" — because an RBAC refusal and an empty namespace look identical, and
+only one of them means there is nothing to worry about. That is the same rule
+`AuthFailed` already followed, applied one level down.
+
+## ADR-0041 — Panics are logged, redacted, and still printed
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+Almost all of this program's work happens on tokio tasks and GPUI executors,
+where a panic unwinds one task and is otherwise silent: the window stays up, a
+watch is simply gone, and the log file attached to the bug report says nothing.
+`scope` now installs a panic hook before anything else can fail.
+
+The hook logs and then calls the previous hook, so stderr keeps its backtrace
+and its exact message. What goes to the *file* is redacted, because a panic
+payload carries whatever was being processed — for this program, an object's
+contents — and the file outlives the session. That is the same split the rest of
+the error handling makes: the screen gets the truth, the disk gets the redaction.
+
+It lives in `scope` rather than `periscope-config::logging` because redaction
+lives in `periscope-cluster`, which depends on `config`; only the binary can see
+both.
+

@@ -29,6 +29,12 @@ pub struct ResourceTable {
     snapshot: Arc<BTreeMap<ResourceKey, Instant>>,
     /// Whether `snapshot` is behind `changed`.
     restale: bool,
+    /// Why this kind cannot be listed, if it cannot.
+    ///
+    /// An RBAC refusal and an empty namespace look identical in a table of no
+    /// rows, and the difference matters: one means "there are none", the other
+    /// means "you are not allowed to know". Held here so the view can say which.
+    unavailable: Option<Arc<str>>,
 }
 
 impl ResourceTable {
@@ -42,12 +48,37 @@ impl ResourceTable {
         &self.columns
     }
 
+    /// Why this kind cannot be listed, if it cannot.
+    pub fn unavailable(&self) -> Option<&Arc<str>> {
+        self.unavailable.as_ref()
+    }
+
+    /// Records that the apiserver will not serve this kind to this identity.
+    ///
+    /// Returns whether anything changed. The rows already held are dropped: a
+    /// listing nobody is allowed to refresh goes stale silently, which is
+    /// exactly the shape of bug this project refuses to ship.
+    pub fn refuse(&mut self, reason: &str) -> bool {
+        let reason: Arc<str> = Arc::from(reason);
+        if self.unavailable.as_deref() == Some(&*reason) && self.rows.is_empty() {
+            return false;
+        }
+
+        self.rows.clear();
+        self.changed.clear();
+        self.restale = true;
+        self.unavailable = Some(reason);
+        true
+    }
+
     /// Replaces the whole table with a fresh listing.
     ///
     /// Returns whether anything the UI renders changed. A resync that finds the
     /// world unchanged — the common case after a brief watch drop — must not
     /// repaint ten thousand rows.
     pub fn reset(&mut self, columns: Arc<[ColumnSpec]>, rows: &[ResourceRow]) -> bool {
+        // Whatever we were refused before, we are evidently allowed now.
+        let was_refused = self.unavailable.take().is_some();
         let replacement: BTreeMap<_, _> = rows
             .iter()
             .map(|row| (row.key.clone(), Arc::new(row.clone())))
@@ -60,7 +91,9 @@ impl ResourceTable {
                 .zip(self.rows.iter())
                 .all(|((_, new), (_, old))| new == old);
         if unchanged {
-            return false;
+            // The rows may match, but a table that was showing a refusal and is
+            // now showing rows has changed even so.
+            return was_refused;
         }
 
         self.columns = columns;

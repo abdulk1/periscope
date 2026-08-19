@@ -45,6 +45,10 @@ pub enum AfterError {
     /// Stop. The credential was rejected and retrying would just hammer the
     /// apiserver with a token it has already refused.
     Stop,
+    /// Stop this one kind. The identity is fine and the rest of the cluster is
+    /// still being watched; this kind is simply not permitted, and RBAC will
+    /// not change because we ask again in a second.
+    StopKind,
 }
 
 /// Which objects a watch covers.
@@ -178,6 +182,20 @@ impl ResourceStream {
                 },
                 AfterError::Stop,
             ),
+            // 403 is about this kind, not this credential. Reporting it as the
+            // connection failing would stop every other watch on a cluster the
+            // user is perfectly well connected to — which is what happened to
+            // anybody holding a role that grants some kinds and not others.
+            Failure::Forbidden(reason) => {
+                return (
+                    ClusterEvent::KindFailed {
+                        cluster: self.cluster.clone(),
+                        kind: self.kind.clone(),
+                        reason,
+                    },
+                    AfterError::StopKind,
+                );
+            }
             Failure::Other(reason) => (
                 ConnectionState::Degraded {
                     // A watch failure is about one kind; say which, or the user
@@ -357,7 +375,7 @@ pub async fn run(
                 if events.send(event).is_closed() {
                     return;
                 }
-                if after == AfterError::Stop {
+                if matches!(after, AfterError::Stop | AfterError::StopKind) {
                     return;
                 }
             }
@@ -523,6 +541,35 @@ mod tests {
             !reason.contains("credential plugin:"),
             "the plugin was named twice: {reason}"
         );
+    }
+
+    #[test]
+    fn a_forbidden_kind_stops_that_kind_and_leaves_the_cluster_alone() {
+        // The incident: a role granting `pods` and not `secrets` opened the
+        // Secrets table. The 403 was classified as the credential failing, so
+        // the whole cluster went to AuthFailed and every other watch stopped —
+        // one denied kind logged the user out of a cluster they were connected
+        // to.
+        let mut stream = ResourceStream::new("prod".into(), pods());
+        let forbidden =
+            watcher::Error::WatchStartFailed(kube::Error::Api(Box::new(kube::core::Status {
+                code: 403,
+                message: "secrets is forbidden: User \"dev\" cannot list resource \"secrets\""
+                    .to_owned(),
+                ..kube::core::Status::default()
+            })));
+
+        let (event, after) = stream.on_error(&forbidden);
+
+        // Not Stop: the session continues, only this kind is given up on.
+        assert_eq!(after, AfterError::StopKind);
+        match event {
+            ClusterEvent::KindFailed { kind, reason, .. } => {
+                assert_eq!(kind, pods());
+                assert!(reason.contains("forbidden"), "{reason}");
+            }
+            other => panic!("a 403 must not touch the connection state: {other:?}"),
+        }
     }
 
     #[test]

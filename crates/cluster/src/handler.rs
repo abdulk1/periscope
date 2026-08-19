@@ -330,7 +330,11 @@ async fn list_contexts(source: kubeconfig::Source, events: EventSink) {
 fn report(cluster: ClusterId, failure: Failure, events: &EventSink) {
     let state = match failure {
         Failure::Auth(reason) => ConnectionState::AuthFailed { reason },
-        Failure::Other(reason) => ConnectionState::Disconnected {
+        // A 403 on the connect path is not a rejected credential, so it must
+        // not be offered as one — re-authenticating will produce the same
+        // answer. It is still fatal for the session, because discovery is the
+        // first thing every other request depends on.
+        Failure::Forbidden(reason) | Failure::Other(reason) => ConnectionState::Disconnected {
             reason: Some(reason),
         },
     };
