@@ -151,10 +151,20 @@ Before you commit anything that touches a cluster, a credential, or a file:
 If a guardrail fails, the fix is almost never to relax it. If it is genuinely
 wrong, fix the rule and say why in the commit message.
 
-## The runner has no kubeconfig, and no cluster
+## CI is not this machine
 
-A green `cargo test` on this machine is not the same claim as a green CI. The
-runners have no `~/.kube/config`, no cluster, and no keychain, so anything that
+Two ways that bites, both of which have cost a red build here.
+
+**The toolchain moves.** CI tracks stable, so a new Rust can fail a build that
+nothing changed: 1.98 landed and `clippy::result_large_err` rejected a
+`ConnectError` that had been fine the day before. When CI fails on a lint that
+passes locally, `rustup update stable` and reproduce it before touching the
+code. The lint is usually right — that one found a 136-byte error type sitting
+in the error half of every `Result` on the connect path.
+
+**The runner has no cluster.** A green `cargo test` on this machine is not the
+same claim as a green CI. The runners have no `~/.kube/config`, no cluster and
+no keychain, so anything that
 reaches for one passes here and fails there. A refusal test that built its
 client with `Client::try_default()` did exactly that: the gate it was checking
 worked perfectly, and the test still failed on both runners.
