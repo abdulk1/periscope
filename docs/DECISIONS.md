@@ -1239,6 +1239,24 @@ It lives in `scope` rather than `periscope-config::logging` because redaction
 lives in `periscope-cluster`, which depends on `config`; only the binary can see
 both.
 
+**Amended 2026-08-20.** The paragraph above was written against a profile that
+did not behave that way. `[profile.release]` set `panic = "abort"`, so in the
+binary that actually ships there was no unwinding and no surviving window: any
+panic on any thread took the whole application down. The hook still ran and
+still logged first, so the record survived — but "the window stays up, a watch
+is simply gone" described debug builds only, and nobody had noticed because
+nobody runs a debug build.
+
+`panic = "abort"` is now removed rather than the ADR reworded, because the
+behaviour the ADR assumed is the behaviour this program wants. A console holding
+several clusters and a log tail should not lose all of them to one panic in one
+watch task. The cost is a slightly larger binary and unwinding tables; the
+alternative is a class of total failure in a tool people open when something is
+already wrong.
+
+It was never a considered decision — no ADR argued for it, and it long predates
+the panic hook that contradicted it.
+
 ## ADR-0042 — The watch keeps quorum reads and pays for them
 
 **Date:** 2026-08-19

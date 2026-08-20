@@ -17,7 +17,7 @@ on a screen reader should use `kubectl` or `k9s` instead.
 | macOS (Apple silicon) | Developed and smoke-tested here |
 | macOS (Intel) | Should work; untested |
 | Linux (X11/Wayland) | Builds in CI, and `.deb`/`.rpm` install cleanly there; not smoke-tested against a display |
-| Windows | Not built or tested yet (not a launch blocker) |
+| Windows | Builds and runs the store, config and bridge tests in CI, and passes. Never launched, never seen; the file-permission hardening is `#[cfg(unix)]` and does nothing there (not a launch blocker) |
 
 ## Packaging
 
@@ -588,7 +588,11 @@ that paint a frame, not seen.
   fetch-to-YAML, not frame timing: the frame the YAML lands in was not measured.
 - **Light theme.** The theme toggle is wired and unit-covered; only the dark
   appearance has been looked at.
-- **CI.** `.github/workflows/ci.yml` has still not run; nothing has been pushed
-  to a remote. The Linux build dependency list and the new `kind` job are written
-  from documentation rather than observed from a green run.
-- **Linux.** Neither built nor run on Linux.
+- **Linux, as a running program.** It builds, its `.deb` installs, and the
+  desktop entry validates — all in CI, on every push. What nobody has done is
+  open the window on a Linux desktop. GPUI's Wayland and X11 backends are
+  exercised by nothing here.
+- **A four-hour session.** `IMPLEMENTATION.md` asks for one. The longest run so
+  far is **90 minutes** (`packaging/soak.sh`, tailing `chatty` against `kind`
+  with watches active): no crash, and RSS flat at 64–67MB from start to finish.
+  Ninety minutes is not four hours.

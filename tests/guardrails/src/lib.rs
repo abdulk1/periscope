@@ -67,16 +67,23 @@ fn collect(directory: &Path, found: &mut Vec<(PathBuf, String)>) {
     }
 }
 
-/// Lines of a file, numbered from one, with `#[cfg(test)]` modules removed.
+/// Lines of a file, numbered from one, with the trailing `#[cfg(test)]` module
+/// removed.
 ///
 /// Tests build the very strings the rules below forbid — that is how they prove
 /// the redaction works — so scanning them would make the guardrail impossible to
-/// satisfy. The split is crude: everything from the first `#[cfg(test)]` to the
-/// end of the file. Every file in this workspace puts its tests last.
+/// satisfy.
+///
+/// The cut is at the **first unindented** `#[cfg(test)]`, which is the `mod
+/// tests` every file in this workspace puts last. It used to be the first
+/// `#[cfg(test)]` anywhere, and that was silently wrong: a test-only accessor
+/// carries the same attribute indented, in the middle of a file, and
+/// `workspace.rs` grew one. The scan stopped at line 1015 of 4680 and exempted
+/// three and a half thousand lines of the largest, fastest-changing file in the
+/// repository — the one most worth watching — from every rule here.
 pub fn production_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
-    let end = text.find("#[cfg(test)]").unwrap_or(text.len());
-    text[..end]
-        .lines()
+    text.lines()
         .enumerate()
+        .take_while(|(_, line)| *line != "#[cfg(test)]")
         .map(|(at, line)| (at + 1, line))
 }

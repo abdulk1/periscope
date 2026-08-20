@@ -108,15 +108,32 @@ fn everything_that_persists_is_restricted_to_its_owner() {
     // account on the machine.
     let mut offences = Vec::new();
 
+    /// How far after a write `restrict` may appear. Every real call site does it
+    /// on the next line or the one after; the slack is for a `?` split across
+    /// lines or an intervening `flush`.
+    const WINDOW: usize = 6;
+
     for (path, text) in sources() {
         // `paths::restrict` is the one place allowed to talk about modes.
         if path.ends_with("paths.rs") {
             continue;
         }
 
-        for (number, line) in production_lines(&text) {
-            let writes = line.contains("fs::write(") || line.contains(".append(true)");
-            if writes && !text.contains("restrict") {
+        let lines: Vec<_> = production_lines(&text).collect();
+        for (index, (number, line)) in lines.iter().enumerate() {
+            if !(line.contains("fs::write(") || line.contains(".append(true)")) {
+                continue;
+            }
+
+            // Checked against the following few lines rather than the whole
+            // file. A file-wide `contains("restrict")` meant one restricted
+            // write anywhere exempted every other write in the same file —
+            // which is the shape of exemption that grows quietly.
+            let restricted = lines[index..]
+                .iter()
+                .take(WINDOW)
+                .any(|(_, near)| near.contains("restrict"));
+            if !restricted {
                 offences.push(format!("{}:{number}: {}", path.display(), line.trim()));
             }
         }
@@ -127,6 +144,33 @@ fn everything_that_persists_is_restricted_to_its_owner() {
         "a file is written without being restricted to its owner:\n{}\n\n\
          Call `periscope_config::paths::restrict` after writing it.",
         offences.join("\n")
+    );
+}
+
+#[test]
+fn the_scan_does_not_stop_at_the_first_test_only_item() {
+    // The split used to cut at the first `#[cfg(test)]` anywhere in a file.
+    // `workspace.rs` carries that attribute, indented, on two test-only
+    // accessors — so the scan stopped at line 1015 of 4680 and quietly exempted
+    // three and a half thousand lines of the largest and fastest-changing file
+    // in the repository. Nothing was leaking; nothing was watching either.
+    //
+    // The canary is the export write at ~1898: a real `fs::write` of cluster
+    // log text, sitting well past the old cut, and exactly the kind of line
+    // these rules exist to police.
+    let (_, text) = sources()
+        .into_iter()
+        .find(|(path, _)| path.ends_with("workspace.rs"))
+        .expect("the workspace view is part of the shipped source");
+
+    let write = production_lines(&text).find(|(_, line)| line.contains("fs::write("));
+    let (number, _) = write.expect(
+        "the export write is not inside the scanned region; the split found a \
+         `#[cfg(test)]` that is not the trailing test module",
+    );
+    assert!(
+        number > 1015,
+        "expected it past the old cut, found line {number}"
     );
 }
 

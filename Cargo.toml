@@ -118,7 +118,13 @@ ropey = { opt-level = 3 }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Deliberately *not* `panic = "abort"`. Almost all of this program's work
+# happens on tokio tasks and GPUI executors, and unwinding is what confines a
+# panic to the one that raised it: the window stays up, the other clusters keep
+# streaming, and the hook in `scope` writes down what happened. Aborting turns
+# one bad object in one watch into the loss of every session the window holds.
+# ADR-0041 assumed this and was, until it was checked, wrong about the profile
+# that ships.
 
 # Optimised like release, linked like a test.
 #
