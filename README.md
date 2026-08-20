@@ -415,6 +415,8 @@ explicit about what that costs.
 
 ## Working on it
 
+Start with the crate graph, because the dependency edges are the architecture:
+
 ```
 crates/
 ├── scope/     binary: flags, window setup, wiring
