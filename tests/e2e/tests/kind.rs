@@ -247,8 +247,21 @@ fn disconnecting_stops_the_stream() {
     })
     .unwrap_or_else(|seen| panic!("no disconnect reported; saw: {}", describe(&seen)));
 
-    // Nothing more should arrive for that cluster.
+    // Whatever the watch had already sent before it was torn down is still in
+    // the channel, and arriving after the disconnect status proves nothing: a
+    // single queue cannot order a watch task's last send against the handler's
+    // reply. Throw that away first.
+    //
+    // This does not weaken the test. The claim is that the watch has *stopped
+    // producing*, and what proves it is the silence after the drain — a watch
+    // still running against a cluster with ten thousand pods in it fills that
+    // window immediately. It filled this one, which is how the race was found:
+    // the suite used to run ten minutes after the load fixture was seeded, and
+    // now runs seconds after, while those pods are still going Pending.
+    while stream.try_recv().is_some() {}
+
     std::thread::sleep(Duration::from_secs(2));
+
     while let Some(event) = stream.try_recv() {
         assert!(
             !matches!(
