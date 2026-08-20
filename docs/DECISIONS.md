@@ -83,6 +83,25 @@ No `rust-toolchain.toml` is committed. Pinning the toolchain file would force
 every contributor onto one exact compiler for a project with no toolchain-specific
 requirements; the MSRV field plus CI on stable is sufficient.
 
+`rust-version` in the manifest is `1.89`, not the 1.85 this ADR first recorded.
+
+**Amended 2026-08-20.** "No toolchain-specific requirements" turned out to be
+not quite true, in the way tracking stable always eventually is: 1.98 landed,
+CI's `dtolnay/rust-toolchain@stable` picked it up, and `clippy::result_large_err`
+failed the build on code that had not changed. Local builds were still on 1.97.1
+and still green, so it was reproducible only by running `rustup update stable`
+and matching CI.
+
+Still not pinning. The churn is cheap — one lint, one afternoon — and it is a
+useful forcing function: this one was correct, and boxing the 112-byte
+`kube::Error` inside `ConnectError` made the error half of every `Result` on the
+connect path four times smaller. A pinned toolchain would have deferred that
+find indefinitely.
+
+What *has* changed is the habit: when CI fails on a lint that passes locally,
+update the local toolchain and reproduce it rather than reasoning about the
+diagnostic from a distance. `AGENTS.md` says so.
+
 ---
 
 ## ADR-0003 — tokio lives on its own thread, never on GPUI's executors

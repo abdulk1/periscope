@@ -35,8 +35,14 @@ pub enum ConnectError {
     #[error("{source}")]
     Client {
         /// What went wrong.
+        ///
+        /// Boxed because `kube::Error` is 112 bytes on its own — it carries a
+        /// whole `std::process::Output` for a failed credential plugin — and
+        /// this type is the error half of every `Result` on the connect path.
+        /// Unboxed it made `ConnectError` 136 bytes, which every caller paid on
+        /// the success path too.
         #[source]
-        source: kube::Error,
+        source: Box<kube::Error>,
         /// The `exec` command this context runs, if it runs one.
         credential_plugin: Option<String>,
     },
@@ -201,7 +207,7 @@ pub async fn connect(context: &ClusterId, source: Source) -> Result<Connection, 
     );
 
     let client = Client::try_from(config).map_err(|source| ConnectError::Client {
-        source,
+        source: Box::new(source),
         credential_plugin: plugin.clone(),
     })?;
 
@@ -312,5 +318,22 @@ users:
     fn an_empty_kubeconfig_yields_no_contexts_and_no_current() {
         let empty = Kubeconfig::from_yaml("apiVersion: v1\nkind: Config\n").expect("parses");
         assert_eq!(contexts_of(&empty), Contexts::default());
+    }
+
+    #[test]
+    fn a_connect_failure_stays_small_enough_to_return_by_value() {
+        // `ConnectError` is the error half of every `Result` on the connect
+        // path, and an enum that size is paid on the success path too. It was
+        // 136 bytes until `kube::Error` — 112 on its own, because it carries a
+        // whole `std::process::Output` for a failed credential plugin — was
+        // boxed inside the `Client` variant.
+        //
+        // 128 is where `clippy::result_large_err` starts objecting, and it
+        // started objecting in Rust 1.98 against code that had been fine the
+        // day before. The bound here is tighter than the lint so the next
+        // large field is caught by a test that says why, rather than by a CI
+        // failure on a toolchain bump.
+        let size = std::mem::size_of::<ConnectError>();
+        assert!(size <= 64, "ConnectError has grown to {size} bytes");
     }
 }

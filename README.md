@@ -53,7 +53,7 @@ its honesty and is worth reading before you rely on anything here.
 
 ## Run it
 
-Requires Rust stable (developed on 1.97.1; MSRV 1.89) and a kubeconfig.
+Requires Rust stable (developed on 1.98.0; MSRV 1.89) and a kubeconfig.
 
 ```sh
 cargo run --release --bin scope                        # open the window
