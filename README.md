@@ -44,8 +44,8 @@ is no Developer ID to run them with — a Homebrew cask, an AppImage, screenshot
 and a describe-style summary. Exec runs a command and streams its output; it is
 not a terminal, and ADR-0033 argues that half a terminal is worse than none.
 
-**Not proven:** a real EKS or GKE handshake, a session longer than 90 minutes,
-and the app running on a Linux desktop. Each is listed in
+**Not proven:** a real EKS or GKE handshake, and the app running on a Linux
+desktop. Each is listed in
 [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), which is where this project keeps
 its honesty and is worth reading before you rely on anything here.
 

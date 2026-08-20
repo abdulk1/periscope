@@ -470,6 +470,48 @@ The same applies to a masked Secret: Apply and Dry run render disabled with
 On a read-only cluster the cluster's reason wins, since revealing the values
 would not make the apply land.
 
+## The four-hour session
+
+`IMPLEMENTATION.md` asks for "no crash in a 4-hour session with active watches
+and log tailing". Run on 2026-08-20 against `kind` with **10,024 pods watched**
+and a merged tail of three `chatty` pods, under `--perf`, which forces
+continuous redraw and is therefore the pessimistic case:
+
+```
+soak started 2026-08-20T17:50:11Z  args=--tail app=chatty -n default
+soak completed after 14413s
+```
+
+Four hours and thirteen seconds, and `packaging/soak.sh` stops the moment the
+process dies — "completed" means it was alive the whole way.
+
+| | |
+|---|---|
+| Resident memory | peak **81MB**, mean 48MB, **39MB at the end** — against a 300MB budget |
+| Flushes applied | **125,014**, of which **0** dropped an event |
+| Warnings, errors, panics in the log | **0** |
+| Rows watched at the last flush | **10,024** |
+| Frame reports | 2,225, median **60.0fps**, p50 16.68ms |
+
+Two things worth reading carefully rather than taking at face value:
+
+- **Memory went down, not up.** It peaked at 81MB during the initial listing of
+  10,024 pods and drifted to 39MB over the four hours. Memory growth on long
+  sessions was the risk this test exists for, and the ring buffers and the idle
+  sweep appear to do their job; the tail buffer was at 93,159 lines of its
+  100,000 capacity by the end, so it was evicting, which is what it should do.
+- **CPU fell to under 1% for the last stretch, and that is not the app idling
+  through the test.** macOS stops sending frame callbacks to a window nobody is
+  looking at, so `--perf`'s continuous redraw stops while the cluster work
+  continues — the last line in the log is a flush at 21:50:24Z carrying
+  `rows=10024`. Watches and the tail were live to the end; only the drawing
+  paused. It does mean the last hours measured event handling rather than
+  rendering.
+
+209 of the 2,225 frame reports recorded at least one interval over 33ms. That is
+the same missed-vsync effect measured directly above, and on a window that is
+being occluded and revealed over four hours it is expected.
+
 ## Testing
 
 Bridge tests that involve the tokio thread poll with a deadline rather than
@@ -592,7 +634,3 @@ that paint a frame, not seen.
   desktop entry validates — all in CI, on every push. What nobody has done is
   open the window on a Linux desktop. GPUI's Wayland and X11 backends are
   exercised by nothing here.
-- **A four-hour session.** `IMPLEMENTATION.md` asks for one. The longest run so
-  far is **90 minutes** (`packaging/soak.sh`, tailing `chatty` against `kind`
-  with watches active): no crash, and RSS flat at 64–67MB from start to finish.
-  Ninety minutes is not four hours.
