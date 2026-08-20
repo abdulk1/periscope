@@ -5,14 +5,16 @@ mod cli;
 mod update;
 
 use std::cell::RefCell;
+use std::io::IsTerminal as _;
 use std::rc::Rc;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use clap::Parser as _;
 use gpui::{
-    App, AppContext as _, Application, Bounds, Global, TitlebarOptions, WindowBounds,
-    WindowOptions, point, px, size,
+    App, AppContext as _, Application, Bounds, Context, Global, IntoElement, ParentElement as _,
+    Render, SharedString, Styled as _, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
+    point, px, rgb, size,
 };
 use gpui_component::Root;
 use gpui_component_assets::Assets;
@@ -76,8 +78,78 @@ fn record_panics() {
 }
 
 fn main() -> Result<()> {
-    let started = Instant::now();
     let cli = Cli::parse();
+
+    // Returning the error is what prints it: `Termination` writes it to stderr
+    // and exits non-zero, which is right for anyone who typed `scope`. Nobody
+    // who double-clicked an icon has a stderr, so they get a window first.
+    match start(cli) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            show_startup_failure(&error);
+            Err(error)
+        }
+    }
+}
+
+/// Shows a fatal startup error to somebody who has no terminal to read.
+///
+/// Everything before `Application::run` — logging, settings, the audit log, the
+/// cluster runtime — used to fail by returning out of `main`. From a terminal
+/// that is fine. Launched from Finder or a desktop entry it is not: stderr goes
+/// nowhere, so a malformed `settings.toml` produced an application that bounced
+/// once in the Dock and vanished, with the explanation written to a stream
+/// nobody was reading.
+///
+/// Refusing to start on a malformed settings file is deliberate — starting with
+/// permissive defaults when somebody has written a read-only rule is the worst
+/// thing this program could do — which makes it all the more important that the
+/// refusal is legible.
+fn show_startup_failure(error: &anyhow::Error) {
+    // A terminal has already been given it, or is about to be.
+    if std::io::stderr().is_terminal() {
+        return;
+    }
+
+    // Not `{error:#}`. That walks the chain and re-appends each source, and
+    // these errors already quote their own — `SettingsError::Parse` is
+    // "{path} is not valid settings: {source}" — so the alternate form printed
+    // the whole TOML diagnostic twice. `describe` is the same walk with the
+    // repetition dropped; it was written for `kube`, which nests errors the
+    // same way.
+    let message = SharedString::from(failure_message(error));
+
+    Application::new().with_assets(Assets).run(move |cx| {
+        cx.activate(true);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+
+        let opened = cx.open_window(failure_window_options(), |_, cx| {
+            cx.new(|_| StartupFailure {
+                message: message.clone(),
+            })
+        });
+
+        // Nothing left to try: the caller returns the error and stderr gets it,
+        // wherever stderr happens to go.
+        if opened.is_err() {
+            cx.quit();
+        }
+    });
+}
+
+/// The text the failure window shows.
+fn failure_message(error: &anyhow::Error) -> String {
+    periscope_cluster::errors::describe(error.as_ref())
+}
+
+/// The whole of startup, so that any failure in it has one place to be caught.
+fn start(cli: Cli) -> Result<()> {
+    let started = Instant::now();
 
     // Logging first, so a failure anywhere below is recorded.
     let log_guard = periscope_config::logging::init(cli.verbosity(), cli.verbose)
@@ -277,6 +349,58 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// The window that says why there is no window.
+///
+/// Deliberately built from raw GPUI with literal colours: it must render when
+/// the theme, the settings and the log file have all failed, so it depends on
+/// none of them. It is not themed, and that is the point — this is the one
+/// screen that has to work when nothing else did.
+struct StartupFailure {
+    message: SharedString,
+}
+
+impl Render for StartupFailure {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_8()
+            .bg(rgb(0x16181d))
+            .text_color(rgb(0xe8eaed))
+            .child(div().text_lg().child("Periscope could not start"))
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .text_color(rgb(0xf28b82))
+                    .child(self.message.clone()),
+            )
+            .child(div().text_xs().text_color(rgb(0x9aa0a6)).child(
+                "Fix the file named above, or delete it to start with defaults. \
+                         Settings are read once, at startup.",
+            ))
+    }
+}
+
+fn failure_window_options() -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds {
+            origin: point(px(160.), px(160.)),
+            // Roomy on purpose: a TOML parse error arrives with the offending
+            // line and a caret under it, and truncating the one thing that says
+            // *where* the problem is would defeat the window.
+            size: size(px(860.), px(560.)),
+        })),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Periscope".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn window_options() -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -294,6 +418,40 @@ fn window_options() -> WindowOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_startup_failure_says_it_once() {
+        // `{error:#}` walks the chain re-appending every source, and these
+        // errors already quote their own — so the window printed the whole TOML
+        // diagnostic, caret and all, twice.
+        #[derive(Debug, thiserror::Error)]
+        #[error("{path} is not valid settings: {source}")]
+        struct Parse {
+            path: String,
+            source: Inner,
+        }
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("TOML parse error at line 2, column 14")]
+        struct Inner;
+
+        let error = anyhow::Error::new(Parse {
+            path: "/home/u/settings.toml".to_owned(),
+            source: Inner,
+        })
+        .context("could not read settings");
+
+        let shown = failure_message(&error);
+
+        // The path is the part that makes it actionable, and the parse error is
+        // the part that says where.
+        assert!(shown.contains("/home/u/settings.toml"), "{shown}");
+        assert_eq!(
+            shown.matches("TOML parse error").count(),
+            1,
+            "the source is repeated: {shown}"
+        );
+    }
 
     #[test]
     fn a_panic_message_survives_however_it_was_raised() {

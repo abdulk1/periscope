@@ -5974,6 +5974,7 @@ dependencies = [
  "periscope-config",
  "periscope-store",
  "periscope-ui",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "zed-reqwest",

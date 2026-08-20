@@ -1426,3 +1426,42 @@ the profile did, and it is worth noting for a different reason: a test whose
 number can triple between runs is measuring the producer at least as much as
 the consumer.
 
+## ADR-0046 — A failure before the window gets a window
+
+**Date:** 2026-08-20
+**Status:** Accepted
+
+Everything before `Application::run` — logging, settings, the audit log, the
+cluster runtime — failed by returning out of `main`. From a terminal that is
+correct: `Termination` writes the error to stderr and exits non-zero.
+
+Launched from Finder or a desktop entry, it was invisible. There is no stderr
+there, so a malformed `settings.toml` produced an application that bounced once
+in the Dock and vanished, with the explanation written to a stream nobody was
+reading. Refusing to start on a bad settings file is deliberate — starting with
+permissive defaults when somebody has written a read-only rule is the worst
+thing this program could do — which is exactly why the refusal has to be
+legible.
+
+`show_startup_failure` opens a plain window when `stderr` is not a terminal, and
+does nothing when it is: a person who typed `scope` has already been given the
+error and does not need a window popping up over their shell.
+
+Three details that are the whole point:
+
+* **It is built from raw GPUI with literal colours.** It has to render when the
+  theme, the settings and the log file have all failed, so it depends on none of
+  them. It is not themed, and it should not be.
+* **The message is `errors::describe`, not `{error:#}`.** anyhow's alternate
+  form walks the chain re-appending each source, and these errors already quote
+  their own — `SettingsError::Parse` is `"{path} is not valid settings:
+  {source}"` — so the first version printed the whole TOML diagnostic, caret and
+  all, twice. `describe` is the same walk with the repetition dropped; it was
+  written for `kube`, which nests errors the same way. A test pins it.
+* **The window is roomy.** A TOML parse error arrives with the offending line
+  and a caret under it, and truncating the one part that says *where* would
+  defeat the exercise.
+
+`main` still returns the error afterwards, so the stderr behaviour and the exit
+code are unchanged.
+
