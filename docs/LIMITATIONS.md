@@ -479,7 +479,12 @@ a timeout rather than hanging, but they are wall-clock sensitive and could be
 flaky on a heavily loaded machine.
 
 The `kind`-based suite lives in `tests/e2e` and is `#[ignore]`d, because it needs
-a real cluster, so `cargo test` does not run it. CI does: a `kind` job creates a
+a real cluster, so `cargo test` does not run it. The job takes **about ten minutes**,
+down from twenty-seven: it used to spend 467s installing graphics headers for a
+build that draws nothing, 196s watching `kubectl wait` before starting work, and
+most of ten minutes linking eleven test binaries with settings meant for a
+shipped release. Under two minutes of it was ever running tests. ADR-0044 and
+ADR-0045 have the numbers. CI does: a `kind` job creates a
 cluster, seeds 10,000 pods, installs cert-manager, Argo CD and our own `widgets`
 CRD, and runs the suite with `PERISCOPE_E2E_REQUIRE_FIXTURES=1` so that a
 missing fixture fails the build instead of silently skipping fifteen tests. The

@@ -1399,3 +1399,12 @@ roughly a factor of two in hand — losing LTO does not cost anything like that.
 Nothing else changes profile. `cargo build --release --bin scope` still produces
 the binary people run, still with thin LTO and one codegen unit.
 
+**Confirmed on CI.** "Build the suite" went 608s to 262s, and the whole `kind`
+job 1,608s to 608s — a 62% cut across ADR-0044 and this one. The ingest-rate
+test did not slow down; it measured 59,434 lines/s against the 10,000 budget,
+*higher* than the 20,635 recorded before the change. That is almost certainly
+the four producer pods getting more of a less-loaded node rather than anything
+the profile did, and it is worth noting for a different reason: a test whose
+number can triple between runs is measuring the producer at least as much as
+the consumer.
+
