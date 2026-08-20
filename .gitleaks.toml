@@ -1,0 +1,39 @@
+# What may look like a credential in this repository and is not.
+#
+# The scan runs over the whole history, so anything allowlisted here is
+# allowlisted forever — keep each entry as narrow as it can be, and say what it
+# is and why it is safe. A path-wide exemption on a file that handles real
+# credentials would quietly turn the scan off exactly where it matters most.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+The fake credentials in the redactor's own tests. `redact.rs` exists to keep
+tokens out of anything written down, and the only way to prove it works is to
+hand it something token-shaped — so this file will always contain strings that
+look like secrets. Matched literally rather than by path: the file is the one
+place in the codebase where a *real* leaked token would be most at home, and a
+path exemption would stop looking for it.
+
+The first is a JWT header whose `kid` decodes to "LongEnoughToBeARealToken";
+the second is base64 of "https://sts.amazonaws", in the shape `aws eks
+get-token` returns. Neither has ever been valid anywhere.
+"""
+targetRules = ["generic-api-key", "jwt"]
+regexes = [
+  '''eyJhbGciOiJSUzI1NiIsImtpZCI6IkxvbmdFbm91Z2hUb0JlQVJlYWxUb2tlbiJ9''',
+  '''k8s-aws-v1\.aHR0cHM6Ly9zdHMuYW1hem9uYXdz''',
+]
+
+[[allowlists]]
+description = """
+The golden fixtures for the YAML writer. `secret.yaml` is what a masked Secret
+renders as — the point of the fixture is that the values are `<hidden, N
+bytes>` and not values — but `kind: Secret` in a YAML file is enough for the
+rule to fire. Scoped to that one rule and to the golden directory, so a
+credential pasted into any other fixture is still caught.
+"""
+targetRules = ["kubernetes-secret-yaml"]
+paths = ['''crates/cluster/tests/golden/.*\.yaml''']

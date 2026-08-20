@@ -108,7 +108,15 @@ cargo deny check                     # licences, unmaintained crates, duplicates
 `cargo audit` and `cargo deny` are not installed by default. Install them
 (`cargo install cargo-audit cargo-deny --locked`) and run them, rather than
 pushing a `deny.toml` you have never executed — CI will run it either way, and
-finding out there means a red build and a twenty-five minute round trip.
+finding out there means a red build and a long round trip.
+
+CI also scans the whole git history for committed credentials
+(`gitleaks git --redact --exit-code 1 .`, MIT binary, pinned by checksum).
+`.gitleaks.toml` allowlists three test fixtures, each by literal value or by a
+rule-scoped path rather than by exempting a file — `redact.rs` is the one place
+a real leaked token would look most at home, so it is never exempted wholesale.
+If you add a fixture that looks like a credential, narrow the allowlist to it
+and say why.
 
 `tests/guardrails` reads the source and fails the build when a shape that has
 already leaked reappears — a `tracing::` call carrying a cluster URL or a token,
