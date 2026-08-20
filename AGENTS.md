@@ -164,10 +164,10 @@ in the error half of every `Result` on the connect path.
 
 **The runner has no cluster.** A green `cargo test` on this machine is not the
 same claim as a green CI. The runners have no `~/.kube/config`, no cluster and
-no keychain, so anything that
-reaches for one passes here and fails there. A refusal test that built its
-client with `Client::try_default()` did exactly that: the gate it was checking
-worked perfectly, and the test still failed on both runners.
+no keychain, so anything that reaches for one passes here and fails there. A
+refusal test that built its client with `Client::try_default()` did exactly
+that: the gate it was checking worked perfectly, and the test still failed on
+both runners.
 
 Build such a client from an explicit `kube::Config` pointed at a port nothing
 listens on. Before pushing anything that touches credentials, kubeconfig or the
