@@ -109,15 +109,18 @@ jobs:
 
       # Both binaries are built here rather than on demand, so that the compile
       # and the image pulls above overlap instead of queueing.
+      # `--profile e2e` is release with thin LTO and single-codegen-unit
+      # linking turned off. Eleven test binaries linked that way was most of a
+      # ten-minute build; relinking one dropped from 27.6s to 1.2s locally.
       - name: Build the suite
         run: |
-          cargo build --release -p periscope-e2e --bin seed-pods
-          cargo test --release -p periscope-e2e --no-run
+          cargo build --profile e2e -p periscope-e2e --bin seed-pods
+          cargo test --profile e2e -p periscope-e2e --no-run
 
       - name: Seed the load fixture
         run: |
-          cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000
-          cargo run --release -p periscope-e2e --bin seed-pods -- --large-config-map
+          cargo run --profile e2e -p periscope-e2e --bin seed-pods -- --count 10000
+          cargo run --profile e2e -p periscope-e2e --bin seed-pods -- --large-config-map
 
       # By now these have almost always finished pulling; the timeout is for the
       # times they have not.
@@ -137,7 +140,7 @@ jobs:
         env:
           PERISCOPE_E2E_REQUIRE_FIXTURES: "1"
         run: |
-          cargo test --release -p periscope-e2e -- --ignored --test-threads 1 --nocapture \
+          cargo test --profile e2e -p periscope-e2e -- --ignored --test-threads 1 --nocapture \
             --skip a_firehose_is_ingested_at_rate_and_stays_bounded
 
       # The ingest-rate budget needs the unthrottled producer, so it runs on its
@@ -157,7 +160,7 @@ jobs:
         run: |
           kubectl apply -f tests/e2e/fixtures/firehose.yaml
           kubectl wait --for=condition=Available --timeout=300s deployment/firehose
-          cargo test --release -p periscope-e2e --test logs -- --ignored --nocapture \
+          cargo test --profile e2e -p periscope-e2e --test logs -- --ignored --nocapture \
             a_firehose_is_ingested_at_rate_and_stays_bounded
           kubectl delete -f tests/e2e/fixtures/firehose.yaml
 

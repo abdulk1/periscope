@@ -119,3 +119,17 @@ ropey = { opt-level = 3 }
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# Optimised like release, linked like a test.
+#
+# The end-to-end suite is eleven separate integration-test binaries, and under
+# the release profile each one is linked with thin LTO and a single codegen
+# unit — settings that exist to make one shipped binary as fast as possible and
+# that cost, measured on CI, most of a ten-minute build. What the suite needs
+# from optimisation is that its timing budgets mean something, which is
+# `opt-level = 3`; it does not need the last few per cent. The ingest-rate test
+# runs at 20,635 lines/s against a 10,000 budget, so there is room for it.
+[profile.e2e]
+inherits = "release"
+lto = false
+codegen-units = 16

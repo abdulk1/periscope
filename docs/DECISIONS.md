@@ -1367,3 +1367,35 @@ The job was also reordered: fixtures are applied before anything is compiled and
 waited for afterwards, so cert-manager, Argo CD and three workload deployments
 pull their images while cargo works instead of after it. That was another 200s
 of a runner watching `kubectl wait`.
+
+## ADR-0045 — The end-to-end suite is optimised, not shipped
+
+**Date:** 2026-08-19
+**Status:** Accepted
+
+`[profile.release]` sets `lto = "thin"` and `codegen-units = 1`. Those are the
+right settings for the one binary that ships and the wrong ones for eleven
+integration-test binaries, each of which links the whole dependency graph.
+
+Measured on the author's machine, before and after ADR-0044 removed GPUI from
+that graph and this ADR relaxed the link:
+
+| | cold build | relink one test |
+|---|---|---|
+| `--release` | 308s | 27.6s |
+| `--profile e2e` | 135s | **1.2s** |
+
+The relink number is the one that matters, because CI pays it eleven times on
+every run — `rust-cache` caches dependencies and deliberately discards the
+workspace's own artifacts, so every run relinks every test binary.
+
+`[profile.e2e]` inherits release and turns off both. It keeps `opt-level = 3`,
+which is the part the suite actually needs: its budgets are assertions about
+throughput, and a debug build misses them by a wide margin. What it gives up is
+the last few per cent of a shipped binary, which no test asserts on. The
+ingest-rate test measures 20,635 lines/s against a 10,000 budget, so there is
+roughly a factor of two in hand — losing LTO does not cost anything like that.
+
+Nothing else changes profile. `cargo build --release --bin scope` still produces
+the binary people run, still with thin LTO and one codegen unit.
+
