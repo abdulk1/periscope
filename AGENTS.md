@@ -1,8 +1,17 @@
 # Working on Periscope
 
 Read this first. It is the operating manual for anyone — human or agent —
-changing this repository. It is short on purpose; the detail lives in the four
-documents it links to.
+changing this repository. It is short on purpose; the detail lives in
+`docs/`:
+
+| Document | For |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | How the six crates fit together, and where a new feature goes |
+| [`docs/STYLE.md`](docs/STYLE.md) | How the code, tests and commit messages are written |
+| [`docs/TESTING.md`](docs/TESTING.md) | The six kinds of test, and which one you need |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Why things are the way they are. Append, never rewrite |
+| [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | What does not work, measured and unhidden |
+| [`docs/COMPETITORS.md`](docs/COMPETITORS.md) | What the rest of the field does, and which of this project's bets the evidence does *not* support |
 
 Nothing here is specific to one assistant. `CLAUDE.md` points at this file
 because Claude Code looks for that name; if your tool reads

@@ -5,31 +5,53 @@ affordances: live resource streams, multi-cluster, and log tailing across pods.
 
 **Binary:** `scope` · **Language:** Rust · **UI:** GPUI
 
-> **Status: Phase 6 (ship it), in progress.** Connects to kubeconfig contexts on
-> demand, discovers every kind each serves — CRDs included — streams any of them
-> into a virtualised table, tails logs from one pod or from every pod matching a
-> label selector, and shows two clusters side by side. Clusters you have visited
-> stay warm, so switching back is instant. Fuzzy jump palette (⌘K) searches
-> every warm cluster at once.
->
-> It can now change things: delete, scale, restart, cordon, drain, apply edited
-> YAML (with a dry run first), forward a local port onto a pod, and run a command
-> in a container. Everything that changes anything shows a confirmation naming
-> the cluster, passes two independent read-only gates, and is written to a local
-> audit log. Exec runs a command and streams its output; the spec asked for
-> terminal emulation and that is not built — see ADR-0033.
->
-> Phase 6 so far: a `settings.toml` covering theme, access, limits, columns and
-> a fully remappable k9s-style keymap; a macOS `.app` and `.dmg`; Debian and RPM
-> packages; an opt-in update check. The security invariants are now held by code
-> rather than by discipline — see **Security posture** — and the end-to-end
-> suite runs against a real `kind` cluster on every push. Not there yet: code
-> signing (no Developer ID), a Homebrew cask, an AppImage, Windows, and
-> screenshots.
-> See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the roadmap and
-> [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for what does not work.
+It opens on your `current-context`, lists every kind the cluster serves — custom
+resources included, with the columns their own definitions declare — and streams
+any of them into a table that updates as the cluster does. Two clusters fit side
+by side. Logs merge across every pod matching a selector. Anything that changes a
+cluster asks first, in a sentence naming the cluster, the object and the
+operation.
 
-## Build and run
+It requires no account, phones nothing home, and writes no credential to disk.
+
+[What works today](#status) · [Run it](#run-it) · [The keyboard](#the-keyboard) ·
+[Settings](#settings) · [Security posture](#security-posture) ·
+[Working on it](#working-on-it)
+
+## Status
+
+**There is no release to download yet.** You build it from source, and on macOS
+the bundle is unsigned. That is the honest headline; everything below is what
+you get once you have.
+
+Phases 0 through 5 — the console itself — are built and tested. Phase 6,
+packaging and distribution, is what remains.
+
+**Built:** browsing every kind a cluster serves, custom resources included, with
+the columns their own definitions declare; a virtualised table that streams;
+clusters that stay warm so switching back is instant; a fuzzy palette (⌘K) that
+searches every warm cluster at once; merged log tailing across a selector; two
+clusters side by side; delete, scale, restart, cordon, drain, apply-with-dry-run,
+port-forwarding and running a command in a container — each behind a confirmation
+naming the cluster, two independent read-only gates, and a local audit log. A
+`settings.toml` covering theme, access, limits, columns and a fully remappable
+k9s-style keymap. An opt-in update check. A macOS `.app` and `.dmg`, Debian and
+RPM packages. Windows builds and passes its tests in CI, though nobody has
+opened the window there.
+
+**Not built:** code signing and notarization — the scripts are written and there
+is no Developer ID to run them with — a Homebrew cask, an AppImage, screenshots,
+and a describe-style summary. Exec runs a command and streams its output; it is
+not a terminal, and ADR-0033 argues that half a terminal is worse than none.
+
+**Not proven:** a real EKS or GKE handshake, a session longer than 90 minutes,
+and the app running on a Linux desktop. Each is listed in
+[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), which is where this project keeps
+its honesty and is worth reading before you rely on anything here.
+
+[`IMPLEMENTATION.md`](IMPLEMENTATION.md) has the roadmap.
+
+## Run it
 
 Requires Rust stable (developed on 1.97.1; MSRV 1.89) and a kubeconfig.
 
@@ -45,27 +67,13 @@ It connects to the `current-context` on start; the sidebar lists every context
 and every kind the cluster serves. Prefer `--release`: debug builds miss the
 cold-start budget by a wide margin (`docs/LIMITATIONS.md`).
 
-For a real application bundle on macOS:
+Its own logs go to a daily-rotating file under the platform's application data
+directory; the path is printed in the log's first line and shown by `--verbose`.
+If it cannot start at all — a malformed `settings.toml`, most likely — it says
+so in a window rather than dying silently, unless you ran it from a terminal, in
+which case the error is on stderr where you are already looking.
 
-```sh
-packaging/macos/bundle.sh      # -> target/bundle/Periscope.app and Periscope.dmg
-```
-
-On Linux:
-
-```sh
-cargo deb --package scope            # -> target/debian/periscope_<version>_<arch>.deb
-cargo generate-rpm -p crates/scope   # -> target/generate-rpm/periscope-<version>.rpm
-```
-
-Both install `scope` to `/usr/bin`, a desktop entry and an icon; CI builds them,
-installs the `.deb` and validates the desktop entry on every change.
-
-The bundle is **unsigned** unless `PERISCOPE_CODESIGN_IDENTITY` and
-`PERISCOPE_NOTARY_PROFILE` are set, so on a machine other than the one that
-built it Gatekeeper refuses to open it until you right-click and choose Open.
-There is no Developer ID behind this project yet; `docs/LIMITATIONS.md` is
-explicit about what that costs.
+## The keyboard
 
 | Key | Does |
 |---|---|
@@ -83,101 +91,6 @@ explicit about what that costs.
 The single-letter keys are k9s's, and they only fire when no text field has
 focus — typing `l` into the namespace filter types an `l`. All of them are
 remappable; see Settings below.
-
-Logs are written to a daily-rotating file under the platform's application data
-directory; the path is printed in the log's first line and shown by `--verbose`.
-
-## Layout
-
-```
-crates/
-├── scope/     binary: flags, window setup, wiring
-├── ui/        GPUI views and components          (main thread only)
-├── store/     state, indexes, filtering          (no GPUI, no kube)
-├── cluster/   kube clients, watchers, logs       (tokio only)
-├── bridge/    tokio <-> GPUI plumbing (the pump is an optional feature)
-└── config/    paths, settings, themes, logging   (no GPUI, no kube)
-```
-
-The dependency edges are the architecture: `store`, `cluster` and `config` cannot
-reach GPUI — the one file in `bridge` that does is behind a feature only `ui` and
-`scope` enable — and `ui` cannot reach Kubernetes. Everything crossing between them
-goes through `bridge` as a bounded, coalesced message stream.
-
-## Development
-
-Every change must leave these green:
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
-```
-
-Anything touching a credential, a log line or a file on disk also has to leave
-these green. They are not installed by default:
-
-```sh
-cargo install cargo-audit cargo-deny --locked
-cargo test -p periscope-guardrails   # the invariants no type can express
-cargo audit                          # RUSTSEC advisories against Cargo.lock
-cargo deny check                     # licences, unmaintained crates, duplicates
-```
-
-The runners have no kubeconfig, no cluster and no keychain, so anything that
-reaches for one passes here and fails there. Prove it before pushing:
-
-```sh
-mkdir -p /tmp/no-kubeconfig-home
-env -u KUBECONFIG HOME=/tmp/no-kubeconfig-home \
-    CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup cargo test --workspace
-```
-
-The YAML the detail pane shows is pinned by golden files in
-`crates/cluster/tests/golden/`: a JSON object, and the exact text it must render
-as. After a deliberate change to the writer, rewrite them and read the diff —
-an expectation updated without being read records the bug instead of catching
-it.
-
-```sh
-PERISCOPE_UPDATE_GOLDEN=1 cargo test -p periscope-cluster --test golden
-```
-
-The end-to-end suite needs a real cluster, so `cargo test` skips it:
-
-```sh
-kind create cluster --name periscope
-cargo test -p periscope-e2e -- --ignored --test-threads 1
-cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fixture
-```
-
-CI runs it on every push against a `kind` cluster seeded with 10,000 pods,
-cert-manager, Argo CD and our own `widgets` CRD, with
-`PERISCOPE_E2E_REQUIRE_FIXTURES=1` so that a missing fixture fails the build
-instead of silently skipping fifteen tests.
-
-### Documentation
-
-| Document | For |
-|---|---|
-| [`AGENTS.md`](AGENTS.md) | Anyone changing this repository, human or otherwise — the invariants, the loop, the traps |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | How the six crates fit together, and where a new feature goes |
-| [`docs/STYLE.md`](docs/STYLE.md) | How the code, tests and commit messages are written |
-| [`docs/TESTING.md`](docs/TESTING.md) | The six kinds of test, and which one you need |
-| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Why things are the way they are. Append, never rewrite |
-| [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | What does not work, measured and unhidden |
-| [`docs/COMPETITORS.md`](docs/COMPETITORS.md) | What the rest of the field does, what its users complain about, and which of this project's bets that evidence does *not* support |
-
-To look at what you changed, on macOS:
-
-```sh
-cargo run --release --bin scope &
-cargo run --manifest-path tools/winid/Cargo.toml -- scope   # prints a window id
-screencapture -x -o -l<id> shot.png
-```
-
-That captures the application's window and nothing else on the display. See
-[`tools/winid/README.md`](tools/winid/README.md).
 
 ## Finding things
 
@@ -312,6 +225,37 @@ streaming — and the table reads *"Not allowed to list secrets here"* rather th
 "No secrets here.", which is a reassuring sentence and, for that user, a false
 one (ADR-0040).
 
+## Port forwards and commands
+
+A pod's detail pane has a port field and **Forward**: it binds a local port on
+`127.0.0.1` — never `0.0.0.0` — and the forwards panel shows the address to
+paste, how many connections it has served, and, if something breaks, the
+apiserver's own reason. Each connection gets its own stream, so one broken
+connection does not take the forward down; a port nothing is listening on is
+reported rather than accepted silently. Forwards outlive the pane that started
+them, which is why the panel is always reachable from the header.
+
+Next to it is a command field and **Run**. It runs one command in the pod and
+streams stdout and stderr into the output pane, labelled by stream, ending with
+the exit code. It is **not** a terminal: no interactive input, no `vi`, no
+`top`. The command line is split on whitespace and is not a shell — `sh -c "ls |
+wc -l"` is how you get one, and it runs in the container.
+
+A pod with more than one container also gets a container button, listing its
+containers and its init containers with **Default container** — the one the
+apiserver would pick, which is what `kubectl exec` uses without `-c` — at the
+top. The names come from the object the pane already fetched, so opening the
+list costs nothing. Whichever is chosen is named in the confirmation, because
+the same command in a sidecar and in the app are different acts.
+
+The output pane has the log view's filter box, its `.*` and `Aa` toggles, and
+its **Copy** and **Export** buttons, over the same bounded buffer: copying and
+exporting take what the filter left on screen, in the order it is on screen.
+
+Running a command is treated as a change, because it is: it needs the same
+confirmation, is refused on read-only clusters, and is written to the audit log
+with the command line as its detail.
+
 ## Settings
 
 `settings.toml` lives in the platform's config directory beside the log
@@ -403,37 +347,6 @@ are all that is in there — no server addresses, no namespaces, no object names
 nothing from a credential — and deleting the file simply starts a fresh session,
 which is also what happens if it is ever unreadable.
 
-## Port forwards and commands
-
-A pod's detail pane has a port field and **Forward**: it binds a local port on
-`127.0.0.1` — never `0.0.0.0` — and the forwards panel shows the address to
-paste, how many connections it has served, and, if something breaks, the
-apiserver's own reason. Each connection gets its own stream, so one broken
-connection does not take the forward down; a port nothing is listening on is
-reported rather than accepted silently. Forwards outlive the pane that started
-them, which is why the panel is always reachable from the header.
-
-Next to it is a command field and **Run**. It runs one command in the pod and
-streams stdout and stderr into the output pane, labelled by stream, ending with
-the exit code. It is **not** a terminal: no interactive input, no `vi`, no
-`top`. The command line is split on whitespace and is not a shell — `sh -c "ls |
-wc -l"` is how you get one, and it runs in the container.
-
-A pod with more than one container also gets a container button, listing its
-containers and its init containers with **Default container** — the one the
-apiserver would pick, which is what `kubectl exec` uses without `-c` — at the
-top. The names come from the object the pane already fetched, so opening the
-list costs nothing. Whichever is chosen is named in the confirmation, because
-the same command in a sidecar and in the app are different acts.
-
-The output pane has the log view's filter box, its `.*` and `Aa` toggles, and
-its **Copy** and **Export** buttons, over the same bounded buffer: copying and
-exporting take what the filter left on screen, in the order it is on screen.
-
-Running a command is treated as a change, because it is: it needs the same
-confirmation, is refused on read-only clusters, and is written to the audit log
-with the command line as its detail.
-
 ## Security posture
 
 No credentials are ever written to disk. No account, no activation, no login.
@@ -475,3 +388,117 @@ a masked Secret would send the mask.
 `docs/COMPETITORS.md` is blunt about which of these the evidence supports. The
 absence of an account is the best-supported decision in this project; masking by
 default is the one the market argues with.
+
+## Packaging
+
+For a real application bundle on macOS:
+
+```sh
+packaging/macos/bundle.sh      # -> target/bundle/Periscope.app and Periscope.dmg
+```
+
+On Linux:
+
+```sh
+cargo deb --package scope            # -> target/debian/periscope_<version>_<arch>.deb
+cargo generate-rpm -p crates/scope   # -> target/generate-rpm/periscope-<version>.rpm
+```
+
+Both install `scope` to `/usr/bin`, a desktop entry and an icon; CI builds them,
+installs the `.deb` and validates the desktop entry on every change.
+
+The bundle is **unsigned** unless `PERISCOPE_CODESIGN_IDENTITY` and
+`PERISCOPE_NOTARY_PROFILE` are set, so on a machine other than the one that
+built it Gatekeeper refuses to open it until you right-click and choose Open.
+There is no Developer ID behind this project yet; `docs/LIMITATIONS.md` is
+explicit about what that costs.
+
+## Working on it
+
+```
+crates/
+├── scope/     binary: flags, window setup, wiring
+├── ui/        GPUI views and components          (main thread only)
+├── store/     state, indexes, filtering          (no GPUI, no kube)
+├── cluster/   kube clients, watchers, logs       (tokio only)
+├── bridge/    tokio <-> GPUI plumbing (the pump is an optional feature)
+└── config/    paths, settings, themes, logging   (no GPUI, no kube)
+```
+
+The dependency edges are the architecture: `store`, `cluster` and `config` cannot
+reach GPUI — the one file in `bridge` that does is behind a feature only `ui` and
+`scope` enable — and `ui` cannot reach Kubernetes. Everything crossing between them
+goes through `bridge` as a bounded, coalesced message stream.
+
+Every change must leave these green:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets
+```
+
+Anything touching a credential, a log line or a file on disk also has to leave
+these green. They are not installed by default:
+
+```sh
+cargo install cargo-audit cargo-deny --locked
+cargo test -p periscope-guardrails   # the invariants no type can express
+cargo audit                          # RUSTSEC advisories against Cargo.lock
+cargo deny check                     # licences, unmaintained crates, duplicates
+```
+
+The runners have no kubeconfig, no cluster and no keychain, so anything that
+reaches for one passes here and fails there. Prove it before pushing:
+
+```sh
+mkdir -p /tmp/no-kubeconfig-home
+env -u KUBECONFIG HOME=/tmp/no-kubeconfig-home \
+    CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup cargo test --workspace
+```
+
+The YAML the detail pane shows is pinned by golden files in
+`crates/cluster/tests/golden/`: a JSON object, and the exact text it must render
+as. After a deliberate change to the writer, rewrite them and read the diff —
+an expectation updated without being read records the bug instead of catching
+it.
+
+```sh
+PERISCOPE_UPDATE_GOLDEN=1 cargo test -p periscope-cluster --test golden
+```
+
+The end-to-end suite needs a real cluster, so `cargo test` skips it:
+
+```sh
+kind create cluster --name periscope
+cargo test -p periscope-e2e -- --ignored --test-threads 1
+cargo run --release -p periscope-e2e --bin seed-pods -- --count 10000  # load fixture
+```
+
+CI runs it on every push against a `kind` cluster seeded with 10,000 pods,
+cert-manager, Argo CD and our own `widgets` CRD, with
+`PERISCOPE_E2E_REQUIRE_FIXTURES=1` so that a missing fixture fails the build
+instead of silently skipping fifteen tests.
+
+### Documentation
+
+| Document | For |
+|---|---|
+| [`AGENTS.md`](AGENTS.md) | Anyone changing this repository, human or otherwise — the invariants, the loop, the traps |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | How the six crates fit together, and where a new feature goes |
+| [`docs/STYLE.md`](docs/STYLE.md) | How the code, tests and commit messages are written |
+| [`docs/TESTING.md`](docs/TESTING.md) | The six kinds of test, and which one you need |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Why things are the way they are. Append, never rewrite |
+| [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | What does not work, measured and unhidden |
+| [`docs/COMPETITORS.md`](docs/COMPETITORS.md) | What the rest of the field does, what its users complain about, and which of this project's bets that evidence does *not* support |
+
+To look at what you changed, on macOS:
+
+```sh
+cargo run --release --bin scope &
+cargo run --manifest-path tools/winid/Cargo.toml -- scope   # prints a window id
+screencapture -x -o -l<id> shot.png
+```
+
+That captures the application's window and nothing else on the display. See
+[`tools/winid/README.md`](tools/winid/README.md).
