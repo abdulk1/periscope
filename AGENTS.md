@@ -207,8 +207,12 @@ which still refuses and still audits.
    document is the project's honesty, and it is worth more than the feature.
 2. `docs/DECISIONS.md` — append an ADR for anything a future reader would
    otherwise have to reverse-engineer. Append only; supersede, never rewrite.
-3. Commit with a message that explains the reasoning, not a changelog. Read
-   `git log` for the voice.
+3. Commit with a message that explains the reasoning, not a changelog. The
+   subject is a Conventional Commit — `fix(cluster): stop a 403 taking the whole
+   connection down` — and the body is prose. `tools/commit-lint` enforces the
+   subject, as a hook and again in CI; `git config core.hooksPath .githooks`
+   turns the hook on. Read `git log` for the voice, remembering that anything
+   before ADR-0048 has no prefix.
 
 ## Traps this project has already fallen into
 

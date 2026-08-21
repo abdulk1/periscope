@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+#
+# Checks one commit message against this project's convention.
+#
+# Reads the message from the file named as `$1`, or from stdin. Used by
+# `.githooks/commit-msg` before a commit is written and by the `commits` CI job
+# after one is pushed, so the rule is enforced in one place and stated once.
+#
+# The convention is Conventional Commits for the subject line and this
+# project's own prose style for everything below it. See `docs/STYLE.md` and
+# ADR-0048.
+
+set -euo pipefail
+
+types="feat|fix|perf|refactor|docs|test|build|ci|chore|revert"
+max_subject=72
+
+message="$(cat "${1:-/dev/stdin}")"
+
+# Comments are what `git commit` appends to the template; they are not the
+# message. Strip them before looking at anything.
+body="$(printf '%s\n' "$message" | grep -v '^#' || true)"
+subject="$(printf '%s\n' "$body" | sed -n '1p')"
+second="$(printf '%s\n' "$body" | sed -n '2p')"
+
+fail() {
+	echo "commit-lint: $1" >&2
+	echo >&2
+	echo "  subject: $subject" >&2
+	echo >&2
+	echo "Expected:  <type>(<scope>)?!?: <description>" >&2
+	echo "Types:     ${types//|/, }" >&2
+	echo "Scopes:    optional — a crate (ui, store, cluster, bridge, config, scope)," >&2
+	echo "           or an area (ci, e2e, packaging, guardrails)" >&2
+	echo >&2
+	echo "  fix(cluster): stop a 403 taking the whole connection down" >&2
+	echo "  docs: say why the mac build is unsigned" >&2
+	echo "  feat(ui)!: replace the detail pane's tabs" >&2
+	echo >&2
+	echo "The body stays prose: what changed on the first line, why underneath." >&2
+	echo "See docs/STYLE.md." >&2
+	exit 1
+}
+
+# A merge or a fixup is not ours to judge; git wrote it, or rebase will eat it.
+case "$subject" in
+Merge*|Revert*|fixup!*|squash!*) exit 0 ;;
+esac
+
+[ -n "$subject" ] || fail "the message is empty"
+
+if ! printf '%s' "$subject" | grep -Eq "^($types)(\([a-z0-9._-]+\))?!?: .+"; then
+	fail "the subject does not start with a conventional-commit type"
+fi
+
+if [ "${#subject}" -gt "$max_subject" ]; then
+	fail "the subject is ${#subject} characters; the limit is $max_subject"
+fi
+
+case "$subject" in
+*.) fail "the subject ends with a full stop" ;;
+esac
+
+# Only checked when there *is* a body: a one-line commit is allowed, and is the
+# right shape for something genuinely trivial.
+if [ -n "$(printf '%s\n' "$body" | sed -n '3,$p' | tr -d '[:space:]')" ] && [ -n "$second" ]; then
+	fail "the subject and the body need a blank line between them"
+fi
+
+exit 0

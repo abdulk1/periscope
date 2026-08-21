@@ -1518,3 +1518,39 @@ Also unsigned: the Windows artifact carries no Authenticode signature, so
 SmartScreen will warn. That is the same shape of problem the macOS bundle had
 until this week, and the same kind of purchase fixes it.
 
+## ADR-0048 — Conventional Commits for the subject, prose for the body
+
+**Date:** 2026-08-21
+**Status:** Accepted, amending the commit convention in `docs/STYLE.md`
+
+Commit subjects are now `type(scope): description`. The body is unchanged.
+
+The two conventions were easy to mistake for rivals. `docs/STYLE.md` asked for
+"prose, in full sentences, explaining the reasoning — not a changelog", and
+Conventional Commits is a machine-readable prefix, which sounds like exactly the
+changelog-shaped thing that rule was written against. They are not in tension,
+because they govern different lines: the prefix classifies, and the body still
+has to argue. `fix(cluster): stop a 403 taking the whole connection down`
+carries both.
+
+What it buys is small and real: `git log --grep '^fix'` answers a question that
+previously needed reading every subject, release notes can be generated rather
+than assembled by hand — the release workflow already passes `--generate-notes`
+— and the type is a prompt to be honest about what a change is. A `feat` that
+is really a `fix` reads wrong to its own author.
+
+Enforced by `tools/commit-lint`, which is one script used twice: by
+`.githooks/commit-msg` before a commit is written, and by the `commits` CI job
+after one is pushed. One place to state the rule means the hook and CI cannot
+drift apart, and the CI half means a clone that never ran
+`git config core.hooksPath .githooks` still cannot land a bad subject.
+
+**History is not rewritten and is not validated.** Every commit before this ADR
+was correct under the rule in force when it was written, and the CI job only
+looks at the commits a push adds. A repository that fails its own linter on its
+own history teaches people to ignore the linter.
+
+The linter deliberately does not check the description's capitalisation. That is
+the kind of rule that generates argument and catches nothing; the length limit,
+the type, and the blank line before the body all catch real mistakes.
+

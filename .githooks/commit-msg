@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+#
+# Checks the message before the commit is written. Enable it once, per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# `tools/commit-lint` holds the rule; this exists only to point git at it, so
+# the hook and the CI job can never disagree about what is allowed.
+
+set -euo pipefail
+exec "$(dirname "$0")/../tools/commit-lint" "$1"

@@ -295,6 +295,48 @@ jobs:
           path: target/release/scope.exe
           if-no-files-found: error
 
+  commits:
+    name: commit messages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The range below needs the history either end of it.
+          fetch-depth: 0
+
+      # Only the commits this event actually added. The convention started at
+      # ADR-0048 and everything before it predates the rule, so validating the
+      # whole history would fail on work that was correct when it was written.
+      - name: Check the messages
+        run: |
+          set -euo pipefail
+
+          case "${{ github.event_name }}" in
+            pull_request)
+              range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+              ;;
+            *)
+              before="${{ github.event.before }}"
+              # All zeros on a branch's first push, and a force-push can leave
+              # a ref that is no longer reachable. Either way, judge the tip.
+              if [[ "$before" =~ ^0+$ ]] || ! git cat-file -e "$before^{commit}" 2>/dev/null; then
+                range="${{ github.sha }}~1..${{ github.sha }}"
+              else
+                range="$before..${{ github.sha }}"
+              fi
+              ;;
+          esac
+
+          echo "checking $range"
+          failed=0
+          for sha in $(git rev-list --no-merges "$range"); do
+            if ! git log -1 --format=%B "$sha" | tools/commit-lint; then
+              echo "  ...in $(git log -1 --format='%h' "$sha")" >&2
+              failed=1
+            fi
+          done
+          exit "$failed"
+
   security:
     name: security
     runs-on: ubuntu-latest

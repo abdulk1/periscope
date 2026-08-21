@@ -128,15 +128,41 @@ The audience is an SRE who wants the underlying text, not a summary.
 
 ## Commit messages
 
-Prose, in full sentences, explaining the reasoning. Not a changelog, not a list
-of files. The first line is what changed, in the imperative. The body answers
-"why was this worth doing" and, when something was found on the way, says so
-plainly — the defects found while building a feature are the most valuable part
-of the message.
+The subject line is a Conventional Commit. Everything below it is prose.
 
-Look at `git log` before writing one. A good example:
+```
+<type>(<scope>)?!?: <description>
 
-> **Give CI the fixtures the tests were quietly assuming**
+<why this was worth doing, in full sentences>
+```
+
+`<type>` is one of `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`,
+`ci`, `chore`, `revert`. `<scope>` is optional and is a crate (`ui`, `store`,
+`cluster`, `bridge`, `config`, `scope`) or an area (`ci`, `e2e`, `packaging`,
+`guardrails`). A `!` before the colon marks a breaking change. The subject is at
+most 72 characters, imperative, and does not end with a full stop.
+
+`tools/commit-lint` is the rule. Enable it once per clone and it runs before
+each commit is written:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+CI checks the same thing on the commits a push adds, so a clone without the
+hook cannot get around it.
+
+The body is unchanged and is the part that matters: prose, in full sentences,
+explaining the reasoning. Not a changelog, not a list of files. It answers "why
+was this worth doing" and, when something was found on the way, says so plainly
+— the defects found while building a feature are the most valuable part of the
+message. A genuinely trivial change may be a subject alone; most are not.
+
+Look at `git log` before writing one — noting that everything before ADR-0048
+has no type prefix, because the convention started there. A good example, with
+the prefix it would carry today:
+
+> **ci: give CI the fixtures the tests were quietly assuming**
 >
 > The first CI run failed two jobs, and both were the same mistake in different
 > places: tests depending on state that only ever existed on the machine they

@@ -471,6 +471,12 @@ reach GPUI — the one file in `bridge` that does is behind a feature only `ui` 
 `scope` enable — and `ui` cannot reach Kubernetes. Everything crossing between them
 goes through `bridge` as a bounded, coalesced message stream.
 
+First, once per clone, so commit messages are checked before they are written:
+
+```sh
+git config core.hooksPath .githooks
+```
+
 Every change must leave these green:
 
 ```sh
