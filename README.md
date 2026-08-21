@@ -20,9 +20,10 @@ It requires no account, phones nothing home, and writes no credential to disk.
 
 ## Status
 
-**There is no release to download yet.** You build it from source, and on macOS
-the bundle is unsigned. That is the honest headline; everything below is what
-you get once you have.
+**There is no release to download yet** — you build it from source. The macOS
+bundle is signed and notarized when built with a Developer ID, so once there is
+a release it will open without a Gatekeeper warning; there just isn't one to
+download yet.
 
 Phases 0 through 5 — the console itself — are built and tested. Phase 6,
 packaging and distribution, is what remains.
@@ -39,9 +40,8 @@ k9s-style keymap. An opt-in update check. A macOS `.app` and `.dmg`, Debian and
 RPM packages. Windows builds and passes its tests in CI, though nobody has
 opened the window there.
 
-**Not built:** code signing and notarization — the scripts are written and there
-is no Developer ID to run them with — a Homebrew cask, an AppImage, screenshots,
-and a describe-style summary. Exec runs a command and streams its output; it is
+**Not built:** a Homebrew cask, an AppImage, screenshots, and a describe-style
+summary. Exec runs a command and streams its output; it is
 not a terminal, and ADR-0033 argues that half a terminal is worse than none.
 
 **Not proven:** a real EKS or GKE handshake, and the app running on a Linux

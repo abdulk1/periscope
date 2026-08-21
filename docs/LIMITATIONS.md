@@ -27,14 +27,22 @@ paints. CI builds it on every change and keeps the disk image as an artifact.
 
 What is **not** there:
 
-- **Signing and notarisation.** The script does both when
-  `PERISCOPE_CODESIGN_IDENTITY` and `PERISCOPE_NOTARY_PROFILE` are set, and
-  neither has ever run, because there is no Apple Developer ID to sign with.
-  Every build produced so far is unsigned, which means Gatekeeper refuses it on
-  any machine but the one that built it until someone right-clicks and chooses
-  Open. The two-minute install in Phase 6's acceptance criteria is **not met**
-  for a stranger on macOS today, and no amount of code fixes that — it needs a
-  paid developer account.
+- ~~**Signing and notarisation.**~~ Done, 2026-08-20. Both the app and the disk
+  image are signed with a Developer ID, notarised by Apple, and have the ticket
+  stapled, so they open with no warning and without needing the network:
+
+  ```
+  Periscope.app: accepted   source=Notarized Developer ID
+  Periscope.dmg: accepted   source=Notarized Developer ID
+  ```
+
+  Checked against a copy carrying the `com.apple.quarantine` attribute a
+  download would give it, which is the condition a stranger actually hits.
+
+  What is still missing is a *release* — nothing is published for anyone to
+  download, so the two-minute install in Phase 6's acceptance criteria is still
+  **not met**. That is now a tag and a CI job rather than anything about
+  signing.
 - **A Homebrew cask.** Nothing is published anywhere to point one at.
 - **AppImage.** `.deb` and `.rpm` are built and checked by CI — the deb is
   installed, its paths verified and its desktop entry validated on every change
@@ -87,8 +95,9 @@ actually runs, which by default is never.
 
 The bundle's first launch is dominated by Gatekeeper scanning a binary it has
 never seen, which is a one-off per build and not something the app can affect.
-A signed and notarised build avoids most of it; this has not been measured,
-because there is no Developer ID to sign with (see below).
+A signed and notarised build carries a stapled ticket and should avoid most of
+it. That has not been re-measured since signing started working, so the 1385ms
+figure above is still the unsigned one.
 
 The <500ms budget in `IMPLEMENTATION.md` §4 is met comfortably by release builds
 and **missed by debug builds**, which are what `cargo run` produces. The budget is

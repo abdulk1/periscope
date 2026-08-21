@@ -85,6 +85,16 @@ ln -s /Applications "$staging/Applications"
 hdiutil create -volname "Periscope" -srcfolder "$staging" -ov -format UDZO "$dmg" >/dev/null
 rm -rf "$staging"
 
+# The disk image gets signed too, not only the app inside it. Stapling a
+# notarisation ticket to an unsigned image leaves `spctl -t open` reporting
+# "no usable signature" for the very file people download, even though the app
+# within it is accepted — so the thing being judged on first contact is the
+# thing that was never signed.
+if [[ -n "${PERISCOPE_CODESIGN_IDENTITY:-}" ]]; then
+	echo "==> signing the disk image"
+	codesign --force --timestamp --sign "$PERISCOPE_CODESIGN_IDENTITY" "$dmg"
+fi
+
 if [[ -n "${PERISCOPE_NOTARY_PROFILE:-}" ]]; then
 	echo "==> notarising (this waits for Apple)"
 	xcrun notarytool submit "$dmg" --keychain-profile "$PERISCOPE_NOTARY_PROFILE" --wait
