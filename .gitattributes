@@ -1,0 +1,19 @@
+# Line endings are LF everywhere, including on Windows checkouts.
+#
+# This is not a style preference. `crates/cluster/tests/golden/` holds
+# byte-exact expectations for the YAML writer, compared against what the
+# renderer produces — and the renderer emits `\n` on every platform. Git for
+# Windows converts text files to CRLF on checkout by default, so those fixtures
+# arrived with `\r\n` and every golden test failed with an "expected" and a
+# "rendered" block that were identical to look at.
+#
+# Normalising in the test would have hidden the difference instead of fixing it,
+# and would have hidden a real stray `\r` in the output along with it.
+* text=auto eol=lf
+
+# Never touched: no line-ending conversion, no diffing as text.
+*.png binary
+*.icns binary
+*.dmg binary
+*.p12 binary
+*.p8 binary
