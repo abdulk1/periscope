@@ -18,6 +18,44 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+/// Splits a PascalCase name into its words.
+///
+/// A capital starts a word, except inside a run of them: `CSIDriver` is
+/// `["CSI", "Driver"]`, not five words. `PodDisruptionBudget` is three.
+fn split_pascal_case(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut words = Vec::new();
+    let mut word = String::new();
+
+    for (at, &c) in chars.iter().enumerate() {
+        let starts_word = at > 0
+            && c.is_uppercase()
+            // ...either after a lowercase — `podDisruption` — or as the last
+            // capital of a run that is starting a new word: `CSIDriver`.
+            && (!chars[at - 1].is_uppercase()
+                || chars.get(at + 1).is_some_and(|next| next.is_lowercase()));
+
+        if starts_word && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        word.push(c);
+    }
+
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// Upper-cases the first character and leaves the rest alone.
+fn capitalise(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Identifies an object within a cluster.
 ///
 /// Ordered by namespace then name, which is the order tables render in, so a
@@ -102,6 +140,48 @@ impl KindId {
         } else {
             format!("{}.{}", self.plural, self.group)
         }
+    }
+
+    /// The plural, spaced and title-cased, for a person to read.
+    ///
+    /// `networkpolicies` becomes `Network Policies` and
+    /// `horizontalpodautoscalers` becomes `Horizontal Pod Autoscalers`. The
+    /// run-together lowercase plural is what `kubectl` takes and what this
+    /// program is keyed by — see [`KindId::label`], which is the identity and
+    /// must not change — but it is not a name anybody reads comfortably in a
+    /// list, and the consoles this project's sidebar is modelled on do not ask
+    /// them to.
+    ///
+    /// The word boundaries come from `kind`, which the apiserver already gives
+    /// us in PascalCase, and the *last* word comes from `plural`, which is the
+    /// only authority on how a kind pluralises — `Ingress` becomes `Ingresses`
+    /// and `Endpoints` stays `Endpoints`, and no rule of ours would get both
+    /// right. Everything before the last word is identical in the two, so the
+    /// boundaries transfer.
+    ///
+    /// A kind whose plural is not built from its name — nothing in the wild,
+    /// but a CRD may say anything — falls back to the plural untouched.
+    pub fn title(&self) -> String {
+        let words = split_pascal_case(&self.kind);
+        let mut out = String::with_capacity(self.plural.len() + words.len());
+        let mut rest: &str = &self.plural;
+
+        for word in words.iter().take(words.len().saturating_sub(1)) {
+            let lower = word.to_lowercase();
+            match rest.strip_prefix(&lower) {
+                Some(remainder) => {
+                    out.push_str(word);
+                    out.push(' ');
+                    rest = remainder;
+                }
+                // The plural stopped matching the name; anything further would
+                // be invention.
+                None => return capitalise(&self.plural),
+            }
+        }
+
+        out.push_str(&capitalise(rest));
+        out
     }
 
     /// `apiVersion` as it appears on an object.
@@ -315,6 +395,43 @@ mod tests {
             state: RowState::Healthy,
             created: None,
         }
+    }
+
+    #[test]
+    fn a_kind_reads_as_words() {
+        let title = |kind: &str, plural: &str| KindId::new("", "v1", kind, plural).title();
+
+        // The ordinary case, and the reason for doing this at all.
+        assert_eq!(
+            title("NetworkPolicy", "networkpolicies"),
+            "Network Policies"
+        );
+        assert_eq!(
+            title("HorizontalPodAutoscaler", "horizontalpodautoscalers"),
+            "Horizontal Pod Autoscalers"
+        );
+        assert_eq!(
+            title("PodDisruptionBudget", "poddisruptionbudgets"),
+            "Pod Disruption Budgets"
+        );
+        assert_eq!(
+            title("ControllerRevision", "controllerrevisions"),
+            "Controller Revisions"
+        );
+
+        // Pluralisation comes from the apiserver, because no rule of ours
+        // would get all of these right.
+        assert_eq!(title("Ingress", "ingresses"), "Ingresses");
+        assert_eq!(title("Endpoints", "endpoints"), "Endpoints");
+        assert_eq!(title("Pod", "pods"), "Pods");
+
+        // A run of capitals is one word.
+        assert_eq!(title("CSIDriver", "csidrivers"), "CSI Drivers");
+        assert_eq!(title("APIService", "apiservices"), "API Services");
+
+        // A CRD may name its plural anything at all; inventing word breaks for
+        // one we cannot parse would be worse than leaving it alone.
+        assert_eq!(title("Widget", "gadgets"), "Gadgets");
     }
 
     #[test]

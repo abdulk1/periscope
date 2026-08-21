@@ -125,12 +125,16 @@ impl Palette {
         }
 
         for info in kinds {
+            // The readable name is what the sidebar shows, and the fuzzy match
+            // is a subsequence — so `networkpolicies`, typed out of `kubectl`
+            // habit, still finds `Network Policies`. The API name goes in the
+            // detail line, where it is both visible and searchable.
             self.candidates.push(Candidate {
-                label: info.id.label(),
+                label: info.id.title(),
                 detail: if info.custom {
-                    format!("custom resource · {}", info.id.kind)
+                    format!("custom resource · {}", info.id.label())
                 } else {
-                    info.id.kind.to_string()
+                    info.id.label()
                 },
                 target: Target::Kind(info.id.clone()),
             });
@@ -284,20 +288,21 @@ mod tests {
 
         assert_eq!(found[0], "prod");
         assert_eq!(found[1], "staging");
-        assert_eq!(found[2], "pods");
+        assert_eq!(found[2], "Pods");
         assert!(found.contains(&"default/api-0".to_owned()));
     }
 
     #[test]
     fn an_exact_kind_name_ranks_above_a_longer_one_containing_it() {
         let mut palette = palette();
+        // Typed the way `kubectl` spells it, which is the habit this has to
+        // keep serving now that the list reads `Pods`.
         let found = labels(&palette.search("pods"));
 
-        // Both match; `pods` is what the user meant. Kinds outside the core
-        // group carry their group, exactly as `kubectl` names them.
-        assert_eq!(found[0], "pods");
+        // Both match; `Pods` is what the user meant.
+        assert_eq!(found[0], "Pods");
         assert!(
-            found.contains(&"podsecuritypolicies.policy".to_owned()),
+            found.contains(&"Pod Security Policies".to_owned()),
             "{found:?}"
         );
     }
@@ -326,13 +331,13 @@ mod tests {
         let mut palette = palette();
         // The way people actually type: initials of the words they remember.
         assert!(
-            labels(&palette.search("dep")).contains(&"deployments.apps".to_owned()),
+            labels(&palette.search("dep")).contains(&"Deployments".to_owned()),
             "dep should reach deployments"
         );
         assert!(
             labels(&palette.search("aplctns"))
                 .iter()
-                .any(|label| label.starts_with("applications")),
+                .any(|label| label.starts_with("Applications")),
             "initials should reach applications"
         );
     }
@@ -367,6 +372,7 @@ mod tests {
         let found = palette.search("api-0");
         // The pane is on `prod`; saying so on every line would be noise.
         assert_eq!(found[0].candidate.detail, "pods");
+        assert_eq!(found[0].candidate.label, "default/api-0");
     }
 
     #[test]
@@ -374,7 +380,15 @@ mod tests {
         let mut palette = palette();
         let found = palette.search("applications");
         assert!(found[0].candidate.detail.contains("custom"), "{found:?}");
-        assert_eq!(found[0].candidate.label, "applications.argoproj.io");
+        // Read as words, with the API name kept in the detail line.
+        assert_eq!(found[0].candidate.label, "Applications");
+        assert!(
+            found[0]
+                .candidate
+                .detail
+                .contains("applications.argoproj.io"),
+            "{found:?}"
+        );
     }
 
     #[test]

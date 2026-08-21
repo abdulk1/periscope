@@ -257,7 +257,11 @@ fn empty_message(
 }
 
 fn matches_filter(info: &periscope_bridge::KindInfo, filter: &str) -> bool {
-    filter.is_empty() || info.id.label().to_lowercase().contains(filter)
+    // Both names match: `networkpolicies` is what people type because it is
+    // what `kubectl` takes, and `network policies` is what they now see.
+    filter.is_empty()
+        || info.id.label().to_lowercase().contains(filter)
+        || info.id.title().to_lowercase().contains(filter)
 }
 
 /// The server-side filters a watch was started with.
@@ -2629,9 +2633,13 @@ impl Workspace {
             if open {
                 for info in matching {
                     let selected = current_kind.as_ref() == Some(&info.id);
-                    // The full label here: there is no group heading above a
-                    // recents list to say which `certificates` this is.
-                    sections.push(self.kind_row(info, "recent", info.id.label(), selected, cx));
+                    // There is no group heading above a recents list to say
+                    // which `Certificates` this is, so the group comes along.
+                    let label = match info.id.is_core() {
+                        true => info.id.title(),
+                        false => format!("{} · {}", info.id.title(), info.id.group),
+                    };
+                    sections.push(self.kind_row(info, "recent", label, selected, cx));
                 }
             }
         }
@@ -2665,13 +2673,7 @@ impl Workspace {
                 let selected = current_kind.as_ref() == Some(&info.id);
                 // Inside a section the group is the heading, so the plural
                 // alone reads better than `deployments.apps`.
-                sections.push(self.kind_row(
-                    info,
-                    "kind",
-                    info.id.plural.to_string(),
-                    selected,
-                    cx,
-                ));
+                sections.push(self.kind_row(info, "kind", info.id.title(), selected, cx));
             }
         }
 
