@@ -20,35 +20,41 @@ It requires no account, phones nothing home, and writes no credential to disk.
 
 ## Status
 
-**There is no release to download yet** — you build it from source. The macOS
-bundle is signed and notarized when built with a Developer ID, so once there is
-a release it will open without a Gatekeeper warning; there just isn't one to
-download yet.
+**No release to download yet** — for now you build it from source, and the
+[Run it](#run-it) section is two commands. Cutting the first release is the last
+thing standing between this and an install anyone can do; everything it needs is
+built and proven.
 
-Phases 0 through 5 — the console itself — are built and tested. Phase 6,
-packaging and distribution, is what remains.
+Phases 0 through 5 — the console itself — are done. Phase 6 is packaging.
 
-**Built:** browsing every kind a cluster serves, custom resources included, with
-the columns their own definitions declare; a virtualised table that streams;
-clusters that stay warm so switching back is instant; a fuzzy palette (⌘K) that
-searches every warm cluster at once; merged log tailing across a selector; two
-clusters side by side; delete, scale, restart, cordon, drain, apply-with-dry-run,
-port-forwarding and running a command in a container — each behind a confirmation
-naming the cluster, two independent read-only gates, and a local audit log. A
-`settings.toml` covering theme, access, limits, columns and a fully remappable
-k9s-style keymap. An opt-in update check. A macOS `.app` and `.dmg`, Debian and
-RPM packages. Windows builds and passes its tests in CI, though nobody has
-opened the window there.
+**Works.** Browsing every kind a cluster serves, custom resources included, with
+the columns their own definitions declare. A virtualised table that streams as
+the cluster changes. Clusters stay warm, so switching back is instant. A fuzzy
+palette (⌘K) that searches every warm cluster at once. Merged log tailing across
+a label selector. Two clusters side by side. Delete, scale, restart, cordon,
+drain, apply-with-dry-run, port-forwarding and running a command in a container
+— each behind a confirmation naming the cluster and the object, two independent
+read-only gates, and a local audit log. A `settings.toml` covering theme,
+access, limits, columns and a fully remappable k9s-style keymap. An opt-in
+update check.
 
-**Not built:** a Homebrew cask, an AppImage, screenshots, and a describe-style
-summary. Exec runs a command and streams its output; it is
-not a terminal, and ADR-0033 argues that half a terminal is worse than none.
+**Packaging.** A macOS `.app` and `.dmg`, signed with a Developer ID and
+notarised by Apple, so they open with no warning. Debian and RPM packages, and a
+Windows build — both unsigned, so Windows will show a SmartScreen warning until
+that changes. macOS, Linux and Windows all gate CI.
 
-**Not proven:** a real EKS or GKE handshake, and the app running on a Linux
-desktop. Each is listed in
-[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), which is where this project keeps
-its honesty and is worth reading before you rely on anything here.
+**Missing.** A Homebrew cask, an AppImage, screenshots, and a describe-style
+summary of an object. Exec runs a command and streams its output but is not a
+terminal — ADR-0033 argues that half a terminal is worse than none.
 
+**Built but not witnessed.** Nobody has opened the window on Linux or on
+Windows; CI builds both and runs every test that does not need a display. Nobody
+has run it against a real EKS or GKE cluster, though the credential-plugin path
+those depend on is tested against the real `aws eks get-token`.
+
+[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) is where this project keeps its
+honesty — every gap above and a good many smaller ones, each measured rather
+than estimated. Read it before relying on anything here.
 [`IMPLEMENTATION.md`](IMPLEMENTATION.md) has the roadmap.
 
 ## Run it
@@ -391,7 +397,22 @@ default is the one the market argues with.
 
 ## Packaging
 
-For a real application bundle on macOS:
+A `v*` tag is what produces something to download.
+`.github/workflows/release.yml` builds a signed and notarised `.dmg`, a `.deb`,
+an `.rpm`, a Linux tarball and a Windows `.zip`, checksums them, and attaches
+them to a GitHub release. It also runs on `workflow_dispatch`, which builds
+every artifact and publishes nothing — that is how to exercise a change to it
+without inventing a tag.
+
+Signing needs three secrets the repository does not and must never contain:
+`MACOS_CERTIFICATE` (a Developer ID `.p12`, base64-encoded) with
+`MACOS_CERTIFICATE_PASSWORD` and `MACOS_SIGNING_IDENTITY`, plus `NOTARY_KEY`
+(an App Store Connect `.p8`, base64-encoded), `NOTARY_KEY_ID` and
+`NOTARY_ISSUER`. An App Store Connect key rather than an app-specific password,
+because the password's prompt cannot be answered on a runner. Without them the
+release still builds, and says plainly that it is unsigned.
+
+To build the same artifacts by hand, on macOS:
 
 ```sh
 packaging/macos/bundle.sh      # -> target/bundle/Periscope.app and Periscope.dmg
@@ -407,11 +428,14 @@ cargo generate-rpm -p crates/scope   # -> target/generate-rpm/periscope-<version
 Both install `scope` to `/usr/bin`, a desktop entry and an icon; CI builds them,
 installs the `.deb` and validates the desktop entry on every change.
 
-The bundle is **unsigned** unless `PERISCOPE_CODESIGN_IDENTITY` and
-`PERISCOPE_NOTARY_PROFILE` are set, so on a machine other than the one that
-built it Gatekeeper refuses to open it until you right-click and choose Open.
-There is no Developer ID behind this project yet; `docs/LIMITATIONS.md` is
-explicit about what that costs.
+Set `PERISCOPE_CODESIGN_IDENTITY` to a Developer ID Application identity and
+`PERISCOPE_NOTARY_PROFILE` to an `xcrun notarytool store-credentials` profile,
+and the script signs the app *and* the disk image, notarises, and staples the
+ticket to both — so they open with no warning and without needing the network.
+Leave them unset and it builds an unsigned bundle and says so, which Gatekeeper
+will refuse on any machine but the one that built it.
+
+The Windows artifact is unsigned, and SmartScreen warns accordingly.
 
 ## Working on it
 

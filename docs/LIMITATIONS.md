@@ -16,8 +16,8 @@ on a screen reader should use `kubectl` or `k9s` instead.
 |---|---|
 | macOS (Apple silicon) | Developed and smoke-tested here |
 | macOS (Intel) | Should work; untested |
-| Linux (X11/Wayland) | Builds in CI, and `.deb`/`.rpm` install cleanly there; not smoke-tested against a display |
-| Windows | Builds and runs the store, config and bridge tests in CI, and passes. Never launched, never seen; the file-permission hardening is `#[cfg(unix)]` and does nothing there (not a launch blocker) |
+| Linux (X11/Wayland) | Clippy and the whole suite run in CI, and `.deb`/`.rpm` install cleanly there; never opened against a display |
+| Windows | A supported platform since ADR-0047: clippy and the whole test suite run there and gate a release. Never launched, never seen, and the file-permission hardening does nothing there — see below |
 
 ## Packaging
 
@@ -48,18 +48,33 @@ What is **not** there:
   installed, its paths verified and its desktop entry validated on every change
   — but no Linux package has ever been *run*, because no CI runner here has a
   display. Treat "it installs" as proven and "it works" as untested.
-- **Windows.** A CI job builds it and runs the windowless tests, and it is
-  marked non-blocking because Phase 6 says Windows must not gate a release. It
-  has never been run on a Windows machine, and whether GPUI's DirectX backend
-  and the TLS stack build there at all is a question that job exists to answer.
+- **Windows, as a running program, and as a signed one.** It builds, clippy is
+  clean, and the whole test suite passes — all gating, since ADR-0047 made
+  Windows a supported platform. Nobody has opened the window on it. The release
+  artifact is an unsigned `.zip`, so SmartScreen will warn until it carries an
+  Authenticode signature; that is the same problem the macOS bundle had until a
+  Developer ID fixed it, and the same kind of purchase fixes it.
+- **File permissions on Windows.** `periscope_config::paths::restrict` is
+  `#[cfg(unix)]`. On Unix `audit.log`, `state.toml` and exported log buffers are
+  `0600` and their directories `0700`; on Windows they inherit whatever the
+  parent directory grants. Every other security invariant holds on both — the
+  redaction, the two write gates, the audit trail, no credential on disk — but
+  this one is Unix-only, and it stopped being a footnote when Windows stopped
+  being a non-goal.
 - **Screenshots and a demo GIF.** Phase 6 asks for both in the README and
   neither is there. Capturing only the app's window needs either accessibility
   permission — denied in this environment — or a human; capturing the whole
   screen would put whatever else is open into the repository. This is the one
   Phase 6 item that needs a person rather than more code.
-- **A published release to update *to*.** The opt-in update check is built and
+- **A published release.** `.github/workflows/release.yml` builds everything a
+  `v*` tag needs — a signed and notarised dmg, `.deb`, `.rpm`, a Linux tarball
+  and a Windows zip, checksummed and attached — and no tag has been pushed, so
+  nothing is published. This is the single thing standing between the project
+  and the "install and connect in under two minutes" acceptance criterion.
+
+  It has a consequence that reads like a separate bug: the opt-in update check
   works — verified against the real GitHub API, which parsed and compared a live
-  release — but the default endpoint is this repository, which has no releases,
+  release — but its default endpoint is this repository, which has no releases,
   so out of the box it logs a 404 and says nothing. It notices new versions; it
   has never had one to notice. It also only ever *reports*: no download, no
   install, and no self-replacement, which is the "no silent updates" half of the
