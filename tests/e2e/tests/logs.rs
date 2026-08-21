@@ -354,9 +354,24 @@ fn a_firehose_is_ingested_at_rate_and_stays_bounded() {
         rate >= budget,
         "ingested only {rate:.0} lines/s; the budget is {budget:.0}"
     );
-    // Bounded is the point: the ring must hold at its cap however much arrives.
+    // Bounded is the point, and this holds however little or much arrives.
     assert!(buffer.len() <= 50_000, "the ring grew past its capacity");
-    assert!(buffer.dropped() > 0, "the ring never had to evict");
+
+    // Eviction can only be observed if more than the ring's capacity actually
+    // turned up, and that depends on how much of the machine the producer got —
+    // one CI run delivered 49,735 lines into a 50,000-line ring and evicted
+    // nothing, which said nothing about the ring.
+    //
+    // That the ring evicts, counts what it dropped, and keeps the filtered and
+    // sorted views consistent while doing it, is proven deterministically and
+    // without a cluster in `periscope_store::logs`. What is worth asserting
+    // here is that a real stream overrunning a real buffer behaves the same.
+    if ingested > 50_000 {
+        assert!(
+            buffer.dropped() > 0,
+            "{ingested} lines overran a 50,000-line ring and none were evicted"
+        );
+    }
 }
 
 #[test]

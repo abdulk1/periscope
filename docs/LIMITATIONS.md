@@ -515,10 +515,17 @@ which is worse than not checking.
 
 So `PERISCOPE_E2E_INGEST_BUDGET` overrides the threshold, defaulting to the real
 10,000, and the `kind` job sets it to 2,000. What CI still checks is everything
-that *is* stable there: that the pipe flows at all, that the ring stays at its
-capacity however much arrives, and that it evicts. The measured rate is printed
-on every run, so the honest figure is always in the log even though nothing
-asserts on it.
+that *is* stable there: that the pipe flows at all, and that the ring stays at
+its capacity however much arrives. The measured rate is printed on every run, so
+the honest figure is always in the log even though nothing asserts on it.
+
+Eviction went the same way for the same reason. One run delivered 49,735 lines
+into a 50,000-line ring, evicted nothing, and failed an assertion that the ring
+must have evicted — which said nothing about the ring. That the ring drops the
+oldest lines, counts them, and keeps the filtered and sorted views consistent
+while doing it is proven deterministically and without a cluster in
+`periscope_store::logs`. The end-to-end test now asserts it only when the stream
+actually overran the buffer.
 
 ## The four-hour session
 
