@@ -1484,3 +1484,37 @@ Three details that are the whole point:
 `main` still returns the error afterwards, so the stderr behaviour and the exit
 code are unchanged.
 
+## ADR-0047 — Windows is a supported platform
+
+**Date:** 2026-08-20
+**Status:** Accepted, reversing a non-goal in `IMPLEMENTATION.md` §2
+
+The plan listed "Windows support as a launch blocker" among the non-goals:
+build it, do not gate on it. The CI job was `continue-on-error: true` and named
+"windows (not a launch blocker)", and it ran three crates' tests.
+
+That is reversed. Windows gates a release now, runs clippy and the whole test
+suite like the other platforms, and produces an artifact the release workflow
+attaches.
+
+The original reasoning was that Windows was unproven — nobody knew whether GPUI
+and the TLS stack even built there, and a red job for an unanswered question
+helps nobody. That question is answered: it has been building and passing for
+days. What was left was a job whose failure nobody had to act on, which is a job
+that tells you nothing. Either the platform matters or the job should go.
+
+Two things this makes honest rather than fixing, and both belong in
+`docs/LIMITATIONS.md` rather than in a comment nobody reads:
+
+* **The file-permission hardening does nothing on Windows.** `paths::restrict`
+  is `#[cfg(unix)]`, so `audit.log`, `state.toml` and exported log buffers land
+  with default ACLs. On Unix they are `0600`. That gap was a footnote while
+  Windows was a non-goal; it is a real limitation now.
+* **Nobody has opened the window on Windows.** CI builds it and runs the tests
+  that need no display. The same is true of Linux. Supported means "we will fix
+  what breaks", not "we have seen it work".
+
+Also unsigned: the Windows artifact carries no Authenticode signature, so
+SmartScreen will warn. That is the same shape of problem the macOS bundle had
+until this week, and the same kind of purchase fixes it.
+

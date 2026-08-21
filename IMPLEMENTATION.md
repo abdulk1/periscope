@@ -51,7 +51,9 @@ accept a pre-1.0 framework.
 - Cost analysis, security scanning, or policy enforcement
 - Web or mobile clients
 - A plugin system or extension API
-- Windows support as a launch blocker (build it, do not gate on it)
+- ~~Windows support as a launch blocker (build it, do not gate on it)~~ —
+  reversed, see ADR-0047. Windows is a supported platform and its CI job gates
+  a release like every other.
 - Accessibility parity — GPUI's a11y support is immature; document the gap,
   do not attempt to solve it in v1
 
@@ -301,7 +303,8 @@ agent assistance; treat them as sequencing, not commitments.
 
 - macOS: signed and notarized `.app`, Homebrew cask
 - Linux: AppImage plus `.deb`/`.rpm`
-- Windows: build and basic verification (not a launch blocker)
+- Windows: a gating build, the full test suite, and a release artifact
+  (ADR-0047)
 - Auto-update check (opt-in, no silent updates)
 - Config file (TOML): themes, keybindings, default columns, idle timeouts
 - Keybindings modeled on k9s/vim defaults so the target user is immediately

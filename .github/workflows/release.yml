@@ -1,0 +1,239 @@
+# Builds the artifacts a stranger downloads, and attaches them to a release.
+#
+# Triggered by a `v*` tag. CI proves the code is good on every push; this proves
+# nothing extra and deliberately duplicates none of it — it exists to produce
+# signed, checksummed files and put them somewhere without a login.
+#
+# It is also runnable by hand (`workflow_dispatch`) against any ref, which
+# produces the same artifacts and no release. That is how you check a change to
+# this file without inventing a tag to throw away.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# One release at a time. Unlike CI, a superseded run here must *not* be
+# cancelled: it may already have signed something or asked Apple to notarise it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    # Job level, because a step's own `env:` block is not in scope for that
+    # step's own `if:` — the condition would always see an empty string and
+    # every signing step would skip silently.
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+      NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+      NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The certificate and its private key live in a throwaway keychain that
+      # exists for the length of this job. Importing into the login keychain
+      # would leave a signing identity on a machine other jobs share.
+      #
+      # Unsigned when the secrets are absent — a fork, or this repository before
+      # anyone has set them — because a release that fails late is worse than
+      # one that says plainly what it could not do.
+      - name: Unlock a signing identity
+        if: env.MACOS_CERTIFICATE != ''
+        env:
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Without this, codesign blocks on a UI prompt that no one can answer.
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          security find-identity -v -p codesigning "$keychain"
+
+      # An App Store Connect API key rather than an app-specific password: the
+      # password's prompt cannot be answered on a runner.
+      - name: Store notarisation credentials
+        if: env.NOTARY_KEY != ''
+        run: |
+          set -euo pipefail
+          echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          xcrun notarytool store-credentials "periscope-notary" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER"
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+      # The same script that runs locally. It signs and notarises when the two
+      # variables are set and says so plainly when they are not.
+      - name: Build the bundle
+        env:
+          PERISCOPE_CODESIGN_IDENTITY: ${{ env.MACOS_SIGNING_IDENTITY }}
+          PERISCOPE_NOTARY_PROFILE: ${{ env.NOTARY_KEY != '' && 'periscope-notary' || '' }}
+        run: packaging/macos/bundle.sh
+
+      # A release nobody can install is the failure this whole workflow exists
+      # to prevent, so the artifact is checked the way a stranger meets it:
+      # quarantined, as a browser would leave it, and judged by Gatekeeper.
+      - name: Check what a stranger will get
+        run: |
+          set -euo pipefail
+          dmg=target/bundle/Periscope.dmg
+          hdiutil verify "$dmg"
+
+          if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+            cp "$dmg" "$RUNNER_TEMP/quarantined.dmg"
+            xattr -w com.apple.quarantine "0081;00000000;Safari;$(uuidgen)" \
+              "$RUNNER_TEMP/quarantined.dmg"
+            spctl -a -vvv -t open --context context:primary-signature \
+              "$RUNNER_TEMP/quarantined.dmg"
+          else
+            echo "unsigned build — skipping the Gatekeeper check"
+          fi
+
+      - name: Name it after the version
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c \
+            'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "scope"))')"
+          mkdir -p dist
+          cp target/bundle/Periscope.dmg "dist/Periscope-${version}-macos.dmg"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-macos
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libfontconfig-dev \
+            libwayland-dev \
+            libxkbcommon-x11-dev \
+            libssl-dev \
+            libzstd-dev \
+            libvulkan-dev \
+            libgl1-mesa-dev \
+            libxcb-composite0-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: Build
+        run: cargo build --release --bin scope
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cargo deb --no-build --package scope
+          cargo generate-rpm -p crates/scope
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+          cp target/generate-rpm/*.rpm dist/
+          tar -C target/release -czf "dist/periscope-linux-x86_64.tar.gz" scope
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-linux
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --bin scope
+
+      # Unsigned. Windows SmartScreen will warn until this carries an
+      # Authenticode signature, and `docs/LIMITATIONS.md` says so rather than
+      # letting somebody find out by downloading it.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cd target/release
+          7z a "../../dist/periscope-windows-x86_64.zip" scope.exe
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-windows
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    # Only a tag becomes a release. A manual run builds the same artifacts and
+    # stops, which is what makes this file safe to test.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: staged
+
+      - name: Collect and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staged -type f -exec cp {} dist/ \;
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          echo "--- releasing:"
+          cat SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            --verify-tag

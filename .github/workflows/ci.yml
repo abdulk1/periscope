@@ -262,24 +262,31 @@ jobs:
           if-no-files-found: error
 
   windows:
-    name: windows (not a launch blocker)
+    name: windows
     runs-on: windows-latest
-    # `IMPLEMENTATION.md` Phase 6 asks for a Windows build and basic
-    # verification while saying explicitly that it must not gate a release. So
-    # this runs and reports, and a failure does not turn the run red. It has
-    # never been run anywhere before now: whether GPUI and the TLS stack build
-    # on Windows is a question this job exists to answer, not one it assumes.
-    continue-on-error: true
+    # Windows is a supported platform, so this gates a release like every other
+    # job. It used to be `continue-on-error` because the plan called Windows
+    # "build it, do not gate on it" — ADR-0047 revisits that. A job whose
+    # failure nobody has to act on is a job that tells you nothing.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+      - name: Build release binary
         run: cargo build --release --bin scope
 
-      - name: Test the layers that do not need a window
-        run: cargo test -p periscope-store -p periscope-config -p periscope-bridge
+      - uses: actions/upload-artifact@v7
+        with:
+          name: periscope-windows
+          path: target/release/scope.exe
+          if-no-files-found: error
 
   security:
     name: security
