@@ -39,10 +39,13 @@ What is **not** there:
   Checked against a copy carrying the `com.apple.quarantine` attribute a
   download would give it, which is the condition a stranger actually hits.
 
-  What is still missing is a *release* — nothing is published for anyone to
-  download, so the two-minute install in Phase 6's acceptance criteria is still
-  **not met**. That is now a tag and a CI job rather than anything about
-  signing.
+  That was run by hand, on the machine holding the certificate. **No published
+  build is signed yet**, because the six secrets `release.yml` needs are not set
+  on the repository — `gh secret list` returns nothing — and the `macOS bundle`
+  job in CI is deliberately unsigned, since a Developer ID's private key must
+  never live in a repository. Nothing is published at all, so the two-minute
+  install in Phase 6's acceptance criteria is still **not met**; that now needs
+  a tag and six secrets rather than a purchase.
 - **A Homebrew cask.** Nothing is published anywhere to point one at.
 - **AppImage.** `.deb` and `.rpm` are built and checked by CI — the deb is
   installed, its paths verified and its desktop entry validated on every change

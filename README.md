@@ -21,9 +21,10 @@ It requires no account, phones nothing home, and writes no credential to disk.
 ## Status
 
 **No release to download yet** — for now you build it from source, and the
-[Run it](#run-it) section is two commands. Cutting the first release is the last
-thing standing between this and an install anyone can do; everything it needs is
-built and proven.
+[Run it](#run-it) section is one command. What stands between this and an
+install anyone can do is a `v*` tag, and the signing secrets being set on the
+repository. Both workflows are written and the signing has been done by hand;
+see [Packaging](#packaging).
 
 Phases 0 through 5 — the console itself — are done. Phase 6 is packaging.
 
@@ -38,10 +39,18 @@ read-only gates, and a local audit log. A `settings.toml` covering theme,
 access, limits, columns and a fully remappable k9s-style keymap. An opt-in
 update check.
 
-**Packaging.** A macOS `.app` and `.dmg`, signed with a Developer ID and
-notarised by Apple, so they open with no warning. Debian and RPM packages, and a
-Windows build — both unsigned, so Windows will show a SmartScreen warning until
-that changes. macOS, Linux and Windows all gate CI.
+**Packaging.** A macOS `.app` and `.dmg`, Debian and RPM packages, a Linux
+tarball and a Windows binary — all built by CI, which macOS, Linux and Windows
+now gate.
+
+Signing works and has been done: a Developer ID signs the app *and* the disk
+image, Apple notarises them, and the ticket is stapled to both, so Gatekeeper
+accepts them offline. But that was run by hand. **Nothing published will be
+signed until the six secrets in [Packaging](#packaging) are set on the
+repository, and today none of them are** — the artifact CI produces on every
+push is deliberately unsigned, because the Developer ID's private key must never
+live in a repository. The Windows build is unsigned with no plan yet; SmartScreen
+will warn about it.
 
 **Missing.** A Homebrew cask, an AppImage, screenshots, and a describe-style
 summary of an object. Exec runs a command and streams its output but is not a
@@ -372,10 +381,15 @@ audit entries and exported buffers outlive the session and get attached to bug
 reports, so hostnames and anything token-shaped are stripped on the way to disk
 — including a failed credential plugin's own output, which is where a live
 bearer token hides — while what is on screen keeps the apiserver's exact words,
-because the person at the keyboard already holds the credentials. Files are
-`0600` and directories `0700`. Panics are logged, redacted, and still printed in
-full to stderr, because a panic on a background task otherwise takes a watch
-down in silence.
+because the person at the keyboard already holds the credentials. Panics are
+logged, redacted, and still printed in full to stderr, because a panic on a
+background task otherwise takes a watch down in silence.
+
+On Unix those files are `0600` and their directories `0700`. **On Windows they
+are not** — the hardening is `#[cfg(unix)]`, so they inherit whatever the parent
+directory grants. Every other invariant here holds on both. It is the one
+security promise this program makes that is platform-specific, and
+`docs/LIMITATIONS.md` says so rather than leaving it to be discovered.
 
 Four of these invariants were held by everybody remembering, and a review found
 two of them already broken. They are held by code now: `tests/guardrails` reads
@@ -398,19 +412,20 @@ default is the one the market argues with.
 ## Packaging
 
 A `v*` tag is what produces something to download.
-`.github/workflows/release.yml` builds a signed and notarised `.dmg`, a `.deb`,
-an `.rpm`, a Linux tarball and a Windows `.zip`, checksums them, and attaches
-them to a GitHub release. It also runs on `workflow_dispatch`, which builds
+`.github/workflows/release.yml` builds a `.dmg`, a `.deb`, an `.rpm`, a Linux
+tarball and a Windows `.zip`, checksums them, and attaches them to a GitHub
+release. The `.dmg` is signed and notarised **if** the secrets below are set; if
+they are not, the release still builds and says plainly that it is unsigned. It also runs on `workflow_dispatch`, which builds
 every artifact and publishes nothing — that is how to exercise a change to it
 without inventing a tag.
 
-Signing needs three secrets the repository does not and must never contain:
+Signing needs six secrets, none of which are set today and none of which may
+ever live in the repository:
 `MACOS_CERTIFICATE` (a Developer ID `.p12`, base64-encoded) with
 `MACOS_CERTIFICATE_PASSWORD` and `MACOS_SIGNING_IDENTITY`, plus `NOTARY_KEY`
 (an App Store Connect `.p8`, base64-encoded), `NOTARY_KEY_ID` and
 `NOTARY_ISSUER`. An App Store Connect key rather than an app-specific password,
-because the password's prompt cannot be answered on a runner. Without them the
-release still builds, and says plainly that it is unsigned.
+because the password's prompt cannot be answered on a runner.
 
 To build the same artifacts by hand, on macOS:
 
