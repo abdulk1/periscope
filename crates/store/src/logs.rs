@@ -344,11 +344,39 @@ impl LogBuffer {
     }
 
     /// The sequence number shown at a display index.
-    fn sequence_at(&self, index: usize) -> Option<u64> {
+    pub fn sequence_at(&self, index: usize) -> Option<u64> {
         match self.order {
             LogOrder::Arrival => self.visible.get(index).copied(),
             LogOrder::Timestamp => self.sorted.get(index).copied(),
         }
+    }
+
+    /// Where a sequence number sits in the display order now, if it is still
+    /// held.
+    ///
+    /// This is what lets a paused view stay on the line it was reading. The
+    /// display index of a line moves every time the ring evicts from the front;
+    /// the sequence number never does, which is the whole reason it exists.
+    /// `None` means the line has been evicted — the reader was looking at
+    /// something that is now gone, and is owed that news rather than a view
+    /// that quietly slid somewhere else.
+    pub fn index_of(&self, sequence: u64) -> Option<usize> {
+        match self.order {
+            // `visible` is ascending, so this is a binary search rather than a
+            // walk: a 100,000-line buffer is looked up on every frame a paused
+            // view is on screen.
+            LogOrder::Arrival => self
+                .visible
+                .binary_search(&sequence)
+                .ok()
+                .filter(|_| self.lines_hold(sequence)),
+            LogOrder::Timestamp => self.sorted.iter().position(|&seq| seq == sequence),
+        }
+    }
+
+    /// Whether the ring still holds a sequence number.
+    fn lines_hold(&self, sequence: u64) -> bool {
+        sequence >= self.first && sequence < self.first + self.lines.len() as u64
     }
 
     /// The line at a visible index, in display order.
@@ -689,6 +717,38 @@ mod tests {
             pattern: pattern.to_owned(),
             ..FilterSpec::default()
         }
+    }
+
+    #[test]
+    fn a_line_keeps_its_identity_while_the_ring_evicts_underneath_it() {
+        // The display index of a line moves every time the ring drops one from
+        // the front. A paused view that remembers an index is looking at
+        // something different a moment later — which is exactly what a reader
+        // paused on a busy stream saw: "Paused", and 6.6 million lines dropped
+        // out from under them.
+        let mut buffer = LogBuffer::new(4);
+        buffer.extend(&[line("api", "one"), line("api", "two")]);
+
+        let watching = buffer.sequence_at(1).expect("a second line");
+        assert_eq!(buffer.index_of(watching), Some(1));
+
+        // Two more: still held, but everything has shifted down.
+        buffer.extend(&[line("api", "three"), line("api", "four")]);
+        assert_eq!(buffer.index_of(watching), Some(1));
+
+        // Two more evicts the front. The line is still there, at a new index.
+        buffer.extend(&[line("api", "five"), line("api", "six")]);
+        assert_eq!(
+            buffer.index_of(watching),
+            None,
+            "the watched line was evicted and index_of must say so"
+        );
+
+        // A line that survived reports where it is now, not where it was.
+        let survivor = buffer.sequence_at(0).expect("a first line");
+        assert_eq!(buffer.index_of(survivor), Some(0));
+        buffer.extend(&[line("api", "seven")]);
+        assert_eq!(buffer.index_of(survivor), None, "that one has now gone too");
     }
 
     #[test]

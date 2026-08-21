@@ -480,6 +480,20 @@ pub struct Workspace {
     /// The command output's scroll position, kept apart from the log view's so
     /// the two panes do not fight over it.
     exec_scroll: gpui::UniformListScrollHandle,
+    /// The line a paused view is holding, by sequence number rather than by
+    /// position.
+    ///
+    /// A display index moves every time the ring evicts from the front, so a
+    /// paused view that remembers an index drifts through the log at the
+    /// eviction rate. Observed in the wild: "Paused" on screen, 6.6 million
+    /// lines dropped, and the reader no longer looking at what they stopped on.
+    log_held: Option<u64>,
+    /// What `dropped()` read when `log_held` was last honoured, so eviction can
+    /// be noticed without comparing the whole buffer.
+    log_held_dropped: u64,
+    /// Whether the held line has been evicted. The view says so rather than
+    /// silently showing something else.
+    log_held_lost: bool,
     /// How many lines were visible last frame, so following only scrolls when
     /// there is something new to scroll to.
     log_visible: usize,
@@ -745,6 +759,9 @@ impl Workspace {
             log_scroll: gpui::UniformListScrollHandle::new(),
             log_wrap_scroll: gpui::ScrollHandle::new(),
             exec_scroll: gpui::UniformListScrollHandle::new(),
+            log_held: None,
+            log_held_dropped: 0,
+            log_held_lost: false,
             log_visible: 0,
             exec_visible: 0,
             log_notice: None,
@@ -1772,6 +1789,69 @@ impl Workspace {
         }
     }
 
+    /// Whether the log view has been scrolled away from the newest line.
+    ///
+    /// Measured against the bottom with a few lines of slack, because a batch
+    /// that has just landed grows the scrollable height before the follow below
+    /// re-pins it — without the slack every arriving line would read as the
+    /// reader scrolling away.
+    fn log_scrolled_away(&self) -> bool {
+        let handle = self.log_scroll.0.borrow();
+        let offset = handle.base_handle.offset().y;
+        let max = handle.base_handle.max_offset().height;
+
+        // Nothing to scroll yet: a list shorter than its viewport is always at
+        // the bottom, and must not be mistaken for a reader who moved.
+        if max <= px(0.) {
+            return false;
+        }
+
+        // GPUI scrolls by translating the content upwards, so `offset.y` is
+        // zero at the top and negative further down.
+        max - -offset > px(crate::logview::LINE_HEIGHT * 3.)
+    }
+
+    /// Keeps a paused view on the line it was reading while the ring evicts.
+    fn hold_the_paused_line(&mut self) {
+        let Some(session) = self.state.logs() else {
+            return;
+        };
+        let buffer = &session.buffer;
+        let dropped = buffer.dropped();
+
+        // Nothing has fallen out of the ring since the last frame, so the view
+        // is where the reader left it; just remember what that is.
+        if dropped == self.log_held_dropped {
+            let top = self
+                .log_scroll
+                .0
+                .borrow()
+                .base_handle
+                .logical_scroll_top()
+                .0;
+            self.log_held = buffer.sequence_at(top);
+            return;
+        }
+        self.log_held_dropped = dropped;
+
+        let Some(held) = self.log_held else {
+            return;
+        };
+
+        match buffer.index_of(held) {
+            // Still held, at a new index: put the view back on it.
+            Some(index) => self
+                .log_scroll
+                .scroll_to_item(index, gpui::ScrollStrategy::Top),
+            // Evicted. The reader is owed that news; scrolling somewhere else
+            // and saying nothing is how the original defect felt.
+            None => {
+                self.log_held = None;
+                self.log_held_lost = true;
+            }
+        }
+    }
+
     fn toggle_follow(&mut self, _: &ToggleFollow, _window: &mut Window, cx: &mut Context<Self>) {
         let following = self
             .state
@@ -2685,11 +2765,19 @@ impl Workspace {
     }
 
     /// The banner that explains whatever is currently wrong.
+    ///
+    /// Two different things end up here and they are not dismissed alike. A
+    /// *condition* — the cluster is unreachable, kubeconfig will not parse — is
+    /// derived from state and stays until the state changes, because hiding it
+    /// would not make it less true. An *event* — a delete the apiserver
+    /// refused — has already happened, and nothing will ever clear it, so
+    /// without a dismiss it sits there for the rest of the session. One did,
+    /// for twenty minutes, while its reader moved on to other things.
     fn banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let (message, retry) = if let Some(error) = self.last_error.clone() {
-            (error.to_string(), false)
+        let (message, retry, dismissable) = if let Some(error) = self.last_error.clone() {
+            (error.to_string(), false, true)
         } else if let Some(error) = self.state.config_error() {
-            (format!("kubeconfig: {error}"), false)
+            (format!("kubeconfig: {error}"), false, false)
         } else {
             let connection = self.state.active_connection()?;
             if !connection.state.is_problem() {
@@ -2700,6 +2788,7 @@ impl Workspace {
             (
                 format!("{cluster}: {} — {detail}", connection.state.label()),
                 true,
+                false,
             )
         };
 
@@ -2721,8 +2810,21 @@ impl Workspace {
                         .small()
                         .label("Reconnect")
                         .on_click(cx.listener(|this, _, _, cx| this.reconnect(cx)))
+                }))
+                .children(dismissable.then(|| {
+                    Button::new("dismiss-error")
+                        .small()
+                        .label("Dismiss")
+                        .tooltip("This already happened; the banner is only the news of it")
+                        .on_click(cx.listener(|this, _, _, cx| this.dismiss_error(cx)))
                 })),
         )
+    }
+
+    /// Clears a banner that is reporting something which already happened.
+    fn dismiss_error(&mut self, cx: &mut Context<Self>) {
+        self.last_error = None;
+        cx.notify();
     }
 
     /// A notice with no log pane to render it.
@@ -3030,6 +3132,13 @@ impl Workspace {
                         } else {
                             "Paused"
                         })
+                        // The shortcut lives on the control, because somebody
+                        // hunting for how to pause is looking at the control.
+                        .tooltip(if session.following {
+                            "Stop following the newest line — or just scroll up (⌘⇧F)"
+                        } else {
+                            "Follow the newest line again (⌘⇧F)"
+                        })
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.toggle_follow(&ToggleFollow, window, cx)
                         })),
@@ -3123,6 +3232,7 @@ impl Workspace {
                         .outline()
                         .small()
                         .label("Close")
+                        .tooltip("Stop tailing and go back to the table (Escape)")
                         .on_click(cx.listener(|this, _, _, cx| this.close_logs(cx))),
                 );
 
@@ -3144,6 +3254,22 @@ impl Workspace {
                 let mut notes: Vec<String> = Vec::new();
                 if let Some(said) = &self.log_notice {
                     notes.push(said.to_string());
+                }
+                // "Paused" only ever meant "stop scrolling". The stream keeps
+                // running and the ring keeps evicting, which on a busy pod
+                // meant a reader stopped to look at something and watched it be
+                // thrown away — the header said `Paused`, and 6.6 million lines
+                // had been dropped. Saying which of the two is paused costs a
+                // clause.
+                if !session.following {
+                    notes.push(match self.log_held_lost {
+                        true => "Paused. The stream kept running and the lines you were reading \
+                                 have been dropped — Following goes back to the newest."
+                            .to_owned(),
+                        false => "Paused — scrolling only. The stream is still running and the \
+                                  buffer is still evicting."
+                            .to_owned(),
+                    });
                 }
                 // Where the lines with no timestamp went is not something
                 // anyone should have to guess at, or read the docs for.
@@ -4418,20 +4544,40 @@ impl Render for Workspace {
             self.exec_container = None;
         }
 
+        // Scrolling up is how a person pauses a log, whether or not they know
+        // there is a button. Following used to survive it, so the next batch
+        // — sixteen milliseconds later — yanked the view back to the bottom and
+        // reading anything above the tail was impossible.
+        if self
+            .state
+            .logs()
+            .is_some_and(|session| session.following && self.log_scrolled_away())
+        {
+            self.state.set_following(false);
+        }
+
         // Following means the newest line stays on screen. Scrolling only when
         // the count changed keeps a paused view exactly where the user left it.
         if let Some(session) = self.state.logs() {
             let visible = session.buffer.visible_len();
-            if session.following && visible > 0 && visible != self.log_visible {
-                self.log_scroll
-                    .scroll_to_item(visible - 1, gpui::ScrollStrategy::Top);
-                // The wrapped body is rebuilt around the newest lines while it
-                // is following, so the bottom of it is the newest line.
-                self.log_wrap_scroll.scroll_to_bottom();
+            if session.following {
+                self.log_held = None;
+                self.log_held_lost = false;
+                if visible > 0 && visible != self.log_visible {
+                    self.log_scroll
+                        .scroll_to_item(visible - 1, gpui::ScrollStrategy::Top);
+                    // The wrapped body is rebuilt around the newest lines while
+                    // it is following, so the bottom of it is the newest line.
+                    self.log_wrap_scroll.scroll_to_bottom();
+                }
+            } else {
+                self.hold_the_paused_line();
             }
             self.log_visible = visible;
         } else if self.log_visible != 0 {
             self.log_visible = 0;
+            self.log_held = None;
+            self.log_held_lost = false;
         }
 
         // The newest line of command output stays on screen the same way a
@@ -6660,6 +6806,34 @@ mod tests {
         });
         // Filtering is local: nothing was re-requested from the cluster.
         assert!(drain(&rx).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_banner_reporting_something_that_already_happened_can_be_dismissed(
+        cx: &mut TestAppContext,
+    ) {
+        // A refusal from the apiserver is news, not a condition: nothing will
+        // ever clear it, so without this it sat in the banner for the rest of
+        // the session. One did, for twenty minutes, while its reader moved on.
+        let (harness, _rx) = workspace(cx);
+        apply(
+            &harness,
+            cx,
+            vec![contexts(&["prod"], "prod"), kinds_event("prod")],
+        );
+
+        harness.update(cx, |workspace, _window, cx| {
+            workspace.report(SharedString::from("pods \"api-0\" is forbidden"));
+            assert!(workspace.last_error.is_some());
+            workspace.dismiss_error(cx);
+        });
+
+        harness.read(cx, |workspace| {
+            assert!(
+                workspace.last_error.is_none(),
+                "the banner outlived its dismissal"
+            );
+        });
     }
 
     #[gpui::test]

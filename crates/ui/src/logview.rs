@@ -20,7 +20,7 @@ use gpui_component::{ActiveTheme as _, h_flex, v_flex};
 use periscope_bridge::{LogLine, LogSource, LogSourceState};
 
 /// Height of one log line.
-const LINE_HEIGHT: f32 = 18.;
+pub(crate) const LINE_HEIGHT: f32 = 18.;
 
 /// Width of the source column in a merged stream.
 const SOURCE_WIDTH: f32 = 220.;

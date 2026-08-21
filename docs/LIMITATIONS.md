@@ -530,6 +530,38 @@ while doing it is proven deterministically and without a cluster in
 `periscope_store::logs`. The end-to-end test now asserts it only when the stream
 actually overran the buffer.
 
+## Memory does not come back down after a busy log
+
+Reported from real use: resident memory went from 40MB to 180MB while watching
+a pod that was spamming, and stayed at 170MB after the log view was closed.
+
+That is not a leak, and it was worth measuring rather than arguing about. A
+throwaway probe filled a 100,000-line `LogBuffer`, dropped it, and read RSS
+either side:
+
+```
+base=2MB  full=29MB  after_drop=29MB
+```
+
+The buffer is genuinely freed — nothing in this program still holds those lines
+— and the allocator keeps the pages rather than returning them to the OS. That
+is ordinary behaviour for a few hundred thousand small allocations, and it means
+**RSS is a high-water mark, not a current reading.** The pages are reused by the
+next thing that needs them rather than being asked for again.
+
+Two things follow, neither of them a fix:
+
+- The number stays within the 300MB budget for one cluster, and the four-hour
+  soak — which peaked at 81MB and *fell* to 39MB — shows the same thing from
+  the other direction: it settles, it does not climb.
+- If a pod is loud enough for this to matter, `log-buffer` in `settings.toml`
+  is the dial. The default is 100,000 lines; the cost measured above is roughly
+  270 bytes a line, so 10,000 lines is about 3MB.
+
+What would actually lower the peak is storing lines more compactly — each is
+currently three separate allocations. Nobody has done that, and nothing here
+needs it yet.
+
 ## The four-hour session
 
 `IMPLEMENTATION.md` asks for "no crash in a 4-hour session with active watches
