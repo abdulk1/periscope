@@ -15,7 +15,17 @@ use periscope_e2e::{connected, describe, wait_for};
 use periscope_store::{FilterSpec, LogBuffer};
 
 /// Attaching runs a request per pod; a busy CI box needs room.
-const TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Ninety seconds rather than thirty because of one test in this file. The
+/// firehose fixture exists to saturate the machine — that is the whole point of
+/// measuring ingest against it — and on a two-core runner it starves the
+/// apiserver it shares a node with. Discovery timed out at thirty seconds while
+/// the connection sat in `Connecting`, which says nothing about the code and
+/// everything about four busybox pods writing as fast as they can.
+///
+/// This bounds *waiting for a cluster*, never the measurement: the ingest
+/// budget times its own ten-second window and is untouched by this.
+const TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The label the fixture's pods carry.
 const FIXTURE: &str = "app=chatty";
