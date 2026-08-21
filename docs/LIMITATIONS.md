@@ -545,9 +545,24 @@ base=2MB  full=29MB  after_drop=29MB
 
 The buffer is genuinely freed — nothing in this program still holds those lines
 — and the allocator keeps the pages rather than returning them to the OS. That
-is ordinary behaviour for a few hundred thousand small allocations, and it means
-**RSS is a high-water mark, not a current reading.** The pages are reused by the
-next thing that needs them rather than being asked for again.
+is ordinary behaviour for a few hundred thousand small allocations: the memory
+is on the allocator's free list, ready for the next thing that needs it, rather
+than handed back and asked for again.
+
+**What the number means depends on which one you are reading**, and the answer
+differs by platform:
+
+| Reading | What it is | Falls after a big log? |
+|---|---|---|
+| macOS `ps` RSS, Activity Monitor | Pages resident in physical memory | Usually not, without pressure |
+| **Windows Task Manager → Memory** | The process's *working set*: pages currently in RAM | Not on its own; Windows trims it under pressure, and aggressively when the window is minimised |
+| Windows Task Manager → Details → **Commit size** | Virtual memory the process has committed | This is the one that reflects what the allocator is holding |
+
+None of them is a high-water mark in the strict sense — they are current
+readings of something that has no reason to shrink while nothing else wants the
+memory. **Minimising the window on Windows is the cheap test:** if the number
+drops sharply, the pages were reclaimable all along, which is the difference
+between a retained allocation and a leaked one.
 
 Two things follow, neither of them a fix:
 
