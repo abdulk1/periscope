@@ -362,7 +362,7 @@ kinds and seeded with 10,009 pods, release build:
 | YAML of a large ConfigMap opens without a frame drop | 939 KiB fetched, cleaned and rendered to YAML in 17ms — a fifth of a 60Hz frame, and most of it network |
 | A CRD-heavy cluster lists every custom resource | 77 kinds with cert-manager and Argo CD installed; all nine of their CRDs listed, none special-cased |
 | Tail 50 pods while staying above 60fps | 50 pods tailed: 60.0fps sustained, 0 dropped frames, ~630µs to rebuild the view |
-| Ingest 10,000 lines/second without unbounded memory | 40,000–53,000 lines/second ingested from an unthrottled fixture; resident memory flat at ~104MB with a full 100,000-line buffer |
+| Ingest 10,000 lines/second without unbounded memory | 40,000–53,000 lines/second ingested from an unthrottled fixture; resident memory flat at ~104MB with a full 100,000-line buffer. **Measured on a real machine, and only there** — see below |
 | Filter a 500k-line buffer in under 100ms | Well inside, for substring and regex alike (release builds; a debug build is several times slower and the test says so) |
 | Pod restart during a tail reconnects within 2s | 355ms from deleting a pod to lines arriving from its replacement |
 | 5 clusters connected simultaneously stay under 800MB | Five clusters holding 50,110 rows: **29MB** resident, flat over a 45s soak. See the caveat below |
@@ -493,6 +493,32 @@ The same applies to a masked Secret: Apply and Dry run render disabled with
 "Reveal the values first", because applying a masked Secret would send the mask.
 On a read-only cluster the cluster's reason wins, since revealing the values
 would not make the apply land.
+
+## The ingest-rate budget is not measured on CI
+
+`IMPLEMENTATION.md` §4 asks for 10,000 lines/second. The figure in the table
+above — 40,000 to 53,000 — was taken on a real machine, and that is the only
+place it means anything.
+
+On a CI runner the firehose fixture, the apiserver and the test process share
+two cores, and the fixture's entire purpose is to saturate them. So the number
+that comes out is largely a measure of how much of the machine the *producer*
+got. Across three runs of unchanged code the same assertion recorded:
+
+```
+8,435   20,635   59,434    lines/second
+```
+
+A sevenfold spread, and the low end fails a 10,000 budget. A gate that fails one
+run in three is not a gate — it teaches people to re-run CI until it passes,
+which is worse than not checking.
+
+So `PERISCOPE_E2E_INGEST_BUDGET` overrides the threshold, defaulting to the real
+10,000, and the `kind` job sets it to 2,000. What CI still checks is everything
+that *is* stable there: that the pipe flows at all, that the ring stays at its
+capacity however much arrives, and that it evicts. The measured rate is printed
+on every run, so the honest figure is always in the log even though nothing
+asserts on it.
 
 ## The four-hour session
 
